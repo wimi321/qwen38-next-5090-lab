@@ -49,6 +49,8 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+.triton-cache/
+.tvm-ffi-cache/
 cover/
 
 # Translations
@@ -150,6 +152,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-win/
 env/
 venv/
 ENV/

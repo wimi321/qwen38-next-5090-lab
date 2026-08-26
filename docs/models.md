@@ -17,6 +17,14 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 
+## Experimental integrations
+
+[Qwen3.8-Flash-Next (Qwen4-Exp)](qwen4-exp.md) has a pinned, text-only RTX
+5090 bring-up guide. It remains experimental until the full-checkpoint 8K
+acceptance record is complete; vision, MTP and radix prefix reuse are not part
+of that milestone. Its current expert path is explicitly W4A16 compatibility
+for a W4A4 checkpoint and is not a W4A4 support claim.
+
 ## MoE backends
 
 `ft serve --moe-backend {auto,fused,offload,cpu,hybrid}`:
