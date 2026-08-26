@@ -65,13 +65,13 @@ def test_batch_memcpy_roundtrip():
 
     rows, feat = 16, 1024
     src = torch.randint(0, 256, (rows, feat), dtype=torch.uint8).pin_memory()
-    dst = torch.zeros(rows, feat, dtype=torch.uint8, device="cuda")
     perm = torch.randperm(rows)
-    dst_ptrs = torch.tensor([dst[i].data_ptr() for i in range(rows)], dtype=torch.int64)
-    src_ptrs = torch.tensor([src[p].data_ptr() for p in perm.tolist()], dtype=torch.int64)
-    sizes = torch.full((rows,), feat, dtype=torch.int64)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
+        dst = torch.zeros(rows, feat, dtype=torch.uint8, device="cuda")
+        dst_ptrs = torch.tensor([dst[i].data_ptr() for i in range(rows)], dtype=torch.int64)
+        src_ptrs = torch.tensor([src[p].data_ptr() for p in perm.tolist()], dtype=torch.int64)
+        sizes = torch.full((rows,), feat, dtype=torch.int64)
         batch_memcpy_jit(dst_ptrs, src_ptrs, sizes, stream.cuda_stream)
     stream.synchronize()
     assert torch.equal(dst.cpu(), src[perm])
