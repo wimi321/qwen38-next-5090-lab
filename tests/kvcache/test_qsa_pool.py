@@ -143,7 +143,7 @@ def test_store_kv_cuda_flattens_multihead_rows():
     pool = QSAKVCache(
         num_kv_heads=2,
         num_layers=1,
-        head_dim=8,
+        head_dim=256,
         num_pages=4,
         page_size=2,
         dtype=torch.bfloat16,
@@ -152,18 +152,18 @@ def test_store_kv_cuda_flattens_multihead_rows():
         layer_ids=(0,),
     )
     rows = torch.tensor([1, 6], dtype=torch.int32, device="cuda")
-    key = torch.arange(32, dtype=torch.bfloat16, device="cuda").view(2, 2, 8)
+    key = torch.arange(1024, dtype=torch.bfloat16, device="cuda").view(2, 2, 256)
     value = key + 40
 
     pool.store_kv(key, value, rows, layer_id=0)
     torch.cuda.synchronize()
 
-    cached_key = pool.k_cache(0).view(-1, 2, 8).index_select(0, rows.long())
-    cached_value = pool.v_cache(0).view(-1, 2, 8).index_select(0, rows.long())
+    cached_key = pool.k_cache(0).view(-1, 2, 256).index_select(0, rows.long())
+    cached_value = pool.v_cache(0).view(-1, 2, 256).index_select(0, rows.long())
     assert torch.equal(cached_key, key)
     assert torch.equal(cached_value, value)
 
-    with pytest.raises(ValueError, match="rows of width 16"):
+    with pytest.raises(ValueError, match="rows of width 512"):
         pool.store_kv(key[:, :1], value, rows, layer_id=0)
 
 
