@@ -166,17 +166,25 @@ ft serve \
   --attention-backend qsa_triton \
   --graph 0 \
   --moe-backend offload \
-  --moe-cpu-layers 4 \
   --moe-cache-auto \
   --nvfp4-backend auto
 ```
 
-The four CPU MoE layers are a count, distributed by FreeToken's existing
-`--moe-cpu-layers` policy. The checkpoint's PLE bank is separate from the MoE
-expert cache. Do not enable a Windows pagefile or WSL swap to make a failing
-configuration appear to pass. `--graph 0` is intentional for this bring-up;
-do not change it until the PLE staging test and the QSA kernels both pass real
-capture/replay parity on the target CUDA/Triton stack.
+Do not force the original four-layer estimate. This checkpoint's expert banks
+occupy about 63.46 GiB, while a 112 GiB WSL instance receives a FreeToken pin
+budget of about 44.02 GiB. Four CPU layers would still leave about 58.17 GiB to
+pin and can fail in `cudaHostRegister`. With `--moe-cpu-layers` omitted, the WSL
+budget resolver selects the minimum safe head-and-tail set (15 layers on this
+configuration: 0-7 and 41-47), leaving about 43.63 GiB pinned. Keep the first
+startup on auto and record the resolved layer list from the log. Passing the
+count `--moe-cpu-layers 15` is not equivalent because count syntax distributes
+layers evenly through the model.
+
+The checkpoint's PLE bank is separate from the MoE expert cache. Do not enable
+a Windows pagefile or WSL swap to make a failing configuration appear to pass.
+`--graph 0` is intentional for this bring-up; do not change it until the PLE
+staging test and the QSA kernels both pass real capture/replay parity on the
+target CUDA/Triton stack.
 
 For this model `moe_intermediate_size=640`; on an SM120 GPU the current
 `--nvfp4-backend auto` policy therefore selects FreeToken's Triton W4A16
@@ -291,7 +299,7 @@ manifest and a table containing:
 | Peak GPU memory | |
 | Peak WSL RSS and major/minor page faults | |
 | PCIe receive/transmit traffic | |
-| Expert-cache geometry and hit rate | |
+| Expert-cache geometry | |
 | Test duration / completed requests | |
 
 Use `ft ctl --json stats` for FreeToken's TTFT, throughput, request count and
@@ -300,6 +308,11 @@ or `pidstat -r`, GPU memory through `nvidia-smi`, and PCIe traffic through an
 NVIDIA profiler or `nvidia-smi dmon`. Sample throughout the run rather than
 only before and after it. For example, this records framebuffer memory and
 PCIe receive/transmit throughput once per second:
+
+The current control API does not expose the internal MoE cache hit/miss
+counters, so do not report a hit rate for this milestone. Record the resolved
+cache geometry from startup and mark hit rate as unavailable until telemetry is
+added rather than inferring it from PCIe traffic.
 
 ```bash
 mkdir -p "$HOME/qwen4-exp-metrics"
