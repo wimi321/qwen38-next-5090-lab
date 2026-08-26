@@ -87,6 +87,13 @@ def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
     assert _inferred("Qwen3MoeForCausalLM")[0] == "qwen25"
 
 
+def test_qwen4_exp_uses_qwen38_tool_and_reasoning_parsers():
+    # Qwen3.8-Flash-Next exposes the Qwen4-Exp architecture name, which does not
+    # contain the older "qwen3" marker even though it keeps Qwen3's reasoning
+    # tags and qwen3_coder tool-call protocol.
+    assert _inferred("Qwen4ExpForConditionalGeneration") == ("qwen3_coder", "qwen3")
+
+
 def test_an_explicit_choice_beats_inference():
     config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
     with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):

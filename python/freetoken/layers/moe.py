@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from typing import TYPE_CHECKING, Tuple
 
@@ -6,12 +8,12 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
-from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.utils import div_even
 
 from .base import BaseOP
 
 if TYPE_CHECKING:
+    from freetoken.moe.offload_cache import OffloadMoeCache
     from freetoken.models.config import ModelConfig
 
 # Router decision (topk_weights[float32], topk_ids[int32]) for models whose router
