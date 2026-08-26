@@ -28,9 +28,22 @@ class GraphCaptureBuffer:
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
+    # Qwen4 PLE graph inputs. Sparse CPU mmap lookup is staged into these
+    # stable-address tensors immediately before replay.
+    ple_embeddings: torch.Tensor | None
+    ple_table_idx: torch.Tensor | None
+    ple_reset_mask: torch.Tensor | None
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls,
+        bs: int,
+        vocab_size: int,
+        device: torch.device,
+        *,
+        ple_embedding_dim: int = 0,
+        ple_dtype: torch.dtype = torch.bfloat16,
+    ) -> GraphCaptureBuffer:
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -38,6 +51,21 @@ class GraphCaptureBuffer:
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            ple_embeddings=(
+                torch.empty(bs, ple_embedding_dim, dtype=ple_dtype, device=device)
+                if ple_embedding_dim
+                else None
+            ),
+            ple_table_idx=(
+                torch.zeros(bs, dtype=torch.long, device=device)
+                if ple_embedding_dim
+                else None
+            ),
+            ple_reset_mask=(
+                torch.ones(bs, dtype=torch.bool, device=device)
+                if ple_embedding_dim
+                else None
+            ),
         )
 
     def set_batch(self, batch: Batch) -> None:
@@ -54,6 +82,28 @@ class GraphCaptureBuffer:
         batch.fla_metadata = FLAMetadata(
             cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
         )
+        if self.ple_embeddings is not None:
+            assert self.ple_table_idx is not None and self.ple_reset_mask is not None
+            batch.ple_embeddings = self.ple_embeddings[_slice]
+            batch.ple_table_idx = self.ple_table_idx[_slice]
+            batch.ple_reset_mask = self.ple_reset_mask[_slice]
+
+    def copy_auxiliary_from(self, batch: Batch) -> None:
+        """Copy staged auxiliary inputs without requiring core batch tensors."""
+
+        if self.ple_embeddings is None:
+            return
+        if (
+            batch.ple_embeddings is None
+            or batch.ple_table_idx is None
+            or batch.ple_reset_mask is None
+        ):
+            raise RuntimeError("Qwen4 PLE decode inputs were not staged before graph replay")
+        _slice = slice(batch.padded_size)
+        self.ple_embeddings[_slice].copy_(batch.ple_embeddings)
+        assert self.ple_table_idx is not None and self.ple_reset_mask is not None
+        self.ple_table_idx[_slice].copy_(batch.ple_table_idx)
+        self.ple_reset_mask[_slice].copy_(batch.ple_reset_mask)
 
     def copy_from(self, batch: Batch) -> None:
         _slice = slice(batch.padded_size)
@@ -63,6 +113,7 @@ class GraphCaptureBuffer:
         self.positions[_slice] = batch.positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
+        self.copy_auxiliary_from(batch)
 
 
 def _determine_cuda_graph_bs(
@@ -145,7 +196,18 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+        ple_embedding_dim = 0
+        ple_dtype = torch.bfloat16
+        ple_spec = getattr(model, "ple_graph_input_spec", None)
+        if ple_spec is not None:
+            ple_embedding_dim, ple_dtype = ple_spec()
+        self.buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs,
+            vocab_size,
+            self.device,
+            ple_embedding_dim=ple_embedding_dim,
+            ple_dtype=ple_dtype,
+        )
         self._reset_moe_offload_cache()
 
         pbar = tqdm(
@@ -163,6 +225,10 @@ class GraphRunner:
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
+            prepare_auxiliary = getattr(model, "prepare_batch_auxiliary", None)
+            if prepare_auxiliary is not None:
+                prepare_auxiliary(batch)
+                self.buffer.copy_auxiliary_from(batch)
             self.buffer.set_batch(batch)
             # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
             # touches scratch (real slot indices are written by copy_from on replay). Hybrid-

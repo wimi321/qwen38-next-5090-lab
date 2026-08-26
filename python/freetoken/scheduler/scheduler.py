@@ -761,6 +761,12 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
+        # Qwen4 PLE hashes token history and fetches sparse mmap rows on the CPU.
+        # Stage those values before model.forward so eager decode and CUDA-graph
+        # replay share the same GPU-only operator path.
+        prepare_auxiliary = getattr(self.engine.model, "prepare_batch_auxiliary", None)
+        if prepare_auxiliary is not None:
+            prepare_auxiliary(batch)
         self._forward_iter += 1
         if batch.is_decode:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,

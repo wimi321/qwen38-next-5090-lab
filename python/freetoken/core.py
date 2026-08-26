@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.kvcache.ple_state_pool import PLEStatePool
     from freetoken.moe import BaseMoeBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -135,6 +136,15 @@ class Batch:
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Qwen4 PLE decode inputs. Hashing plus sparse mmap row fetch happen outside
+    # CUDA graphs; GraphCaptureBuffer then copies the first three tensors into
+    # stable-address replay buffers. The pending CPU histories are committed only
+    # after model.forward succeeds.
+    ple_embeddings: torch.Tensor | None = field(default=None, init=False)
+    ple_table_idx: torch.Tensor | None = field(default=None, init=False)
+    ple_reset_mask: torch.Tensor | None = field(default=None, init=False)
+    ple_next_token_history: torch.Tensor | None = field(default=None, init=False)
+    ple_commit_slots: tuple[int, ...] = field(default_factory=tuple, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the
@@ -176,6 +186,9 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # Qwen4 PLE token-history + dilated-convolution request states.  Separate
+    # from GDN because their snapshot/reuse semantics differ.
+    ple_state_pool: PLEStatePool | None = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property

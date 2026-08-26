@@ -380,6 +380,28 @@ class Engine:
         else:
             self.linear_state_pool = None
 
+        # ======================= Qwen4 PLE state initialization ========================
+        qwen4_args = getattr(config.model_config, "qwen4_args", None)
+        if qwen4_args is not None and qwen4_args.ple_layer_ids:
+            from freetoken.kvcache.ple_state_pool import PLEStatePool
+
+            ple_channels = qwen4_args.hc_count * config.model_config.hidden_size
+            ple_conv_state_len = (
+                (qwen4_args.ple_conv_kernel_size - 1) * qwen4_args.ngram_size
+            )
+            self.ple_state_pool = PLEStatePool(
+                num_slots=config.max_running_req + 1,
+                context_len=qwen4_args.ngram_size - 1,
+                channels=ple_channels,
+                conv_state_len=ple_conv_state_len,
+                eos_token_id=qwen4_args.eos_token_id,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.ctx.ple_state_pool = self.ple_state_pool
+        else:
+            self.ple_state_pool = None
+
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
@@ -421,22 +443,39 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-        self.graph_runner = GraphRunner(
-            stream=self.stream,
+        # Very large lookup stores (for example Qwen4-Exp's ~51 GB FP8 PLE
+        # table) are not ordinary state_dict parameters. Open them only after
+        # the other backends and pools have initialized, then close them if
+        # graph capture or warmup fails in this still-live process.
+        from freetoken.models.auxiliary import setup_auxiliary_banks
+
+        self.auxiliary_banks = setup_auxiliary_banks(
+            self.model,
+            config.model_path,
             device=self.device,
-            model=self.model,
-            attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=init_free_memory,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
-            dummy_req=self.dummy_req,
-            moe_offload_cache=self.moe_offload_cache,
+            dtype=self.dtype,
+            dummy=config.use_dummy_weight,
         )
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+        try:
+            self.graph_runner = GraphRunner(
+                stream=self.stream,
+                device=self.device,
+                model=self.model,
+                attn_backend=self.attn_backend,
+                cuda_graph_bs=config.cuda_graph_bs,
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                free_memory=init_free_memory,
+                max_seq_len=aligned_max_seq_len,
+                vocab_size=config.model_config.vocab_size,
+                dummy_req=self.dummy_req,
+                moe_offload_cache=self.moe_offload_cache,
+            )
+            if config.attention_backend.split(",")[0] == "triton":
+                # Prefill runs on the first comma part; warm its autotune cache.
+                self._warmup_prefill()
+        except BaseException:
+            self.auxiliary_banks.close()
+            raise
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -937,6 +976,12 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        # Auxiliary request state is transactional across the complete model and
+        # expert execution.  In particular, do not publish Qwen4 PLE history/conv
+        # state until the CPU-MoE watchdog has accepted this step's outputs.
+        commit_auxiliary = getattr(self.model, "commit_batch_auxiliary", None)
+        if commit_auxiliary is not None:
+            commit_auxiliary(batch)
 
         for req in batch.reqs:
             req.complete_one()
@@ -1007,6 +1052,7 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        self.auxiliary_banks.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -1294,6 +1340,18 @@ def _adjust_config(config: EngineConfig):
                     f"swa_full_tokens_ratio must be in (0, 1], got {config.swa_full_tokens_ratio}"
                 )
             override("cache_type", "swa_radix")
+
+    if getattr(model_config, "qwen4_args", None) is not None:
+        # PLE carries request-local token history and a dilated-convolution
+        # state.  Until those states participate in prefix-cache snapshot/COW,
+        # accepting radix would reuse KV/GDN state with a mismatched lexical
+        # state and silently corrupt logits.
+        requested_cache = getattr(config, "cache_type", "radix")
+        if requested_cache != "naive":
+            raise ValueError(
+                "Qwen4-Exp PLE currently requires --cache-type naive; radix prefix "
+                "reuse is disabled until PLE token/conv state has snapshot semantics"
+            )
 
     if has_linear_attention:
         override(

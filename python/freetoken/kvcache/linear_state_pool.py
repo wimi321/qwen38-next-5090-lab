@@ -202,14 +202,38 @@ __all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
 
 
 def state_pool_bytes(config, num_slots: int | None = None) -> int:
-    """Total GDN state-pool bytes at ``num_slots`` PHYSICAL slots (default: the startup
-    slot count). The engine adds this to the KV family's fixed cost when budgeting --
-    the state pool is a sibling pool, not a KV tier."""
+    """Total fixed request-state bytes used beside the paged KV pools.
+
+    ``num_slots`` controls the GDN pool (runtime cache rebuild can resize it).
+    Qwen4 PLE is deliberately table-indexed under the naive cache, so its slot
+    count remains ``max_running_req + 1`` and is included independently.  Keeping
+    both terms in the one engine budget hook prevents ``--moe-cache-auto`` from
+    spending VRAM that the PLE convolution state allocates immediately afterward.
+    """
     linear_group = config.model_config.linear_attention_group()
-    if linear_group is None:
-        return 0
-    slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
-    return linear_state_bytes_per_req(linear_group, config.tp_info.size, config.dtype) * slots
+    total = 0
+    if linear_group is not None:
+        slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
+        total += (
+            linear_state_bytes_per_req(
+                linear_group, config.tp_info.size, config.dtype
+            )
+            * slots
+        )
+
+    qwen4_args = getattr(config.model_config, "qwen4_args", None)
+    if qwen4_args is not None and qwen4_args.ple_layer_ids:
+        channels = qwen4_args.hc_count * config.model_config.hidden_size
+        conv_state_len = (
+            qwen4_args.ple_conv_kernel_size - 1
+        ) * qwen4_args.ngram_size
+        total += (
+            (config.max_running_req + 1)
+            * channels
+            * conv_state_len
+            * config.dtype.itemsize
+        )
+    return int(total)
 
 
 def _linear_pool_num_slots(config) -> int:

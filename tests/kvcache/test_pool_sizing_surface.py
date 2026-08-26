@@ -262,6 +262,18 @@ def test_linear_state_pool_prices_itself():
     config.model_config.linear_attention_group = lambda: None
     assert state_pool_bytes(config) == 0
 
+    # Qwen4 PLE owns a fixed table-indexed convolution state in addition to GDN.
+    # It remains max_running_req+1 slots even when a runtime rebuild supplies a
+    # different GDN slot target.
+    config.max_running_req = 3
+    config.model_config.hidden_size = 8
+    config.model_config.qwen4_args = SimpleNamespace(
+        ple_layer_ids=(2,), hc_count=4, ple_conv_kernel_size=4, ngram_size=3
+    )
+    ple_bytes = (config.max_running_req + 1) * (4 * 8) * ((4 - 1) * 3) * 2
+    assert state_pool_bytes(config) == ple_bytes
+    assert state_pool_bytes(config, num_slots=99) == ple_bytes
+
 
 def test_validate_rebuild_targets_flow_by_kv_cost_signature():
     """The base template hands each family's kv_cost exactly the non-None target keys its
