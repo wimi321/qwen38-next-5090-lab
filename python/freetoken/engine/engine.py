@@ -128,6 +128,8 @@ def _resolve_auto_attention_backend(
         candidates.append(("dsa", True))
     if AttnType.BSA in required:
         candidates.append(("m3_sparse", True))
+    if AttnType.QSA in required:
+        candidates += [("qsa_triton", True), ("qsa_torch", True)]
     if AttnType.SWA in required:
         candidates.append(("triton", True))
     if AttnType.FULL in required:
@@ -170,13 +172,25 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
 
     model_config = config.model_config
     backend_parts = [p.strip() for p in config.attention_backend.split(",")]
+    if AttnType.QSA in required and len(backend_parts) != 1:
+        # HybridBackend only exposes the generic attention ``forward`` entry
+        # point. QSA has a wider semantic call (index query/key + transform), so
+        # accepting a comma composition here would pass capability validation
+        # and then fail on the first QSA layer with no ``qsa_forward`` method.
+        raise ValueError(
+            "QSA requires one dedicated attention backend; comma-composed "
+            f"backends are unsupported, got {config.attention_backend!r}"
+        )
     for part in backend_parts:
         info = attention_backend_info(part)
         missing = required - info.supported_types
         if missing:
             valid = [
                 name
-                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse")
+                for name in (
+                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse",
+                    "m3_sparse", "qsa_triton", "qsa_torch",
+                )
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -1292,11 +1306,11 @@ def _adjust_config(config: EngineConfig):
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
-    if AttnType.BSA in required_attn_types and _dtype is not None and _dtype.itemsize != 2:
-        # Reject at config time: the BSA pool's own assert only fires after the
+    if required_attn_types & {AttnType.BSA, AttnType.QSA} and _dtype is not None and _dtype.itemsize != 2:
+        # Reject at config time: the sparse pools' own checks only fire after the
         # model is resident (and not at all under `python -O`).
         raise ValueError(
-            f"--dtype {config.dtype}: block-sparse attention serves 16-bit "
+            f"--dtype {config.dtype}: indexed sparse attention serves 16-bit "
             "compute only (the index slab budgets 2 bytes/token); use bfloat16 "
             "or float16."
         )
@@ -1318,6 +1332,17 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    if not all(
+        attention_backend_info(part).supports_cuda_graph
+        for part in config.attention_backend.split(",")
+    ):
+        # qsa_torch is intentionally dynamic and correctness-first.  Empty graph
+        # sizes are the existing GraphRunner contract for eager-only serving.
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.warning_rank0(
+            f"CUDA graph is disabled for attention backend {config.attention_backend!r}"
+        )
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

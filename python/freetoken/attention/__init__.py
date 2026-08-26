@@ -37,6 +37,10 @@ class BackendInfo:
     # linear layers bypass the backend entirely, but a backend whose metadata or
     # graph machinery assumes layer 0 is an attention layer can opt out here.
     hybrid_linear_ok: bool = True
+    # Correctness/reference backends may deliberately use dynamic Python/Torch
+    # control flow.  Config resolution disables graph batch sizes for them so
+    # GraphRunner never attempts an invalid capture.
+    supports_cuda_graph: bool = True
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -130,6 +134,36 @@ def create_m3_sparse_backend(config: ModelConfig):
     from .m3_sparse import M3SparseAttnBackend
 
     return M3SparseAttnBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "qsa_triton",
+    BackendInfo(
+        supported_types=frozenset({AttnType.QSA}),
+        hybrid_linear_ok=True,
+        # Fixed-shape metadata exists, but QSA capture/replay has not yet passed
+        # target-hardware validation. Do not let GraphRunner advertise it early.
+        supports_cuda_graph=False,
+    ),
+)
+def create_qsa_triton_backend(config: ModelConfig):
+    from .qsa_triton import QSATritonBackend
+
+    return QSATritonBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "qsa_torch",
+    BackendInfo(
+        supported_types=frozenset({AttnType.QSA}),
+        hybrid_linear_ok=True,
+        supports_cuda_graph=False,
+    ),
+)
+def create_qsa_torch_backend(config: ModelConfig):
+    from .qsa import QSAReferenceBackend
+
+    return QSAReferenceBackend(config)
 
 
 def attention_backend_info(name: str) -> BackendInfo:

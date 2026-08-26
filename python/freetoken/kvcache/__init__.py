@@ -57,6 +57,12 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .dsa_pool import MLAKVCache
 
         return MLAKVCache
+    if AttnType.QSA in types:
+        if AttnType.BSA in types:
+            raise ValueError("QSA and MiniMax BSA cannot share one KV pool")
+        from .qsa_pool import QSAKVCache
+
+        return QSAKVCache
     if AttnType.BSA in types:
         from .bsa_pool import BSAKVCache
 
@@ -157,6 +163,30 @@ def create_kvcache_pool(
     # with mla=False -> the MHA pool plus the index-key slab. The same spec fields
     # drive the KV cost model, so the factory and the budget can never disagree.
     from freetoken.attention import AttnType as _AttnType
+
+    # Qwen QSA is an explicit group/family.  Main KV and raw index keys are both
+    # subset-allocated from spec.layer_ids; never route this through BSA, whose
+    # 128-token page/block contract is MiniMax-specific.
+    if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.QSA:
+        from .qsa_pool import QSAKVCache
+
+        spec = kv_specs[0]
+        if spec.num_index_layers != len(spec.layer_ids):
+            raise ValueError(
+                "QSA spec must allocate one index slab per owned KV layer: "
+                f"num_index_layers={spec.num_index_layers}, layer_ids={spec.layer_ids}"
+            )
+        return QSAKVCache(
+            num_kv_heads=spec.num_kv_heads,
+            num_layers=model_config.num_layers,
+            head_dim=spec.head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            index_head_dim=spec.index_head_dim,
+            layer_ids=spec.layer_ids,
+        )
 
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:
         from .bsa_pool import BSAKVCache

@@ -24,6 +24,11 @@ class AttnType(str, Enum):
     # GQA block-sparse (MiniMax-M3): paged GQA K/V + a per-sparse-layer index-key
     # slab; the indexer picks top-k 128-token blocks per query -> BSAKVCache
     BSA = "bsa"
+    # Qwen QSA: paged GQA K/V + one raw index-key row per token.  Four-token
+    # microblocks are mean-pooled at selection time and top-k is expressed as a
+    # token budget.  Keep this distinct from BSA: MiniMax's 128-token pages,
+    # forced local/init blocks, and index-score semantics are not compatible.
+    QSA = "qsa"
 
     @property
     def backend_driven(self) -> bool:

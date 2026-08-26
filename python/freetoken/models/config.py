@@ -161,6 +161,60 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
 
 
 @dataclass(frozen=True)
+class QSAAttentionGroupConfig(BaseAttentionGroupConfig):
+    """Qwen Query-Selective Attention (QSA) geometry.
+
+    QSA is deliberately a standalone group instead of a
+    :class:`FullAttentionGroupConfig` carrying ``index_head_dim``.  The latter
+    is the legacy MiniMax-M3 discriminator and resolves to ``AttnType.BSA``;
+    treating QSA as that family would silently select 128-token blocks and the
+    wrong cache/backend.  QSA's index keys are stored per token, then
+    mean-pooled in ``indexer_compress_ratio`` microblocks while selecting.
+
+    The first correctness backend implements the released Qwen geometry with
+    one index KV head.  Keeping that constraint explicit is safer than
+    allocating a multi-head slab that the selector would accidentally flatten.
+    """
+
+    kind: ClassVar[Literal["qsa"]] = "qsa"
+    cache_kind: ClassVar[Literal["qsa_kv"]] = "qsa_kv"
+
+    num_kv_heads: int
+    head_dim: int
+    rotary_config: RotaryConfig
+    indexer_n_heads: int
+    indexer_kv_heads: int
+    indexer_head_dim: int
+    indexer_budget: int
+    indexer_compress_ratio: int = 4
+
+    def __post_init__(self) -> None:
+        if not self.layer_ids:
+            raise ValueError("QSA attention group must own at least one layer")
+        if len(set(self.layer_ids)) != len(self.layer_ids):
+            raise ValueError(f"QSA layer_ids must be unique, got {self.layer_ids}")
+        if self.indexer_n_heads <= 0 or self.indexer_kv_heads != 1:
+            raise ValueError(
+                "QSA correctness backend requires indexer_n_heads > 0 and "
+                f"indexer_kv_heads == 1, got {self.indexer_n_heads}/"
+                f"{self.indexer_kv_heads}"
+            )
+        if self.indexer_head_dim <= 0:
+            raise ValueError("QSA indexer_head_dim must be positive")
+        if self.indexer_compress_ratio <= 0:
+            raise ValueError("QSA indexer_compress_ratio must be positive")
+        if (
+            self.indexer_budget < self.indexer_compress_ratio
+            or self.indexer_budget % self.indexer_compress_ratio
+        ):
+            raise ValueError(
+                "QSA indexer_budget must be a positive multiple of "
+                f"indexer_compress_ratio, got budget={self.indexer_budget}, "
+                f"ratio={self.indexer_compress_ratio}"
+            )
+
+
+@dataclass(frozen=True)
 class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     """DSV4 sparse attention (window + compressed tiers + Lightning Indexer). Standalone
     class on purpose: subclassing SWAAttentionGroupConfig would flip has_swa_attention
@@ -179,6 +233,7 @@ AttentionGroupConfig: TypeAlias = (
     FullAttentionGroupConfig
     | SWAAttentionGroupConfig
     | LinearGatedDeltaGroupConfig
+    | QSAAttentionGroupConfig
     | DSV4AttentionGroupConfig
 )
 
@@ -288,6 +343,10 @@ class ModelConfig:
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
     # code; None for every other model.
     m3_args: Any | None = None
+    # Qwen4-Exp / Qwen3.8-Flash-Next text payload: QSA geometry, four-stream
+    # hyper-connections and PLE hash/cache parameters.  Kept opaque to the
+    # model-agnostic engine just like dsv4_args/m3_args.
+    qwen4_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
@@ -382,6 +441,8 @@ class ModelConfig:
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
             return AttnType.DSV4
+        if isinstance(group, QSAAttentionGroupConfig):
+            return AttnType.QSA
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -435,6 +496,22 @@ class ModelConfig:
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
                         attn_type=AttnType.DSV4,
+                    )
+                )
+            elif isinstance(group, QSAAttentionGroupConfig):
+                specs.append(
+                    KVCacheGroupSpec(
+                        name=group.name,
+                        layer_ids=group.layer_ids,
+                        num_kv_heads=group.num_kv_heads,
+                        head_dim=group.head_dim,
+                        sliding_window=None,
+                        index_head_dim=group.indexer_head_dim,
+                        # QSA owns one index slab per QSA layer.  Derive this
+                        # from the same layer_ids tuple as main K/V so sizing and
+                        # physical allocation cannot drift apart.
+                        num_index_layers=len(group.layer_ids),
+                        attn_type=AttnType.QSA,
                     )
                 )
         return tuple(specs)
