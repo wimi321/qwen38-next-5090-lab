@@ -68,9 +68,15 @@ def fused_topk(
     softmax_first = not renormalize
     if softmax_first:
         logits = torch.softmax(logits, dim=-1)
+    # triton_kernels uses ``tl.arange(0, N_EXPTS_ACT)`` and therefore only
+    # accepts power-of-two k values. Qwen4 routes top-10, so ask the fused
+    # kernel for the next power of two and compact the candidate set below.
+    # The kernel returns candidates ordered by expert id, not by score; simply
+    # slicing the first ``topk`` entries would select the wrong experts.
+    kernel_topk = 1 << (topk - 1).bit_length()
     sparse_topk = triton_kernels_topk(
         logits,
-        topk,
+        kernel_topk,
         apply_softmax=not softmax_first,
     )
     if hasattr(sparse_topk, "vals"):
@@ -78,6 +84,11 @@ def fused_topk(
         topk_ids = sparse_topk.indx
     else:
         topk_weights, topk_ids = sparse_topk[:2]
+    if kernel_topk != topk:
+        topk_weights, candidate_positions = torch.topk(topk_weights, topk, dim=-1)
+        topk_ids = torch.gather(topk_ids, -1, candidate_positions)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_ids = topk_ids.to(torch.int32)
     if num_token_non_padded is not None:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
