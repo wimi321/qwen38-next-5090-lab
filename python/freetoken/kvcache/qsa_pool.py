@@ -111,16 +111,30 @@ class QSAKVCache(MHAKVCache):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
+        num_rows = int(out_loc.numel())
+        row_shape = self._storage_shape[1:]
+        row_width = int(row_shape[0]) * int(row_shape[1])
+
+        def _flatten(name: str, value: torch.Tensor) -> torch.Tensor:
+            if value.shape[0] != num_rows or value.numel() != num_rows * row_width:
+                raise ValueError(
+                    f"QSA {name} must contain {num_rows} rows of width {row_width}, "
+                    f"got {tuple(value.shape)}"
+                )
+            return value.reshape(num_rows, row_width).contiguous()
+
+        k_flat = _flatten("key", k)
+        v_flat = _flatten("value", v)
         # The production path keeps using the fused scatter.  A tiny CPU fallback
         # makes allocation/addressing tests independent of CUDA/Triton.
         if self._device.type != "cpu":
-            return super().store_kv(k, v, out_loc, layer_id)
+            return super().store_kv(k_flat, v_flat, out_loc, layer_id)
         dense = self._dense(layer_id)
         rows = out_loc.to(torch.long)
         k_rows = self._k_buffer[dense].view(self._storage_shape)
         v_rows = self._v_buffer[dense].view(self._storage_shape)
-        k_rows[rows] = k.view(-1, *self._storage_shape[1:])
-        v_rows[rows] = v.view(-1, *self._storage_shape[1:])
+        k_rows[rows] = k_flat.view(-1, *row_shape)
+        v_rows[rows] = v_flat.view(-1, *row_shape)
 
     def rebuild(self, num_pages: int) -> None:
         self._index_k_buffer = None

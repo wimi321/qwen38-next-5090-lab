@@ -138,6 +138,35 @@ def test_store_rebuild_and_unit_bytes_cpu():
     assert pool._index_k_buffer.shape == (2, 10, 4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_store_kv_cuda_flattens_multihead_rows():
+    pool = QSAKVCache(
+        num_kv_heads=2,
+        num_layers=1,
+        head_dim=8,
+        num_pages=4,
+        page_size=2,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        index_head_dim=4,
+        layer_ids=(0,),
+    )
+    rows = torch.tensor([1, 6], dtype=torch.int32, device="cuda")
+    key = torch.arange(32, dtype=torch.bfloat16, device="cuda").view(2, 2, 8)
+    value = key + 40
+
+    pool.store_kv(key, value, rows, layer_id=0)
+    torch.cuda.synchronize()
+
+    cached_key = pool.k_cache(0).view(-1, 2, 8).index_select(0, rows.long())
+    cached_value = pool.v_cache(0).view(-1, 2, 8).index_select(0, rows.long())
+    assert torch.equal(cached_key, key)
+    assert torch.equal(cached_value, value)
+
+    with pytest.raises(ValueError, match="rows of width 16"):
+        pool.store_kv(key[:, :1], value, rows, layer_id=0)
+
+
 def test_qsa_group_rejects_unsupported_or_ambiguous_geometry():
     base = dict(
         name="qsa",
