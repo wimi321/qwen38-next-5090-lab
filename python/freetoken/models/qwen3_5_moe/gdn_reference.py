@@ -65,22 +65,28 @@ def recurrent_gated_delta_rule(
 
 
 class _RMSNormGated(nn.Module):
-    """RMSNorm of x followed by a silu(z) gate (norm_before_gate=True).
+    """RMSNorm of x followed by an output gate (norm_before_gate=True).
 
     Mirrors ``Qwen3_5MoeRMSNormGated`` over head_v_dim groups.
     """
 
-    def __init__(self, dim: int, eps: float):
+    def __init__(self, dim: int, eps: float, activation: str = "silu"):
         super().__init__()
+        if activation not in {"silu", "sigmoid"}:
+            raise ValueError(
+                f"GDN output gate must be 'silu' or 'sigmoid', got {activation!r}"
+            )
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.activation = activation
 
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         x = x * self.weight.float()
-        x = x * F.silu(z.float())
+        gate = F.silu(z.float()) if self.activation == "silu" else torch.sigmoid(z.float())
+        x = x * gate
         return x.to(in_dtype)
 
 
@@ -97,6 +103,7 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         conv_kernel_size: int,
         rms_norm_eps: float,
         hidden_act: str = "silu",
+        output_gate_type: str = "silu",
     ):
         super().__init__()
         if hidden_act != "silu":
@@ -120,7 +127,9 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         )
         self.dt_bias = nn.Parameter(torch.zeros(num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(num_v_heads))
-        self.norm = _RMSNormGated(head_v_dim, eps=rms_norm_eps)
+        self.norm = _RMSNormGated(
+            head_v_dim, eps=rms_norm_eps, activation=output_gate_type
+        )
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
     @torch.no_grad()
