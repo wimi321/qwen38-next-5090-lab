@@ -761,6 +761,14 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
+        # Snapshot the exact token-pool rows this forward will consume before any
+        # graph-external auxiliary staging.  Under overlap scheduling the sampled
+        # decode token is already in token_pool, while Req.input_ids is not updated
+        # until the previous batch drains.  Models with CPU-side staging (Qwen4
+        # PLE) must therefore use this snapshot, and model.forward must reuse it.
+        batch.positions = _make_positions(batch, self.device)
+        input_mapping = _make_input_tuple(batch, self.device)
+        batch.input_ids = self.token_pool[input_mapping]
         # Qwen4 PLE hashes token history and fetches sparse mmap rows on the CPU.
         # Stage those values before model.forward so eager decode and CUDA-graph
         # replay share the same GPU-only operator path.
@@ -786,8 +794,6 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.allocate_paged(batch.reqs)
         if batch.is_prefill:
             self._gather_multimodal(batch)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_state_pool is not None:
@@ -871,7 +877,6 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
-        batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)

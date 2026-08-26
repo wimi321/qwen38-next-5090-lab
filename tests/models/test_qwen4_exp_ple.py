@@ -480,6 +480,7 @@ def test_decode_downstream_failure_leaves_committed_pool_unchanged_until_retry_s
         padded_reqs=[req],
         is_decode=True,
         size=1,
+        input_ids=torch.tensor([11]),
     )
     decode_hidden = torch.randn(1, 8)
     expected_output, expected_state = layer.forward(
@@ -520,6 +521,53 @@ def test_decode_downstream_failure_leaves_committed_pool_unchanged_until_retry_s
     assert expected_state.token_history is not None
     torch.testing.assert_close(pool.token_history[0], expected_state.token_history[0])
     torch.testing.assert_close(pool.conv_states[0], expected_state.conv_state[0])
+
+
+def test_decode_staging_uses_batch_snapshot_while_req_host_view_lags():
+    from freetoken.kvcache.ple_state_pool import PLEStatePool
+
+    layer = _make_tiny_ple()
+    pool = PLEStatePool(
+        num_slots=2,
+        context_len=2,
+        channels=8,
+        conv_state_len=6,
+        eos_token_id=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    pool.commit(
+        0,
+        torch.tensor([5, 7]),
+        torch.zeros(8, 6, dtype=torch.float32),
+    )
+    # Engine.complete_one() has advanced the logical device length, but overlap
+    # scheduling has not yet appended sampled token 11 to the host Req view.
+    req = SimpleNamespace(
+        input_ids=torch.tensor([5, 7]),
+        table_idx=0,
+        cached_len=2,
+        device_len=3,
+        extend_len=1,
+    )
+    batch = SimpleNamespace(
+        reqs=[req],
+        padded_reqs=[req],
+        is_decode=True,
+        size=1,
+        input_ids=torch.tensor([11]),
+    )
+
+    layer.stage_decode_batch(
+        batch, pool, device=torch.device("cpu"), dtype=torch.float32
+    )
+    assert torch.equal(batch.ple_next_token_history, torch.tensor([[7, 11]]))
+
+    del batch.input_ids
+    with pytest.raises(ValueError, match="host token view is not drained"):
+        layer.stage_decode_batch(
+            batch, pool, device=torch.device("cpu"), dtype=torch.float32
+        )
 
 
 def _write_safetensors(path, tensors):

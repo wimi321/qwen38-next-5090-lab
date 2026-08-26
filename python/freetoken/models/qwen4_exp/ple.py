@@ -1306,18 +1306,39 @@ class Qwen4ExpPLELayer(BaseOP):
         next_histories: list[torch.Tensor] = []
         reset_flags: list[bool] = []
         slots: list[int] = []
-        for req in reqs:
+        batch_input_ids = getattr(batch, "input_ids", None)
+        if batch_input_ids is not None:
+            if batch_input_ids.ndim != 1 or batch_input_ids.numel() != len(reqs):
+                raise ValueError(
+                    "PLE decode batch.input_ids must contain one token per padded "
+                    f"request, got {tuple(batch_input_ids.shape)} for {len(reqs)} requests"
+                )
+            # Hashing and mmap lookup are CPU work.  This single transfer also
+            # synchronizes the scheduler-stream token snapshot produced from the
+            # GPU token pool after the previous sampled-token write.
+            decode_token_ids = batch_input_ids.detach().to(device="cpu", dtype=torch.long)
+        else:
+            # Direct callers and capture-focused unit tests may not own a scheduler
+            # token pool. Their Req host view must already be fully drained.
+            decode_token_ids = None
+
+        for row, req in enumerate(reqs):
             length = int(req.extend_len)
             if length != 1:
                 raise ValueError(
                     "PLE decode staging requires exactly one token per padded "
                     f"request, got extend_len={length} for slot {req.table_idx}"
                 )
-            token_ids = req.input_ids[req.cached_len : req.device_len]
-            if token_ids.numel() != 1:
-                raise ValueError(
-                    f"request {req.table_idx} exposes {token_ids.numel()} decode token ids"
-                )
+            if decode_token_ids is not None:
+                token_ids = decode_token_ids[row : row + 1]
+            else:
+                token_ids = req.input_ids[req.cached_len : req.device_len]
+                if token_ids.numel() != 1:
+                    raise ValueError(
+                        f"request {req.table_idx} exposes {token_ids.numel()} decode token ids; "
+                        "its host token view is not drained and no batch.input_ids snapshot "
+                        "was provided"
+                    )
             history, reset = pool.stage_token_history(
                 req.table_idx, fresh=int(req.cached_len) == 0
             )
