@@ -144,6 +144,21 @@ def audit(root: Path = ROOT) -> list[str]:
         if expected_sglang_digest not in lock_text:
             errors.append("uv.lock must retain the audited SGLang cu130 wheel SHA256")
 
+    public_identity_checks = {
+        root / "python" / "freetoken" / "server" / "api_models.py": (
+            'owned_by: str = "qwen38-next-5090-lab"'
+        ),
+        root / "python" / "freetoken" / "server" / "api_server.py": (
+            'FastAPI(title="Qwen3.8 Next 5090 Lab API"'
+        ),
+        root / "python" / "freetoken" / "server" / "args.py": (
+            'description="Qwen3.8 Next 5090 Lab server arguments"'
+        ),
+    }
+    for identity_path, expected in public_identity_checks.items():
+        if expected not in identity_path.read_text(encoding="utf-8"):
+            errors.append(f"downstream public API identity is missing from {identity_path.name}")
+
     workflows = root / ".github" / "workflows"
     for path in workflows.glob("*.yml"):
         text = path.read_text(encoding="utf-8")

@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 from __future__ import annotations
 
 import asyncio
@@ -414,7 +415,7 @@ def install_cors(app: FastAPI, origins_csv: str) -> None:
     )
 
 
-app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifespan)
+app = FastAPI(title="Qwen3.8 Next 5090 Lab API", version=__version__, lifespan=lifespan)
 register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)

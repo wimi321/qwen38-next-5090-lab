@@ -213,7 +213,9 @@ def parse_args(
             return "gemma4"
         return None
 
-    parser = argparse.ArgumentParser(prog=prog, description="FreeToken Server Arguments")
+    parser = argparse.ArgumentParser(
+        prog=prog, description="Qwen3.8 Next 5090 Lab server arguments"
+    )
 
     parser.add_argument(
         "--model-path",

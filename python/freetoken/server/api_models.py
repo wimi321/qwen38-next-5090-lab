@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 from __future__ import annotations
 
 import time
@@ -132,7 +133,7 @@ class ModelCard(BaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "FreeToken"
+    owned_by: str = "qwen38-next-5090-lab"
     root: str
     # The model's own limit, not the KV budget in force. Two spellings of the same number:
     # `max_model_len` is vLLM/SGLang's, `context_length` what most other clients look for.

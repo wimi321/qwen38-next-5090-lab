@@ -36,6 +36,8 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wheel pinned by SHA-256, avoiding an ambiguous duplicate-hash index entry.
 - `q38lab doctor` accepts the measured WDDM display reservation while still
   requiring at least 30,000 MiB free before the fixed RTX 5090 profile starts.
+- OpenAI model metadata, FastAPI documentation, and server help identify this
+  downstream instead of presenting it as the official FreeToken service.
 
 ### Known limitations
 
