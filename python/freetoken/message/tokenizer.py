@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from freetoken.core import SamplingParams
+from freetoken.multimodal import ImageTokenSpan, MediaPayload
 
 from .utils import deserialize_type, serialize_type
 
@@ -48,6 +49,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Optional cumulative engine-side counters.  Only terminal generation replies
+    # carry this payload so collecting native PLE counters cannot add work to every
+    # decoded token.  The tokenizer forwards it verbatim to the frontend stats
+    # tracker; None preserves the wire format for every other model/request step.
+    runtime_telemetry: dict[str, Any] | None = None
 
 
 @dataclass
@@ -72,6 +78,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    media: List[MediaPayload] | None = None
 
 
 @dataclass

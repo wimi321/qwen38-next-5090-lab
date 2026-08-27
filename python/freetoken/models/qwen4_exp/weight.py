@@ -9,8 +9,9 @@ This loader intentionally targets that one layout.  In particular, it does not
 try to reinterpret another Qwen4-Exp quantization policy:
 
 * ``model.language_model.*`` becomes FreeToken's ``model.*`` namespace;
-* the vision tower, MTP head, routed experts, and all ``ple_embedding`` tensors
-  are skipped before their safetensors shards are opened;
+* the MTP head, routed experts, and all ``ple_embedding`` tensors are skipped
+  before their safetensors shards are opened; the vision tower is loaded only
+  when the opt-in image profile enables it;
 * q/k/v, the four GDN input projections, and shared-expert gate/up are fused on
   their output dimension; and
 * every norm tensor is passed through verbatim.  Qwen4-Exp modules implement
@@ -93,7 +94,7 @@ def _uses_w4a4_activation_recipe(hf_config) -> bool:
     return False
 
 
-def _rename(raw_name: str) -> str | None:
+def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
     """Map one HF tensor name to a resident FreeToken key, or skip it.
 
     Skips are decided from the index name.  Consequently the 51 GB PLE table,
@@ -101,18 +102,18 @@ def _rename(raw_name: str) -> str | None:
     the normal state-dict pass.
     """
 
-    if raw_name.startswith(
-        (
-            "mtp.",
-            "model.mtp.",
-            "model.visual.",
-            "visual.",
-            # Be explicit about wrapper variants even though the pinned revision
-            # currently stores visual/MTP outside model.language_model.
-            "model.language_model.mtp.",
-            "model.language_model.visual.",
-        )
-    ):
+    visual_prefixes = (
+        "model.visual.",
+        "visual.",
+        "model.language_model.visual.",
+    )
+    if raw_name.startswith(visual_prefixes):
+        if not include_vision:
+            return None
+        for prefix in visual_prefixes:
+            if raw_name.startswith(prefix):
+                return "visual." + raw_name[len(prefix) :]
+    if raw_name.startswith(("mtp.", "model.mtp.", "model.language_model.mtp.")):
         return None
     if _ROUTED_EXPERT_RE.search(raw_name):
         return None
@@ -247,7 +248,11 @@ def iter_weights(
     # guard: it rejects anything whose routed experts are not the pinned ModelOpt
     # NVFP4 format.  No alternate dense quantization path is intentionally present.
     hf_config = cached_load_hf_config(model_path)
-    parse_config(hf_config)
+    model_config = parse_config(hf_config)
+    # Older downstream config stubs and loader-only tests do not expose the
+    # multimodal capability flag.  Vision is opt-in, so absence must retain the
+    # historical text-only loading behaviour.
+    include_vision = bool(getattr(model_config, "is_multimodal", False))
     if _uses_w4a4_activation_recipe(hf_config):
         logger.warning_rank0(
             "Qwen3.8 checkpoint declares ModelOpt NVFP4 W4A4 activations, but "
@@ -280,7 +285,7 @@ def iter_weights(
         ):
             if raw_name in consumed_fusion_parts:
                 continue
-            name = _rename(raw_name)
+            name = _rename(raw_name, include_vision=include_vision)
             if name is None:
                 continue
 

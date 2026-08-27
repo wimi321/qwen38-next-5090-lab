@@ -1,4 +1,4 @@
-"""Text-only Qwen4-Exp / Qwen3.8-Flash-Next model."""
+"""Qwen4-Exp / Qwen3.8-Flash-Next text and opt-in image model."""
 
 from __future__ import annotations
 
@@ -24,9 +24,35 @@ from .ple import (
     SafetensorsRowShard,
     ShardedSafetensorsMmapRowBank,
 )
+from .vision import Qwen4ExpVisionModel
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+_DEBUG_FINITE = os.getenv("Q38LAB_DEBUG_FINITE", "0") == "1"
+
+
+def _debug_require_finite(label: str, value: torch.Tensor) -> None:
+    """Fail at the first corrupt Qwen4-Exp activation during opt-in bring-up.
+
+    The check deliberately stays behind an import-time environment flag: each
+    ``isfinite().all().item()`` synchronizes CUDA and would otherwise distort
+    serving latency.  Keeping the diagnostic next to the model makes a full
+    checkpoint failure identify the first PLE/attention/MoE boundary instead of
+    surfacing later as greedy token id 0 from all-NaN logits.
+    """
+
+    if not _DEBUG_FINITE:
+        return
+    finite = torch.isfinite(value)
+    if bool(finite.all().item()):
+        return
+    invalid = int((~finite).sum().item())
+    raise RuntimeError(
+        f"Qwen4-Exp non-finite activation at {label}: "
+        f"shape={tuple(value.shape)}, dtype={value.dtype}, invalid={invalid}"
+    )
 
 
 class _DeferredRowBank:
@@ -144,24 +170,35 @@ class Qwen4ExpDecoderLayer(BaseOP):
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
+        _debug_require_finite(f"layer.{self._layer_id}.input", hidden_states)
         if self.ple is not None:
             if ctx.ple_state_pool is None:
                 raise RuntimeError("Qwen4-Exp PLE state pool is not initialized")
-            hidden_states = hidden_states + self.ple.forward_flat(
+            ple_output = self.ple.forward_flat(
                 hidden_states, ctx.batch, ctx.ple_state_pool
             )
+            _debug_require_finite(f"layer.{self._layer_id}.ple", ple_output)
+            hidden_states = hidden_states + ple_output
+            _debug_require_finite(f"layer.{self._layer_id}.post_ple", hidden_states)
 
         mixed, hyper_input, write = self.attn_hyper_connection.forward(hidden_states)
+        _debug_require_finite(f"layer.{self._layer_id}.attn_read", mixed)
         block = (
             self.linear_attn.forward(mixed)
             if self._is_linear
             else self.self_attn.forward(mixed)
         )
+        _debug_require_finite(f"layer.{self._layer_id}.attn_block", block)
         hidden_states = self._inject(block, hyper_input, write)
+        _debug_require_finite(f"layer.{self._layer_id}.post_attn", hidden_states)
 
         mixed, hyper_input, write = self.mlp_hyper_connection.forward(hidden_states)
+        _debug_require_finite(f"layer.{self._layer_id}.mlp_read", mixed)
         block = self.mlp.forward(mixed)
-        return self._inject(block, hyper_input, write)
+        _debug_require_finite(f"layer.{self._layer_id}.mlp_block", block)
+        hidden_states = self._inject(block, hyper_input, write)
+        _debug_require_finite(f"layer.{self._layer_id}.output", hidden_states)
+        return hidden_states
 
 
 class Qwen4ExpModel(BaseOP):
@@ -182,13 +219,56 @@ class Qwen4ExpModel(BaseOP):
             rms_norm_eps=config.rms_norm_eps,
             use_combine=False,
         )
+        self._image_token_id = config.image_token_id
+
+    def _merge_multimodal(
+        self, input_ids: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Replace image placeholders before the four residual streams are copied."""
+
+        mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
+        if mm_embeds is None or self._image_token_id is None:
+            return hidden_states
+        indices = getattr(get_global_ctx().batch, "mm_embed_indices", None)
+        if indices is not None:
+            slots = int(indices.numel())
+            if slots != int(mm_embeds.shape[0]):
+                raise ValueError(
+                    "Qwen4-Exp image embedding/index mismatch in the current prefill chunk: "
+                    f"{slots} destinations != {mm_embeds.shape[0]} feature rows"
+                )
+            # The scheduler already computed exact destinations while slicing
+            # the CPU-resident image plan.  Reusing them avoids mask.sum().item(),
+            # which would synchronize the 5090 once per 512-token chunk.
+            merged = hidden_states.clone()
+            merged.index_copy_(
+                0,
+                indices.to(device=hidden_states.device, dtype=torch.long),
+                mm_embeds.to(hidden_states.device, hidden_states.dtype),
+            )
+            return merged
+        mask = input_ids == self._image_token_id
+        slots = int(mask.sum().item())
+        if slots != int(mm_embeds.shape[0]):
+            raise ValueError(
+                "Qwen4-Exp image embedding/token mismatch in the current prefill chunk: "
+                f"{slots} placeholders != {mm_embeds.shape[0]} feature rows"
+            )
+        return hidden_states.masked_scatter(
+            mask.unsqueeze(-1), mm_embeds.to(hidden_states.device, hidden_states.dtype)
+        )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens.forward(input_ids)
+        _debug_require_finite("embedding", hidden_states)
+        hidden_states = self._merge_multimodal(input_ids, hidden_states)
+        _debug_require_finite("multimodal_merge", hidden_states)
         hidden_states = hidden_states.repeat(1, self._args.hc_count)
         for layer in self.layers.op_list:
             hidden_states = layer.forward(hidden_states)
-        return self.hyper_connection_mixer.forward(hidden_states)
+        hidden_states = self.hyper_connection_mixer.forward(hidden_states)
+        _debug_require_finite("final_mixer", hidden_states)
+        return hidden_states
 
     def ple_layers(self) -> Sequence[Qwen4ExpPLELayer]:
         return tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
@@ -251,7 +331,26 @@ class Qwen4ExpForConditionalGeneration(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
+        if config.is_multimodal:
+            self.visual = Qwen4ExpVisionModel(config.vision_config)
         super().__init__()
+
+    @torch.inference_mode()
+    def encode_images(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        **_: object,
+    ) -> torch.Tensor:
+        """Encode processor patches once; scheduler slices the returned rows per chunk."""
+
+        visual = getattr(self, "visual", None)
+        if visual is None:
+            raise RuntimeError(
+                "Qwen4-Exp vision is disabled; use the rtx5090-wsl2-256k-image profile "
+                "or set FREETOKEN_LOAD_VISION=1 before model construction"
+            )
+        return visual.forward(pixel_values, image_grid_thw)
 
     def setup_auxiliary_banks(
         self,
@@ -328,7 +427,9 @@ class Qwen4ExpForConditionalGeneration(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         hidden = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(hidden)
+        logits = self.lm_head.forward(hidden)
+        _debug_require_finite("lm_head", logits)
+        return logits
 
 
 __all__ = [

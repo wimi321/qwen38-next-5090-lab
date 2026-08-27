@@ -1,7 +1,8 @@
 # Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+import time
+from typing import TYPE_CHECKING, Any, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
@@ -20,6 +21,7 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
+from freetoken.multimodal import MMEmbeddingPlan
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
@@ -46,6 +48,37 @@ Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
+
+
+def _sum_nested_counter(value: Any, key: str) -> int:
+    """Sum one native telemetry counter without double-counting rollups.
+
+    A leaf reader exposes counters directly.  A sharded bank exposes only a
+    ``shards`` list today, while future implementations may also expose a
+    pre-aggregated value.  Prefer that direct value when present; otherwise
+    recurse through mappings/sequences.
+    """
+
+    if isinstance(value, dict):
+        direct = value.get(key)
+        if isinstance(direct, (int, float)) and not isinstance(direct, bool):
+            return int(direct)
+        return sum(_sum_nested_counter(child, key) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_sum_nested_counter(child, key) for child in value)
+    return 0
+
+
+def _process_page_faults() -> int:
+    """Best-effort cumulative minor+major faults for this engine process."""
+
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return int(usage.ru_minflt + usage.ru_majflt)
+    except (ImportError, AttributeError, OSError):
+        return 0
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
@@ -138,6 +171,10 @@ class Scheduler(SchedulerIOMixin):
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
         )
+        self._runtime_telemetry: dict[str, dict[str, int | float]] = {
+            "vision": {"image_tokens": 0, "latency_ms": 0.0},
+            "prefill_chunks": {"count": 0, "total_ms": 0.0},
+        }
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -306,6 +343,14 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        if batch.is_prefill:
+            started_ns = getattr(batch, "_q38lab_prefill_started_ns", None)
+            if isinstance(started_ns, int):
+                counters = self._runtime_telemetry["prefill_chunks"]
+                counters["count"] = int(counters["count"]) + 1
+                counters["total_ms"] = float(counters["total_ms"]) + (
+                    time.perf_counter_ns() - started_ns
+                ) / 1_000_000
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -403,6 +448,13 @@ class Scheduler(SchedulerIOMixin):
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
             swa_used, swa_total = swa_tokens or (0, 0)
+            telemetry_snapshot = getattr(self, "_runtime_telemetry_snapshot", None)
+            terminal_telemetry = (
+                telemetry_snapshot()
+                if callable(telemetry_snapshot)
+                and any(message.finished for message in reply)
+                else None
+            )
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -411,6 +463,8 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                if m.finished:
+                    m.runtime_telemetry = terminal_telemetry
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -480,6 +534,82 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    def _runtime_telemetry_snapshot(self) -> dict[str, dict[str, int | float]]:
+        """Collect cumulative release-evidence counters at a terminal boundary.
+
+        Native PLE readers use locks while copying their counters, so this is
+        intentionally called once per completed request rather than once per
+        sampled token.
+        """
+
+        bytes_read = cache_hits = cache_misses = wait_ns = 0
+        engine = getattr(self, "engine", None)
+        banks = getattr(engine, "auxiliary_banks", {})
+        for bank in banks.values():
+            callback = getattr(bank, "telemetry", None)
+            if not callable(callback):
+                continue
+            value = callback()
+            bytes_read += _sum_nested_counter(value, "storage_bytes")
+            cache_hits += _sum_nested_counter(value, "cache_hit_pages")
+            cache_misses += _sum_nested_counter(value, "cache_miss_pages")
+            wait_ns += _sum_nested_counter(value, "wait_ns")
+
+        kv_cache = getattr(engine, "kv_cache", None)
+        selector_callback = getattr(kv_cache, "selector_telemetry", None)
+        selector = selector_callback() if callable(selector_callback) else {
+            "workspace_peak_bytes": int(
+                getattr(kv_cache, "selector_workspace_peak_bytes", 0)
+            ),
+            "native_calls": 0,
+            "fallback_calls": 0,
+            "errors": 0,
+        }
+        runtime = getattr(self, "_runtime_telemetry", {})
+        vision = runtime.get("vision", {"image_tokens": 0, "latency_ms": 0.0})
+        chunks = runtime.get("prefill_chunks", {"count": 0, "total_ms": 0.0})
+        moe_cache = getattr(engine, "moe_offload_cache", None)
+        moe_callback = getattr(moe_cache, "prefill_sparse_stats", None)
+        moe_prefill = moe_callback() if callable(moe_callback) else {
+            "active_rows": 0,
+            "possible_rows": 0,
+            "bytes_copied": 0,
+            "full_bytes": 0,
+            "row_fraction": 0.0,
+            "byte_fraction": 0.0,
+        }
+        return {
+            "selector": {
+                "workspace_peak_bytes": int(selector.get("workspace_peak_bytes", 0)),
+                "native_calls": int(selector.get("native_calls", 0)),
+                "fallback_calls": int(selector.get("fallback_calls", 0)),
+                "errors": int(selector.get("errors", 0)),
+            },
+            "ple": {
+                "bytes_read": bytes_read,
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "wait_ms": wait_ns / 1_000_000,
+                "page_faults": _process_page_faults(),
+            },
+            "vision": {
+                "image_tokens": int(vision["image_tokens"]),
+                "latency_ms": float(vision["latency_ms"]),
+            },
+            "prefill_chunks": {
+                "count": int(chunks["count"]),
+                "total_ms": float(chunks["total_ms"]),
+            },
+            "moe_prefill": {
+                "active_rows": int(moe_prefill["active_rows"]),
+                "possible_rows": int(moe_prefill["possible_rows"]),
+                "bytes_copied": int(moe_prefill["bytes_copied"]),
+                "full_bytes": int(moe_prefill["full_bytes"]),
+                "row_fraction": float(moe_prefill["row_fraction"]),
+                "byte_fraction": float(moe_prefill["byte_fraction"]),
+            },
+        }
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -495,11 +625,27 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            if msg.image_inputs is not None and not any(
+                callable(getattr(self.engine.model, name, None))
+                for name in ("encode_image_inputs", "encode_images")
+            ):
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error="this loaded model does not support image inputs",
+                            code="unsupported_content_type",
+                        )
+                    ]
+                )
+                return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+            requested_output_len = int(msg.sampling_params.max_tokens)
             max_output_len = max_seq_len - input_len
-            if max_output_len <= 0:
+            if max_output_len <= 0 or requested_output_len > max_output_len:
                 logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                    f"Requested context {input_len}+{requested_output_len} exceeds "
+                    f"{max_seq_len}, "
                     f"request {msg.uid} is dropped."
                 )
                 # Tell the client instead of dropping silently — otherwise its wait_for_ack
@@ -510,10 +656,11 @@ class Scheduler(SchedulerIOMixin):
                             uid=msg.uid,
                             # "prompt is too long: N tokens > M" is the phrasing Claude Code and
                             # OpenClaw match on; the Anthropic wire has no error code to read.
-                            error=(
-                                f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
-                                f"(prompt + generation); shorten the prompt or increase the KV "
-                                f"cache budget"
+                            error=_context_limit_message(
+                                msg,
+                                input_len,
+                                requested_output_len,
+                                max_seq_len,
                             ),
                             # OpenAI's standard class for this, for clients that read a code.
                             code="context_length_exceeded",
@@ -521,11 +668,6 @@ class Scheduler(SchedulerIOMixin):
                     ]
                 )
                 return
-            if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
-                logger.warning_rank0(
-                    f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
-                )
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -606,6 +748,7 @@ class Scheduler(SchedulerIOMixin):
         # double-freeing its table_idx and (hybrid) GDN slots onto the free-list, handing the same
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
+            Scheduler._clear_multimodal_resources(req)
             return
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
@@ -613,6 +756,27 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
+        # Cache admission must see ``is_multimodal`` above so image placeholders
+        # can never enter the shared text-prefix tree. Once the request is fully
+        # released, explicitly drop every potentially large vision reference.
+        Scheduler._clear_multimodal_resources(req)
+
+    @staticmethod
+    def _clear_multimodal_resources(req: Req) -> None:
+        # PLE look-ahead belongs to the request lifecycle as well. A queued
+        # future may already be running (cancel then returns false), but the
+        # native reader remains bounded and its tenured cache is model-owned;
+        # pending work that has not entered the ring is cancelled here.
+        for handle in getattr(req, "ple_prefetch_handles", ()):
+            cancel = getattr(handle, "cancel", None)
+            if callable(cancel):
+                cancel()
+        req.ple_prefetch_handles = ()
+        req.ple_prefetch_input_ids = None
+        req.mm_embeds = None
+        req.image_inputs = None
+        req.mm_plan = None
+        req.mrope_positions = None
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is
@@ -766,13 +930,17 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if batch.is_prefill:
+            batch._q38lab_prefill_started_ns = time.perf_counter_ns()
         self.engine.graph_runner.pad_batch(batch)
+        Scheduler._prepare_multimodal_plans(self, batch)
         # Snapshot the exact token-pool rows this forward will consume before any
         # graph-external auxiliary staging.  Under overlap scheduling the sampled
         # decode token is already in token_pool, while Req.input_ids is not updated
         # until the previous batch drains.  Models with CPU-side staging (Qwen4
         # PLE) must therefore use this snapshot, and model.forward must reuse it.
         batch.positions = _make_positions(batch, self.device)
+        batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         batch.input_ids = self.token_pool[input_mapping]
         # Qwen4 PLE hashes token history and fetches sparse mmap rows on the CPU.
@@ -842,9 +1010,78 @@ class Scheduler(SchedulerIOMixin):
         is kept (not cleared) so the cache manager can recognize multimodal requests and
         keep them out of the shared prefix cache (image placeholders share a token id but
         carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
-        if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+        legacy = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        plans = [req for req in batch.reqs if req.mm_plan is not None]
+        if legacy and plans:
+            raise RuntimeError("cannot mix legacy mm_embeds and MMEmbeddingPlan in one batch")
+        if legacy:
+            batch.mm_embeds = torch.cat(legacy, dim=0)
+            return
+        if not plans:
+            return
+
+        features: list[torch.Tensor] = []
+        indices: list[torch.Tensor] = []
+        total_tokens = sum(req.extend_len for req in batch.padded_reqs)
+        host_mask = torch.zeros(total_tokens, dtype=torch.bool)
+        batch_offset = 0
+        for req in batch.reqs:
+            chunk = req.mm_plan.select(req.cached_len, req.device_len) if req.mm_plan else None
+            if chunk is not None and chunk.features.numel():
+                features.append(chunk.features.to(self.device, non_blocking=True))
+                absolute_indices = chunk.token_indices + batch_offset
+                indices.append(absolute_indices)
+                host_mask[absolute_indices] = True
+            batch_offset += req.extend_len
+        if features:
+            batch.mm_embeds = torch.cat(features, dim=0)
+            batch.mm_embed_indices = torch.cat(indices).to(self.device, non_blocking=True)
+        else:
+            hidden = int(plans[0].mm_plan.features.shape[1])
+            batch.mm_embeds = torch.empty(
+                (0, hidden), dtype=plans[0].mm_plan.features.dtype, device=self.device
+            )
+            batch.mm_embed_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        batch.mm_placeholder_mask = host_mask.to(self.device, non_blocking=True)
+
+    def _prepare_multimodal_plans(self, batch: Batch) -> None:
+        """Run each online request's vision encoder exactly once."""
+
+        encode_inputs = getattr(self.engine.model, "encode_image_inputs", None)
+        encode_images = getattr(self.engine.model, "encode_images", None)
+        for req in batch.reqs:
+            image_inputs = getattr(req, "image_inputs", None)
+            if image_inputs is None or getattr(req, "mm_plan", None) is not None:
+                continue
+            started_ns = time.perf_counter_ns()
+            if callable(encode_inputs):
+                plan = encode_inputs(image_inputs)
+            elif callable(encode_images):
+                inputs = image_inputs
+                features = encode_images(
+                    inputs.pixel_values.to(self.device),
+                    inputs.image_grid_thw.to(self.device),
+                )
+                plan = MMEmbeddingPlan.from_image_spans(
+                    features.detach().to("cpu"), inputs.image_spans
+                )
+            else:
+                raise RuntimeError("model accepted image request without a vision encoder")
+            if not isinstance(plan, MMEmbeddingPlan):
+                raise TypeError("image encoder must return MMEmbeddingPlan")
+            # Force pageable CPU ownership. A model may naturally produce GPU
+            # features; keeping the full image span there defeats 256K budgeting.
+            if not plan.features.is_cpu:
+                plan = MMEmbeddingPlan(plan.features.detach().to("cpu"), plan.spans)
+            req.mm_plan = plan
+            req.image_inputs = None
+            counters = self._runtime_telemetry["vision"]
+            counters["image_tokens"] = int(counters["image_tokens"]) + int(
+                plan.features.shape[0]
+            )
+            counters["latency_ms"] = float(counters["latency_ms"]) + (
+                time.perf_counter_ns() - started_ns
+            ) / 1_000_000
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -905,6 +1142,53 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor | None:
+    """Slice prompt mRoPE or extend it with the request's scalar decode delta."""
+
+    if not any(getattr(req, "mrope_positions", None) is not None for req in batch.reqs):
+        return None
+    needed_size = sum(req.extend_len for req in batch.padded_reqs)
+    pin = torch.cuda.is_available()
+    result = torch.empty((3, needed_size), dtype=torch.int64, pin_memory=pin)
+    offset = 0
+    for req in batch.padded_reqs:
+        start, end = req.cached_len, req.device_len
+        length = end - start
+        prompt_positions = req.mrope_positions
+        copied = 0
+        if prompt_positions is not None and start < prompt_positions.shape[1]:
+            prompt_end = min(end, int(prompt_positions.shape[1]))
+            copied = prompt_end - start
+            result[:, offset : offset + copied].copy_(prompt_positions[:, start:prompt_end])
+        if copied < length:
+            generated_start = start + copied
+            generated = torch.arange(
+                generated_start,
+                end,
+                dtype=torch.int64,
+            ) + int(req.mrope_delta)
+            result[:, offset + copied : offset + length].copy_(generated.view(1, -1).expand(3, -1))
+        offset += length
+    return result.to(device, non_blocking=True)
+
+
+def _context_limit_message(
+    msg: UserMsg,
+    input_len: int,
+    requested_output_len: int,
+    max_seq_len: int,
+) -> str:
+    image_tokens = msg.image_inputs.image_tokens if msg.image_inputs is not None else 0
+    text_tokens = input_len - image_tokens
+    requested_total = input_len + requested_output_len
+    return (
+        f"prompt is too long for the requested output: {text_tokens} text tokens + "
+        f"{image_tokens} image tokens + {requested_output_len} output tokens = "
+        f"{requested_total} total tokens > {max_seq_len} maximum; shorten the prompt, "
+        f"reduce image resolution/count, or request fewer output tokens"
+    )
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

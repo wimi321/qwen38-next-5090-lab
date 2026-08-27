@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from freetoken.kvcache.ple_state_pool import PLEStatePool
     from freetoken.moe import BaseMoeBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.multimodal import ImageInputs, MMEmbeddingPlan
 
 
 @dataclass
@@ -45,6 +46,14 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # Online image path: processor tensors are consumed once by the model-owned
+    # vision encoder, yielding a pageable-CPU, chunk-selectable embedding plan.
+    image_inputs: ImageInputs | None = None
+    mm_plan: MMEmbeddingPlan | None = None
+    # Full prompt mRoPE coordinates and scalar decode delta. Text-only requests
+    # leave both unset and continue using ``Batch.positions``.
+    mrope_positions: torch.Tensor | None = None
+    mrope_delta: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -73,6 +82,10 @@ class Req:
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         self._alloc_ids_buf()
+
+    @property
+    def is_multimodal(self) -> bool:
+        return self.mm_embeds is not None or self.image_inputs is not None or self.mm_plan is not None
 
     def _alloc_ids_buf(self) -> None:
         self._ids_buf = torch.empty(self.max_device_len, dtype=self.input_ids.dtype)
@@ -137,6 +150,12 @@ class Batch:
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Flattened-batch destinations matching mm_embeds rows. Models should prefer
+    # these explicit indices over searching for a model-specific placeholder id.
+    mm_embed_indices: torch.Tensor | None = field(default=None, init=False)
+    mm_placeholder_mask: torch.Tensor | None = field(default=None, init=False)
+    # Optional Qwen-style 3-axis positions, shape [3, flattened_tokens].
+    mrope_positions: torch.Tensor | None = field(default=None, init=False)
     # Qwen4 PLE decode inputs. Hashing plus sparse mmap row fetch happen outside
     # CUDA graphs; GraphCaptureBuffer then copies the first three tensors into
     # stable-address replay buffers. The pending CPU histories are committed only

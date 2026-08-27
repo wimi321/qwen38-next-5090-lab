@@ -82,6 +82,11 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # Qwen4-Exp multimodal RoPE supplies independent temporal/height/width
+    # coordinates and interleaves their frequency lanes.  ``None`` preserves
+    # the ordinary one-dimensional RoPE contract for every existing model.
+    mrope_section: Tuple[int, ...] | None = None
+    mrope_interleaved: bool = False
 
 
 @dataclass(frozen=True)

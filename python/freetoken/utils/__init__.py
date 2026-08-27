@@ -4,6 +4,7 @@ from .arch import (
     is_sm90_supported,
     is_sm100_family,
     is_sm100_supported,
+    is_sm120_family,
 )
 from .hf import (
     cached_load_hf_config,
@@ -39,6 +40,7 @@ __all__ = [
     "is_sm90_supported",
     "is_sm100_family",
     "is_sm100_supported",
+    "is_sm120_family",
     "call_if_main",
     "div_even",
     "div_ceil",

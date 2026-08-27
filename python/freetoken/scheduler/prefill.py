@@ -169,6 +169,13 @@ class PrefillAdder:
                 "Multimodal prompts must fit in a single prefill chunk; increase "
                 "--max-extend-tokens or shrink the prompt."
             )
+        previous = pending_req.chunked_req
+        image_inputs = previous.image_inputs if previous is not None else pending_req.image_inputs
+        mm_plan = previous.mm_plan if previous is not None else pending_req.mm_plan
+        mrope_positions = (
+            previous.mrope_positions if previous is not None else pending_req.mrope_positions
+        )
+        mrope_delta = previous.mrope_delta if previous is not None else pending_req.mrope_delta
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -178,6 +185,24 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            image_inputs=image_inputs,
+            mm_plan=mm_plan,
+            mrope_positions=mrope_positions,
+            mrope_delta=mrope_delta,
+        )
+        # PLE hashes for the next chunk can be known from the complete CPU
+        # prompt even though ChunkedReq.input_ids intentionally ends at the
+        # current boundary. Keep only a shared view (no token copy) and carry
+        # any in-flight native prefetch handles across continuations.
+        req.ple_prefetch_input_ids = (
+            getattr(previous, "ple_prefetch_input_ids", None)
+            if previous is not None
+            else pending_req.input_ids
+        )
+        req.ple_prefetch_handles = (
+            getattr(previous, "ple_prefetch_handles", ())
+            if previous is not None
+            else ()
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -237,8 +262,17 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
+        image_inputs = req.image_inputs
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                image_inputs=image_inputs,
+                mrope_positions=(image_inputs.mrope_positions if image_inputs is not None else None),
+                mrope_delta=(int(image_inputs.rope_delta.item()) if image_inputs is not None else 0),
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
@@ -266,6 +300,16 @@ class PrefillManager:
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
+                    # The continuation object is now the sole owner of online
+                    # multimodal state.  In particular, do not keep the original
+                    # processor ``pixel_values`` alive on PendingReq for every
+                    # remaining 512-token chunk after the vision encoder has
+                    # consumed them.  Subsequent chunks inherit from
+                    # ``pending_req.chunked_req`` in ``_add_one_req`` above.
+                    pending_req.mm_embeds = None
+                    pending_req.image_inputs = None
+                    pending_req.mm_plan = None
+                    pending_req.mrope_positions = None
                     chunked_list.append(pending_req)
                 reqs.append(req)
                 if not is_continuation:

@@ -143,13 +143,59 @@ def flush(timeout: float = 5.0) -> bool:
     return done.wait(timeout)
 
 
+_MEDIA_PART_TYPES = frozenset(
+    {
+        "image",
+        "image_url",
+        "input_image",
+        "audio",
+        "audio_url",
+        "input_audio",
+        "video",
+        "video_url",
+    }
+)
+
+
+def _redact_media_sources(value: Any, *, media_part: bool = False) -> Any:
+    """Remove media URLs/bytes while retaining useful request structure.
+
+    HTTPS image URLs may carry signed credentials, and a data URL can be tens
+    of MiB. Text, roles, image counts, detail settings and other request fields
+    stay visible for diagnostics.
+    """
+
+    if isinstance(value, list):
+        return [_redact_media_sources(item, media_part=media_part) for item in value]
+    if not isinstance(value, dict):
+        return value
+    is_media_part = media_part or value.get("type") in _MEDIA_PART_TYPES
+    redacted: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in {"image_url", "audio_url", "video_url"}:
+            if isinstance(item, dict):
+                redacted[key] = {
+                    child_key: (
+                        "[redacted media source]"
+                        if child_key in {"url", "data"}
+                        else _redact_media_sources(child_value)
+                    )
+                    for child_key, child_value in item.items()
+                }
+            else:
+                redacted[key] = "[redacted media source]"
+        elif is_media_part and key in {"url", "data", "source"}:
+            redacted[key] = "[redacted media source]"
+        else:
+            redacted[key] = _redact_media_sources(item, media_part=is_media_part)
+    return redacted
+
+
 def _to_payload(req: Any) -> Any:
-    """Faithfully represent what the client sent: for a pydantic request model,
-    dump only the fields it actually set (``exclude_unset``) in JSON mode so
-    enums/nested models serialize cleanly. Anything else is passed through."""
+    """Represent a request without persisting media sources or inline bytes."""
     if isinstance(req, BaseModel):
-        return req.model_dump(mode="json", exclude_unset=True)
-    return req
+        req = req.model_dump(mode="json", exclude_unset=True)
+    return _redact_media_sources(req)
 
 
 def log_request(endpoint: str, req: Any, request: Request | None = None) -> None:

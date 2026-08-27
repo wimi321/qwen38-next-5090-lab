@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from types import SimpleNamespace
 
@@ -100,6 +101,30 @@ def chat_request(**kwargs) -> ChatCompletionRequest:
         "model": "client-model",
         "messages": [{"role": "user", "content": "weather in Paris?"}],
         "tools": tool_schema(),
+        "max_tokens": 8,
+    }
+    payload.update(kwargs)
+    return ChatCompletionRequest(**payload)
+
+
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+_PNG_DATA_URL = "data:image/png;base64," + base64.b64encode(_PNG).decode()
+
+
+def image_chat_request(**kwargs) -> ChatCompletionRequest:
+    payload = {
+        "model": "client-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _PNG_DATA_URL}},
+                    {"type": "text", "text": "describe briefly"},
+                ],
+            }
+        ],
         "max_tokens": 8,
     }
     payload.update(kwargs)
@@ -244,6 +269,89 @@ def test_non_stream_chat_completion_returns_openai_tool_calls_and_sends_tools():
     assert tool_call["function"]["name"] == "get_weather"
     assert json.loads(tool_call["function"]["arguments"]) == {"city": "Paris"}
     assert response["usage"] == {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+
+
+def test_image_chat_removes_source_url_and_forwards_validated_bytes() -> None:
+    state = FakeState(
+        [UserReply(uid=42, incremental_output="a pixel", finished=True)]
+    )
+
+    response = run(
+        handle_chat_completion(
+            image_chat_request(), request=None, state=state, model_sampling={}
+        )
+    )
+
+    assert response["choices"][0]["message"]["content"] == "a pixel"
+    assert state.sent is not None
+    assert state.sent.text == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": "describe briefly"},
+            ],
+        }
+    ]
+    assert state.sent.media is not None and len(state.sent.media) == 1
+    assert state.sent.media[0].mime_type == "image/png"
+    assert state.sent.media[0].data == _PNG
+    assert _PNG_DATA_URL not in repr(state.sent)
+
+
+def test_streaming_image_chat_uses_the_same_validated_media_path() -> None:
+    state = FakeState(
+        [UserReply(uid=42, incremental_output="a pixel", finished=True)]
+    )
+
+    response = run(
+        handle_chat_completion(
+            image_chat_request(stream=True),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+    chunks = run(_collect(response.body_iterator))
+    events = parse_sse(chunks)
+
+    assert events[-1] == "[DONE]"
+    assert any(
+        choice.get("delta", {}).get("content") == "a pixel"
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+    )
+    assert state.sent is not None and state.sent.media is not None
+    assert state.sent.media[0].data == _PNG
+
+
+def test_unsafe_image_url_returns_openai_classified_error_before_enqueue() -> None:
+    state = FakeState([])
+    request = image_chat_request(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "http://127.0.0.1:80/private.png"},
+                    }
+                ],
+            }
+        ]
+    )
+
+    response = run(
+        handle_chat_completion(request, request=None, state=state, model_sampling={})
+    )
+    body = json.loads(response.body)
+
+    assert response.status_code == 400
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "messages"
+    assert body["error"]["code"] == "unsafe_image_url"
+    assert state.sent is None
 
 
 def test_non_stream_chat_completion_length_truncation_overrides_tool_calls():

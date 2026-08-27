@@ -23,6 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.multimodal import MediaPayload
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 try:
@@ -139,6 +140,9 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    # Validated image bytes in the same order as ``type=image`` content parts.
+    # The original URL never leaves the API frontend.
+    media: list[MediaPayload] = field(default_factory=list)
 
     @property
     def parse_tools(self) -> bool:
@@ -188,9 +192,13 @@ def resolve_sampling(
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    """Normalize message dicts for the chat template.
+
+    Pure-text content lists retain the historical flattened-string shape.  A
+    prepared image conversation keeps a structured list (``type=image`` plus
+    text parts) for ``AutoProcessor``.  Source URLs must already have been
+    removed by ``prepare_image_messages``.
+    """
     return [_render_message(m) for m in messages]
 
 
@@ -198,7 +206,7 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        m["content"] = _render_content_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -241,6 +249,25 @@ def _flatten_text_parts(parts: list[Any]) -> str:
     return "".join(texts)
 
 
+def _render_content_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    if all(isinstance(part, dict) and part.get("type") == "text" for part in parts):
+        return _flatten_text_parts(parts)
+    rendered: list[dict[str, Any]] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            raise ValueError("message content parts must be objects")
+        part_type = part.get("type")
+        if part_type == "text":
+            rendered.append({"type": "text", "text": part.get("text") or ""})
+        elif part_type == "image":
+            rendered.append({"type": "image"})
+        elif part_type in ("image_url", "input_image"):
+            raise ValueError("image URLs must be validated before rendering")
+        else:
+            raise ValueError(f"Unsupported content part type: {part_type}")
+    return rendered
+
+
 def split_tool_lists(
     all_tool_dicts: list[dict[str, Any]] | None, selected_name: str | None = None
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
@@ -269,6 +296,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            media=spec.media,
         )
     )
     return uid
@@ -325,6 +353,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        media=spec.media,
     )
     try:
         manager = await asyncio.to_thread(build)

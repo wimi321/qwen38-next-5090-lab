@@ -5,6 +5,7 @@ from typing import Dict, List
 
 import torch
 from freetoken.core import SamplingParams
+from freetoken.multimodal import ImageInputs, ImageTokenSpan
 
 from .utils import deserialize_type, serialize_type
 
@@ -37,6 +38,9 @@ class UserMsg(BaseBackendMsg):
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
     # the in-process offline path; remains None for the (serialized) online path.
     mm_embeds: torch.Tensor | None = None
+    # Online processor output. The scheduler asks the model's vision encoder to
+    # turn it into a chunkable MMEmbeddingPlan exactly once.
+    image_inputs: ImageInputs | None = None
 
 
 @dataclass

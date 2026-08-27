@@ -46,6 +46,8 @@ class Qwen4ExpQSAIndexer(BaseOP):
             max_position=group.rotary_config.max_position,
             base=group.rotary_config.base,
             rope_scaling=None,
+            mrope_section=group.rotary_config.mrope_section,
+            mrope_interleaved=group.rotary_config.mrope_interleaved,
         )
 
     def project(self, hidden_states: torch.Tensor, positions: torch.Tensor):
@@ -64,8 +66,33 @@ class Qwen4ExpQSAIndexer(BaseOP):
         self, pooled_keys: torch.Tensor, logical_block_starts: torch.Tensor
     ) -> torch.Tensor:
         original_shape = pooled_keys.shape
+        if pooled_keys.ndim not in (2, 3):
+            raise ValueError(
+                "QSA pooled keys must be [blocks, dim] or [batch, blocks, dim], "
+                f"got {tuple(original_shape)}"
+            )
+        positions = logical_block_starts.to(torch.int32)
+        if pooled_keys.ndim == 3:
+            # The legacy/raw cache pools independently for each request and
+            # passes starts as [B,N].  In particular B==3 is still a text batch,
+            # not a three-axis mRoPE tensor.
+            if positions.shape != original_shape[:-1]:
+                raise ValueError(
+                    "batched QSA key positions must match [batch, blocks], got "
+                    f"{tuple(positions.shape)} for keys {tuple(original_shape)}"
+                )
+            positions = positions.reshape(-1)
+        elif positions.ndim == 1:
+            if positions.numel() != original_shape[0]:
+                raise ValueError("QSA scalar block positions do not match pooled keys")
+            positions = positions.reshape(-1)
+        elif positions.ndim != 2 or positions.shape != (3, original_shape[0]):
+            raise ValueError(
+                "compressed QSA key positions must be [blocks] or [3, blocks], got "
+                f"{tuple(positions.shape)}"
+            )
+
         pooled_keys = self.k_layernorm.forward(pooled_keys).reshape(-1, self.head_dim)
-        positions = logical_block_starts.reshape(-1).to(torch.int32)
         # Avoid aliasing query/key inputs: the in-place RoPE kernel rotates both.
         unused_query = pooled_keys.clone()
         _, pooled_keys = self.rotary.forward(
@@ -106,6 +133,8 @@ class Qwen4ExpAttention(BaseOP):
             max_position=group.rotary_config.max_position,
             base=group.rotary_config.base,
             rope_scaling=None,
+            mrope_section=group.rotary_config.mrope_section,
+            mrope_interleaved=group.rotary_config.mrope_interleaved,
         )
         self.indexer = Qwen4ExpQSAIndexer(config, group)
         self.o_proj = make_replicated(
@@ -113,7 +142,10 @@ class Qwen4ExpAttention(BaseOP):
         )
 
     def _project(self, hidden_states: torch.Tensor):
-        positions = get_global_ctx().batch.positions
+        batch = get_global_ctx().batch
+        positions = getattr(batch, "mrope_positions", None)
+        if positions is None:
+            positions = batch.positions
         qkv = self.qkv_proj.forward(hidden_states)
         qg, key, value = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, 2 * self.head_dim)

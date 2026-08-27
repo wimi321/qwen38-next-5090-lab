@@ -20,6 +20,8 @@ class RotaryEmbedding(StateLessOP):
         proportional: bool = False,
         attention_factor: float = 1.0,
         is_neox: bool = True,
+        mrope_section: Tuple[int, ...] | None = None,
+        mrope_interleaved: bool = False,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -28,6 +30,8 @@ class RotaryEmbedding(StateLessOP):
         # ``rope_interleave`` models: GLM MLA lineage). Both underlying kernels
         # accept the flag; the cos/sin cache layout is identical.
         self.is_neox = is_neox
+        self.mrope_section = mrope_section
+        self.mrope_interleaved = bool(mrope_interleaved)
         if proportional:
             assert 0 < rotary_dim <= head_size
             assert rotary_dim % 2 == 0
@@ -74,6 +78,8 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if positions.ndim == 2:
+            return self._forward_mrope(positions, query, key)
         self.apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
             query=query,
@@ -84,6 +90,63 @@ class RotaryEmbedding(StateLessOP):
         )
         return query, key
 
+    def _forward_mrope(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply Qwen4-Exp's interleaved temporal/height/width RoPE."""
+
+        if positions.shape[0] != 3:
+            raise ValueError(f"mRoPE positions must be [3, tokens], got {tuple(positions.shape)}")
+        if self.mrope_section is None or not self.mrope_interleaved:
+            raise ValueError("three-axis positions require an interleaved mrope_section")
+        if sum(self.mrope_section) != self.rotary_dim // 2:
+            raise ValueError(
+                f"mrope_section {self.mrope_section} does not cover rotary dim {self.rotary_dim}"
+            )
+        if not self.is_neox:
+            raise NotImplementedError("Qwen4-Exp mRoPE currently requires NeoX half rotation")
+        token_count = positions.shape[1]
+        if query.shape[0] != token_count or key.shape[0] != token_count:
+            raise ValueError("mRoPE token positions must match query and key rows")
+        if token_count == 0:
+            return query, key
+
+        flat_positions = positions.to(device=self._cos_sin_cache.device, dtype=torch.long)
+        if int(flat_positions.min().item()) < 0 or int(flat_positions.max().item()) >= len(
+            self._cos_sin_cache
+        ):
+            raise ValueError("mRoPE position is outside the configured context window")
+        axis = self._cos_sin_cache.index_select(0, flat_positions.reshape(-1)).view(
+            3, token_count, self.rotary_dim
+        )
+        half = self.rotary_dim // 2
+        cos = axis[0, :, :half].clone()
+        sin = axis[0, :, half:].clone()
+        for dim, offset in ((1, 1), (2, 2)):
+            stop = self.mrope_section[dim] * 3
+            lane = slice(offset, stop, 3)
+            cos[:, lane] = axis[dim, :, :half][:, lane]
+            sin[:, lane] = axis[dim, :, half:][:, lane]
+        cos = torch.cat((cos, cos), dim=-1)
+        sin = torch.cat((sin, sin), dim=-1)
+
+        def rotate_in_place(tensor: torch.Tensor) -> None:
+            shaped = tensor.reshape(token_count, -1, self.head_size)
+            rope = shaped[..., : self.rotary_dim]
+            left, right = rope.chunk(2, dim=-1)
+            rotated_half = torch.cat((-right, left), dim=-1)
+            rotated = rope * cos[:, None].to(rope.dtype) + rotated_half * sin[:, None].to(
+                rope.dtype
+            )
+            shaped[..., : self.rotary_dim].copy_(rotated)
+
+        rotate_in_place(query)
+        rotate_in_place(key)
+        return query, key
+
 
 def _get_rope(
     head_dim: int,
@@ -92,9 +155,19 @@ def _get_rope(
     base: float,
     rope_scaling: Dict[str, Any] | None = None,
     is_neox: bool = True,
+    mrope_section: Tuple[int, ...] | None = None,
+    mrope_interleaved: bool = False,
 ) -> RotaryEmbedding:
     if rope_scaling is None:
-        return RotaryEmbedding(head_dim, rotary_dim, max_position, base, is_neox=is_neox)
+        return RotaryEmbedding(
+            head_dim,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox=is_neox,
+            mrope_section=mrope_section,
+            mrope_interleaved=mrope_interleaved,
+        )
     # need to test some cases:
     match rope_scaling["rope_type"]:
         case "default":
@@ -217,6 +290,8 @@ def get_rope(
     base: float,
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
     is_neox: bool = True,
+    mrope_section: Tuple[int, ...] | None = None,
+    mrope_interleaved: bool = False,
 ) -> RotaryEmbedding:
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     t = torch.tensor([])
@@ -227,8 +302,26 @@ def get_rope(
                 "We cannot use meta device for rope. Please call set_rope_device() first."
             )
         with torch.device(_ROPE_DEVICE):
-            return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)
-    return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)
+            return _get_rope(
+                head_dim,
+                rotary_dim,
+                max_position,
+                base,
+                rope_map,
+                is_neox,
+                mrope_section,
+                mrope_interleaved,
+            )
+    return _get_rope(
+        head_dim,
+        rotary_dim,
+        max_position,
+        base,
+        rope_map,
+        is_neox,
+        mrope_section,
+        mrope_interleaved,
+    )
 
 
 __all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]

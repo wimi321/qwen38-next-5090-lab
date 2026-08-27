@@ -1,4 +1,4 @@
-from .config import parse_config
+from .config import Qwen4ExpVisionConfig, parse_config
 from .hyperconnection import Qwen4ExpGatedResidual, Qwen4ExpGroupedRMSNorm
 from .model import Qwen4ExpForConditionalGeneration
 from .ple import (
@@ -18,6 +18,7 @@ from .weight import (
     load_nvfp4_expert_sources_parallel,
     setup_offload_expert_banks,
 )
+from .vision import Qwen4ExpVisionModel
 
 __all__ = [
     "ConcatenatedRowBank",
@@ -28,6 +29,8 @@ __all__ = [
     "Qwen4ExpNGramEmbedding",
     "Qwen4ExpNGramHasher",
     "Qwen4ExpPLELayer",
+    "Qwen4ExpVisionConfig",
+    "Qwen4ExpVisionModel",
     "SafetensorsMmapRowBank",
     "SafetensorsRowShard",
     "ShardedSafetensorsMmapRowBank",

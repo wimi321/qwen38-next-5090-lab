@@ -21,6 +21,7 @@ from .api_models import (
     ToolChoiceObject,
 )
 from .function_call_parser import ToolCallItem
+from .media import MediaError, prepare_image_messages
 from .request_logger import log_request
 from .generation import (
     ContentDelta,
@@ -58,6 +59,9 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    *,
+    prepared_messages: list[dict[str, Any]] | None = None,
+    media: list[Any] | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -67,7 +71,11 @@ def chat_request_to_genspec(
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
     return GenSpec(
-        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        messages=render_messages(
+            prepared_messages
+            if prepared_messages is not None
+            else [m.model_dump(exclude_none=True) for m in req.messages]
+        ),
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,
@@ -80,6 +88,7 @@ def chat_request_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
+        media=list(media or []),
     )
 
 
@@ -179,7 +188,16 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        raw_messages = [m.model_dump(exclude_none=True) for m in req.messages]
+        prepared_messages, media = await prepare_image_messages(raw_messages)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            prepared_messages=prepared_messages,
+            media=media,
+        )
+    except MediaError as exc:
+        return create_error_response(str(exc), param="messages", code=exc.code)
     except ValueError as exc:
         return create_error_response(str(exc))
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from freetoken.models.config import (
@@ -10,6 +11,7 @@ from freetoken.models.config import (
     QSAAttentionGroupConfig,
     RotaryConfig,
     detect_expert_quant,
+    vision_load_enabled,
 )
 
 from .args import load_args
@@ -22,6 +24,76 @@ from .args import load_args
 _QWEN4_EXP_MOE_AUTO_RUNTIME_RESERVE_BYTES = 512 * 2**20
 
 
+@dataclass(frozen=True)
+class Qwen4ExpVisionConfig:
+    """Runtime geometry of the Qwen3.8/Qwen4-Exp image tower.
+
+    The names deliberately follow the Hugging Face configuration.  Keeping the
+    payload immutable lets the model builder create the exact resident vision
+    tensors without retaining the much larger top-level Transformers config.
+    """
+
+    depth: int
+    hidden_size: int
+    hidden_act: str
+    intermediate_size: int
+    num_heads: int
+    in_channels: int
+    patch_size: int
+    spatial_merge_size: int
+    temporal_patch_size: int
+    out_hidden_size: int
+    num_position_embeddings: int
+
+
+def _scalar_size(value: Any, name: str) -> int:
+    """Normalize HF's scalar-or-sequence patch fields for the pinned model."""
+
+    if isinstance(value, (list, tuple)):
+        if not value or len(set(int(item) for item in value)) != 1:
+            raise ValueError(f"Qwen4-Exp vision {name} must be a uniform size, got {value!r}")
+        value = value[0]
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"Qwen4-Exp vision {name} must be positive, got {value}")
+    return value
+
+
+def _parse_vision_config(hf_config: Any, text_hidden_size: int) -> Qwen4ExpVisionConfig | None:
+    """Return the opt-in image tower config; the legacy 8K profile stays text-only."""
+
+    vision = getattr(hf_config, "vision_config", None)
+    if vision is None or not vision_load_enabled():
+        return None
+    out_hidden_size = int(getattr(vision, "out_hidden_size", text_hidden_size))
+    if out_hidden_size != text_hidden_size:
+        raise ValueError(
+            "Qwen4-Exp vision merger output must equal the text hidden size: "
+            f"{out_hidden_size} != {text_hidden_size}"
+        )
+    depth = int(getattr(vision, "depth", getattr(vision, "num_hidden_layers", 0)))
+    num_heads = int(getattr(vision, "num_heads", getattr(vision, "num_attention_heads", 0)))
+    if depth <= 0 or num_heads <= 0 or int(vision.hidden_size) % num_heads:
+        raise ValueError(
+            "Qwen4-Exp vision depth/heads must be positive and hidden_size divisible by heads"
+        )
+    return Qwen4ExpVisionConfig(
+        depth=depth,
+        hidden_size=int(vision.hidden_size),
+        hidden_act=str(getattr(vision, "hidden_act", "gelu_pytorch_tanh")),
+        intermediate_size=int(vision.intermediate_size),
+        num_heads=num_heads,
+        in_channels=int(getattr(vision, "in_channels", 3)),
+        patch_size=_scalar_size(vision.patch_size, "patch_size"),
+        spatial_merge_size=_scalar_size(vision.spatial_merge_size, "spatial_merge_size"),
+        temporal_patch_size=_scalar_size(
+            vision.temporal_patch_size, "temporal_patch_size"
+        ),
+        out_hidden_size=out_hidden_size,
+        num_position_embeddings=int(vision.num_position_embeddings),
+    )
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
     args = load_args(text)
@@ -31,6 +103,17 @@ def parse_config(hf_config: Any) -> ModelConfig:
     rope = getattr(text, "rope_parameters", None) or {}
     partial = float(rope.get("partial_rotary_factor", getattr(text, "partial_rotary_factor", 1.0)))
     rotary_dim = int(head_dim * partial)
+    mrope_section_raw = rope.get("mrope_section")
+    mrope_section = (
+        tuple(int(value) for value in mrope_section_raw)
+        if mrope_section_raw is not None
+        else None
+    )
+    if mrope_section is not None and sum(mrope_section) != rotary_dim // 2:
+        raise ValueError(
+            "Qwen4-Exp mrope_section must cover half the rotary dimensions: "
+            f"sum({mrope_section}) != {rotary_dim // 2}"
+        )
     rope_type = rope.get("rope_type", "default")
     if rope_type not in (None, "default"):
         raise ValueError(f"Qwen4-Exp text milestone supports default RoPE only, got {rope_type!r}")
@@ -40,6 +123,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         max_position=int(text.max_position_embeddings),
         base=float(rope.get("rope_theta", getattr(text, "rope_theta", 10_000.0))),
         scaling=None,
+        mrope_section=mrope_section,
+        mrope_interleaved=bool(rope.get("mrope_interleaved", mrope_section is not None)),
     )
     if rotary_dim > args.indexer_head_dim:
         raise ValueError(
@@ -106,7 +191,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         dense_quant="none",
         lm_head_quant="none",
         use_qk_norm=True,
-        vision_config=None,
+        vision_config=_parse_vision_config(hf_config, int(text.hidden_size)),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         qwen4_args=args,
@@ -114,4 +199,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["Qwen4ExpVisionConfig", "parse_config"]

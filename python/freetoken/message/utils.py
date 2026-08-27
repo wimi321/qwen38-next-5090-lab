@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, Type
 
-import numpy as np
 import torch
 
 
@@ -32,10 +31,15 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        if not self.is_cpu:
+            raise ValueError("message tensors must be on CPU before serialization")
+        tensor = self.detach().contiguous()
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
-        serialized["dtype"] = str(self.dtype)
+        # View bytes through torch rather than NumPy: NumPy cannot represent
+        # bfloat16, which is a valid processor/vision staging dtype.
+        serialized["buffer"] = tensor.view(torch.uint8).numpy().tobytes()
+        serialized["dtype"] = str(tensor.dtype)
+        serialized["shape"] = list(tensor.shape)
         return serialized
 
     # normal type
@@ -64,14 +68,20 @@ def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
+        torch_dtype = getattr(torch, dtype_str, None)
+        if not isinstance(torch_dtype, torch.dtype):
+            raise ValueError(f"Unknown tensor dtype {data['dtype']!r}")
         assert isinstance(buffer, bytes)
-        np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        # bytearray owns writable storage; clone detaches the result from the
+        # temporary and gives callers the same independent tensor as before.
+        tensor = torch.frombuffer(bytearray(buffer), dtype=torch_dtype).clone()
+        shape = data.get("shape")
+        if shape is not None:
+            tensor = tensor.reshape(tuple(int(dim) for dim in shape))
+        return tensor
 
     cls = cls_map.get(type_name)
     if cls is None:

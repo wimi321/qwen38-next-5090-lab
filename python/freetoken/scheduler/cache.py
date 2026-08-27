@@ -29,6 +29,19 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 _SWA_RETAIN_GAP = 16
 
 
+def _is_multimodal_req(req) -> bool:
+    """Accept real Req/PendingReq objects and the lightweight test doubles used
+    by cache unit tests predating the richer multimodal request interface."""
+
+    marker = getattr(req, "is_multimodal", None)
+    if marker is not None:
+        return bool(marker)
+    return any(
+        getattr(req, name, None) is not None
+        for name in ("mm_embeds", "image_inputs", "mm_plan")
+    )
+
+
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None):
@@ -89,7 +102,7 @@ class CacheManager:
         # Multimodal requests must not reuse a shared prefix: image-placeholder tokens
         # have identical ids across images but carry different content (and KV), so a
         # match would serve the wrong image's KV. Match against the empty prefix.
-        ids = req.input_ids[:0] if req.mm_embeds is not None else req.input_ids[: input_len - 1]
+        ids = req.input_ids[:0] if _is_multimodal_req(req) else req.input_ids[: input_len - 1]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -295,7 +308,7 @@ class CacheManager:
         # Multimodal requests are never inserted into the shared prefix cache (see
         # ``match_req``). Their KV pages stay owned by the active request and are freed
         # on completion; nothing is exposed for cross-request reuse.
-        if req.mm_embeds is not None:
+        if _is_multimodal_req(req):
             self.unlock(old_handle)
             if finished:
                 tail = self._padded_tail(req, old_handle.cached_len)
@@ -343,7 +356,7 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
-        if req.mm_embeds is not None:
+        if _is_multimodal_req(req):
             self.unlock(old_handle)
             if finished:
                 self._free(page_indices[old_handle.cached_len :])
@@ -437,7 +450,7 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
-        if req.mm_embeds is not None:
+        if _is_multimodal_req(req):
             self.unlock(old_handle)
             if finished:
                 tail = self._padded_tail(req, old_handle.cached_len)

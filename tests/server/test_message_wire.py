@@ -19,8 +19,11 @@ from freetoken.message import (
     PromptAdmittedMsg,
     TokenizeMsg,
     UserReply,
+    UserMsg,
 )
 from freetoken.core import SamplingParams
+from freetoken.multimodal import ImageInputs, ImageTokenSpan, MediaPayload
+import torch
 
 
 def test_cache_rebuild_msg_roundtrip():
@@ -88,17 +91,23 @@ def test_user_reply_token_deltas_round_trip():
 
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
+    telemetry = {
+        "selector": {"workspace_peak_bytes": 1024},
+        "ple": {"bytes_read": 4096},
+    }
     msg = DetokenizeMsg(
         uid=3, next_token=42, finished=True,
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
+        runtime_telemetry=telemetry,
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+    assert decoded.runtime_telemetry == telemetry
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
@@ -122,3 +131,35 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_multidimensional_bfloat16_image_tensors_round_trip():
+    image = ImageInputs(
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+        pixel_values=torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),
+        image_grid_thw=torch.tensor([[1, 2, 2]], dtype=torch.int64),
+        mm_token_type_ids=torch.tensor([0, 1, 0], dtype=torch.int32),
+        mrope_positions=torch.arange(9, dtype=torch.int64).reshape(3, 3),
+        rope_delta=torch.tensor([-1], dtype=torch.int64),
+        image_spans=[ImageTokenSpan(0, 1, 2)],
+    )
+    msg = UserMsg(
+        uid=9,
+        input_ids=image.input_ids,
+        sampling_params=SamplingParams(),
+        image_inputs=image,
+    )
+    out = BaseBackendMsg.decoder(msg.encoder())
+    assert isinstance(out, UserMsg) and isinstance(out.image_inputs, ImageInputs)
+    assert out.image_inputs.pixel_values.dtype == torch.bfloat16
+    assert out.image_inputs.pixel_values.shape == (3, 4)
+    assert torch.equal(out.image_inputs.pixel_values, image.pixel_values)
+
+    token_msg = TokenizeMsg(
+        uid=10,
+        text="x",
+        sampling_params=SamplingParams(),
+        media=[MediaPayload("image/png", b"png", "data")],
+    )
+    token_out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(token_msg))
+    assert token_out.media == token_msg.media

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -56,6 +56,9 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    # Latest cumulative scheduler/engine counters, attached to terminal replies.
+    # FrontendManager retains the newest snapshot for /v1/stats.
+    runtime_telemetry: dict[str, Any] | None = None
 
 
 @dataclass

@@ -211,6 +211,30 @@ def test_scheduler_rejection_emits_error_but_no_admission():
     assert not any(isinstance(msg, PromptAdmittedMsg) for msg in sent)
 
 
+def test_scheduler_rejects_input_plus_requested_output_instead_of_clamping():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(max_seq_len=16)
+    added = []
+    scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append)
+    sent = []
+    scheduler.send_result = sent.extend
+
+    Scheduler._process_one_msg(
+        scheduler,
+        UserMsg(
+            uid=9,
+            input_ids=torch.arange(12, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=5),
+        ),
+    )
+
+    assert added == []
+    assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
+    assert sent[0].code == "context_length_exceeded"
+    assert "12 text tokens + 0 image tokens + 5 output tokens = 17 total tokens" in sent[0].error
+    assert "16 maximum" in sent[0].error
+
+
 def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_manager = SimpleNamespace(abort_req=lambda uid: None)
