@@ -266,6 +266,7 @@ q38lab bench --profile rtx5090-wsl2-256k-image \
   --image-file "$HOME/q38lab-fixtures/chart.png" \
   --https-image-url "https://example.org/q38lab-chart.png" \
   --decode-tokens 1024 \
+  --timeout 1200 \
   --out results/rtx5090-256k-image-YYYY-MM-DD
 ```
 
@@ -276,12 +277,9 @@ cross-check 缺失时拒绝生成可发布证据。若透明 fake-IP 环境必�
 fallback，应给 `doctor`、`serve` 和 `bench` 使用相同的
 `Q38LAB_DOH_FALLBACK=1`；证据会保留该 opt-in 值与系统 resolver 的软取消局限。
 
-本次硬件记录包括：非 slow 测试 1,530 passed / 9 skipped / 11 deselected；
-峰值显存 31,668 MiB（30.926 GiB）；WSL 峰值 RSS 72.234 GiB；100/100
-顺序请求及 121/121 次独立 soak 请求成功，连续运行 30.0 分钟且未检测到单调
-内存泄漏。8,176-token 请求的客户端 TTFT p50 为 7.283 秒，effective prefill
-p50 为 1,122.6 tok/s；另行测得 256-token 稳态 decode 为 14.014 tok/s。
-权威表格由英文 [README](README.md) 的 evidence 生成器维护。
+硬件数字只由已审阅 evidence 的 `summary.json` 生成。权威表格由英文
+[README](README.md) 的 generated benchmark 区块维护；中文文档不手工复制
+性能数字，以免证据更新后出现不一致。
 
 验证时 WSL 的 `swap=0`。Windows 宿主已有 pagefile，因此本项目**不声称宿主没有
 发生分页**。早期 7-token completion 也不会被

@@ -332,7 +332,12 @@ def _run_serve(args: argparse.Namespace, deps: Dependencies) -> int:
     return 0
 
 
-def _client_settings(args: argparse.Namespace, deps: Dependencies) -> tuple[str, float]:
+def _client_settings(
+    args: argparse.Namespace,
+    deps: Dependencies,
+    *,
+    default_timeout: float = 120.0,
+) -> tuple[str, float]:
     base_url = str(_env_value(
         args.base_url,
         deps.env,
@@ -344,7 +349,7 @@ def _client_settings(args: argparse.Namespace, deps: Dependencies) -> tuple[str,
         args.timeout,
         deps.env,
         "Q38LAB_TIMEOUT",
-        120.0,
+        default_timeout,
         float,
     ))
     if not math.isfinite(timeout) or timeout <= 0:
@@ -391,7 +396,6 @@ def _run_smoke(args: argparse.Namespace, deps: Dependencies) -> int:
 
 
 def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
-    base_url, timeout = _client_settings(args, deps)
     model_dir = _model_dir(args.model_dir, deps)
     profile_name = str(_env_value(
         args.profile, deps.env, "Q38LAB_PROFILE", PROFILE_NAME, str,
@@ -400,6 +404,14 @@ def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
         profile = SERVE_PROFILES[profile_name]
     except KeyError:
         raise ConfigurationError(f"unknown profile: {profile_name!r}") from None
+    default_timeout = (
+        1200.0
+        if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name
+        else 120.0
+    )
+    base_url, timeout = _client_settings(
+        args, deps, default_timeout=default_timeout,
+    )
 
     def positive_env(cli_value, name: str, default: int | float, converter=int):
         value = converter(_env_value(cli_value, deps.env, name, default, converter))

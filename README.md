@@ -327,6 +327,7 @@ q38lab bench --profile rtx5090-wsl2-256k-image \
   --image-file "$HOME/q38lab-fixtures/chart.png" \
   --https-image-url "https://example.org/q38lab-chart.png" \
   --decode-tokens 1024 \
+  --timeout 1200 \
   --out results/rtx5090-256k-image-YYYY-MM-DD
 ```
 

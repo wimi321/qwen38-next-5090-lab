@@ -4,7 +4,7 @@ message: >-
   upstream FreeToken work that provides its serving-engine foundation.
 title: "Qwen3.8 Next 5090 Lab"
 type: software
-version: "0.1.0-alpha.1"
+version: "0.2.0-alpha.1"
 authors:
   - name: "wimi321"
     website: "https://github.com/wimi321"
@@ -12,10 +12,11 @@ repository-code: "https://github.com/wimi321/qwen38-next-5090-lab"
 url: "https://github.com/wimi321/qwen38-next-5090-lab"
 license: Apache-2.0
 abstract: >-
-  An unofficial, reproducible FreeToken downstream for running the text tower
-  from the pinned Qwen3.8-Flash-Next NVFP4 checkpoint on one 32 GB RTX 5090,
-  using sparse PLE mmap row staging, Query-Selective Attention, four-stream
-  gated residuals, and heterogeneous MoE offload.
+  An unofficial alpha FreeToken downstream targeting a 262,144-token total
+  context and image input from the pinned Qwen3.8-Flash-Next NVFP4 checkpoint
+  on one 32 GB RTX 5090, using compressed Query-Selective Attention caches,
+  io_uring/O_DIRECT PLE streaming, four-stream gated residuals, and
+  heterogeneous MoE offload. Hardware support remains evidence-gated.
 keywords:
   - Qwen3.8-Flash-Next
   - FreeToken

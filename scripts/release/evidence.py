@@ -52,6 +52,12 @@ ALLOWED_POST_RUNTIME_FILES = {
     "README.md",
     "README.zh-CN.md",
     "CHANGELOG.md",
+    "MODIFICATIONS.md",
+    "SECURITY.md",
+    "docs/assets/q38lab-architecture.svg",
+    "docs/cli.md",
+    "docs/models.md",
+    "docs/qwen4-exp.md",
 }
 ALLOWED_POST_RUNTIME_PREFIX = "results/rtx5090-"
 EXPECTED_MODEL = {
@@ -376,7 +382,7 @@ def runtime_tree_sha256(root: Path, commit: str = "HEAD") -> str:
 def validate_tag_binding(
     summary: dict[str, Any], *, tag_commit: str, repo_root: Path
 ) -> None:
-    """Bind evidence from runtime commit C to evidence-only tag commit E."""
+    """Bind runtime commit C to a tag that adds only evidence/release docs."""
 
     tag = str(_git_output(repo_root, ["rev-parse", f"{tag_commit}^{{commit}}"])).strip()
     if not COMMIT_RE.fullmatch(tag):

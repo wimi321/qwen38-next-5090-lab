@@ -1027,22 +1027,42 @@ class EvidenceTests(unittest.TestCase):
         (repo / "scripts" / "release").mkdir(parents=True)
         (repo / "scripts" / "release" / "gate.py").write_text("pass\n", encoding="utf-8")
         (repo / "pyproject.toml").write_text("[project]\nname='x'\nversion='1'\n", encoding="utf-8")
+        (repo / "docs" / "assets").mkdir(parents=True)
+        (repo / "MODIFICATIONS.md").write_text("candidate\n", encoding="utf-8")
+        (repo / "SECURITY.md").write_text("candidate\n", encoding="utf-8")
+        (repo / "docs" / "assets" / "q38lab-architecture.svg").write_text(
+            "<svg/>\n", encoding="utf-8",
+        )
+        (repo / "docs" / "cli.md").write_text("candidate\n", encoding="utf-8")
+        (repo / "docs" / "models.md").write_text("candidate\n", encoding="utf-8")
+        (repo / "docs" / "qwen4-exp.md").write_text("candidate\n", encoding="utf-8")
+        (repo / "THIRD_PARTY_NOTICES.md").write_text("notices\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-qm", "runtime"], cwd=repo, check=True)
         runtime = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
         digest = evidence.runtime_tree_sha256(repo, runtime)
         (repo / "results" / "rtx5090-test").mkdir(parents=True)
         (repo / "results" / "rtx5090-test" / "summary.json").write_text("{}\n", encoding="utf-8")
+        for relative in sorted(evidence.ALLOWED_POST_RUNTIME_FILES):
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("reviewed release metadata\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-qm", "evidence"], cwd=repo, check=True)
         tag = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
         summary = {"source": {"validated_runtime_commit": runtime, "runtime_tree_sha256": digest}}
         evidence.validate_tag_binding(summary, tag_commit=tag, repo_root=repo)
+        (repo / "THIRD_PARTY_NOTICES.md").write_text("changed notices\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "forbidden notice change"], cwd=repo, check=True)
+        notice_tag = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        with self.assertRaisesRegex(evidence.EvidenceError, "THIRD_PARTY_NOTICES"):
+            evidence.validate_tag_binding(summary, tag_commit=notice_tag, repo_root=repo)
         (repo / "python" / "runtime.py").write_text("value = 2\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-qm", "bad runtime change"], cwd=repo, check=True)
         bad_tag = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-        with self.assertRaisesRegex(evidence.EvidenceError, "runtime files"):
+        with self.assertRaisesRegex(evidence.EvidenceError, r"python/runtime\.py"):
             evidence.validate_tag_binding(summary, tag_commit=bad_tag, repo_root=repo)
 
 

@@ -222,6 +222,7 @@ def test_256k_bench_forwards_profile_image_fixtures_and_1024_decode(tmp_path):
     argv = calls[0]
     assert argv[argv.index("--profile") + 1] == "rtx5090-wsl2-256k-image"
     assert argv[argv.index("--decode-tokens") + 1] == "1024"
+    assert argv[argv.index("--request-timeout") + 1] == "1200.0"
     assert argv[argv.index("--image-file") + 1] == str(image)
     assert argv[argv.index("--https-image-url") + 1] == "https://example.com/fixture.png"
 

@@ -9,9 +9,8 @@ and be submitted to that project separately.
 
 - Read the [alpha contract](README.md#verified-alpha-contract),
   [model status](docs/models.md), and [reproducibility record](docs/qwen4-exp.md).
-- Search existing issues. Do not report vision, MTP, radix cache, multi-request,
-  W4A4, or context beyond 8K as a regression when the status page still marks it
-  out of scope.
+- Search existing issues. Do not report a capability as a regression while the
+  versioned [model status](docs/models.md) still marks it out of scope.
 - Use the matching issue form. Include text logs rather than screenshots and
   remove secrets, prompts, outputs, usernames, host paths, and tokens.
 - Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
