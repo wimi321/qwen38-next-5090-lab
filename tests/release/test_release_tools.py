@@ -147,6 +147,49 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(rtx5090_harness.EvidenceError, "without the required"):
                 rtx5090_harness.post_sse("http://127.0.0.1:1919/v1/chat/completions", {}, 1)
 
+    def test_sse_captures_final_finish_reason(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n',
+                    b'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2}}\n',
+                    b'data: [DONE]\n',
+                ])
+
+        with mock.patch.object(rtx5090_harness.LOCAL_OPENER, "open", return_value=Response()):
+            result = rtx5090_harness.post_sse(
+                "http://127.0.0.1:1919/v1/chat/completions", {}, 1
+            )
+        self.assertEqual(result.finish_reason, "length")
+        self.assertEqual(result.completion_tokens, 2)
+
+        class InvalidResponse(Response):
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":7}]}\n',
+                    b'data: [DONE]\n',
+                ])
+
+        with mock.patch.object(
+            rtx5090_harness.LOCAL_OPENER, "open", return_value=InvalidResponse()
+        ):
+            with self.assertRaisesRegex(
+                rtx5090_harness.EvidenceError, "finish_reason"
+            ):
+                rtx5090_harness.post_sse(
+                    "http://127.0.0.1:1919/v1/chat/completions", {}, 1
+                )
+
     def test_tool_arguments_require_a_valid_shanghai_city(self) -> None:
         self.assertIsNotNone(rtx5090_harness.valid_city_arguments('{"city":"Shanghai"}'))
         self.assertIsNone(rtx5090_harness.valid_city_arguments('{"city":""}'))

@@ -132,6 +132,7 @@ class StreamResult:
     tool_arguments: str
     prompt_tokens: int
     completion_tokens: int
+    finish_reason: str
     ttft_ms: float
     total_ms: float
 
@@ -152,6 +153,7 @@ def post_sse(url: str, payload: dict[str, Any], timeout: float) -> StreamResult:
     tool_name = ""
     tool_arguments: list[str] = []
     usage: dict[str, Any] = {}
+    finish_reason = ""
     done = False
     try:
         with LOCAL_OPENER.open(request, timeout=timeout) as response:
@@ -175,7 +177,13 @@ def post_sse(url: str, payload: dict[str, Any], timeout: float) -> StreamResult:
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
-                delta = choices[0].get("delta") or {}
+                choice = choices[0]
+                finish_value = choice.get("finish_reason")
+                if finish_value is not None:
+                    if not isinstance(finish_value, str) or not finish_value:
+                        raise EvidenceError("stream finish_reason must be a non-empty string or null")
+                    finish_reason = finish_value
+                delta = choice.get("delta") or {}
                 content = delta.get("content") or ""
                 reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
                 tool_calls = delta.get("tool_calls") or []
@@ -206,6 +214,7 @@ def post_sse(url: str, payload: dict[str, Any], timeout: float) -> StreamResult:
         tool_arguments="".join(tool_arguments),
         prompt_tokens=int(usage.get("prompt_tokens") or 0),
         completion_tokens=int(usage.get("completion_tokens") or 0),
+        finish_reason=finish_reason,
         ttft_ms=(first_delta - started) * 1000,
         total_ms=(ended - started) * 1000,
     )
@@ -951,11 +960,18 @@ def run_api_gates(args: argparse.Namespace, recorder: Recorder, tokenizer: Any) 
 
     decode_payload = chat_payload("Continue with short numbered facts.", args.decode_tokens, reasoning_effort="none", ignore_eos=True)
     decode = post_sse(endpoint, decode_payload, args.request_timeout)
-    recorder.record(case="steady-decode", iteration=0, warmup=False, stream=True, success=True, prompt_tokens=decode.prompt_tokens, completion_tokens=decode.completion_tokens, ttft_ms=decode.ttft_ms, total_ms=decode.total_ms, http_status=decode.status)
+    exact_budget = (
+        decode.status == 200
+        and decode.completion_tokens == args.decode_tokens
+        and decode.finish_reason == "length"
+    )
+    recorder.record(case="steady-decode", iteration=0, warmup=False, stream=True, success=exact_budget, prompt_tokens=decode.prompt_tokens, completion_tokens=decode.completion_tokens, ttft_ms=decode.ttft_ms, total_ms=decode.total_ms, http_status=decode.status, proof={"finish_reason": decode.finish_reason, "requested_tokens": args.decode_tokens})
     decode_seconds = max(0.001, (decode.total_ms - decode.ttft_ms) / 1000)
     steady = {
         "requested_tokens": args.decode_tokens,
         "observed_tokens": decode.completion_tokens,
+        "finish_reason": decode.finish_reason,
+        "http_status": decode.status,
         "decode_tokens_per_second": round(max(0, decode.completion_tokens - 1) / decode_seconds, 3),
     }
     return {"api": api, "prompt_cases": prompt_cases, "steady_decode": steady}, {"endpoint": endpoint}
@@ -1102,9 +1118,14 @@ def main(argv: list[str] | None = None) -> int:
     api_results = {
         "api": {"stream_nonstream_match": False, "thinking_none": False, "thinking_high": False, "tool_call": False},
         "prompt_cases": [],
-        "steady_decode": {"requested_tokens": args.decode_tokens, "observed_tokens": 0},
+        "steady_decode": {
+            "requested_tokens": args.decode_tokens,
+            "observed_tokens": 0,
+            "finish_reason": "",
+            "http_status": 0,
+        },
     }
-    stability = {"attempted": args.sequential_requests, "succeeded": 0}
+    stability = {"attempted": 0, "succeeded": 0}
     soak = {
         "attempted": 0, "succeeded": 0, "started_elapsed_s": 0.0,
         "finished_elapsed_s": 0.0, "duration_seconds": 0.0,
@@ -1176,13 +1197,28 @@ def main(argv: list[str] | None = None) -> int:
         tokenizer = load_tokenizer(args.model_dir)
         acceptance_window_start = time.monotonic() - started
         api_results, _private = run_api_gates(args, recorder, tokenizer)
+        steady = api_results["steady_decode"]
+        if not (
+            steady.get("http_status") == 200
+            and steady.get("observed_tokens", 0) == steady.get("requested_tokens", -1)
+            and steady.get("finish_reason") == "length"
+        ):
+            raise EvidenceError(
+                "steady decode must exhaust the exact requested token budget with "
+                f"finish_reason=length; requested={steady.get('requested_tokens')}, "
+                f"observed={steady.get('observed_tokens')}, "
+                f"finish_reason={steady.get('finish_reason')!r}"
+            )
         stability = run_stability(args, recorder)
         if not (
             pytest_counts["passed"] >= 1454 and pytest_counts["failed"] == 0
             and all(api_results["api"].values())
             and stability["attempted"] >= 100
             and stability["succeeded"] == stability["attempted"]
-            and api_results["steady_decode"].get("observed_tokens", 0) >= 256
+            and api_results["steady_decode"].get("observed_tokens", 0)
+            == api_results["steady_decode"].get("requested_tokens", -1)
+            and api_results["steady_decode"].get("finish_reason") == "length"
+            and api_results["steady_decode"].get("http_status") == 200
         ):
             raise EvidenceError("an initial release gate failed; soak was not started")
         soak = run_soak(args, recorder)
@@ -1317,7 +1353,10 @@ def main(argv: list[str] | None = None) -> int:
         and pytest_counts["passed"] >= 1454
         and pytest_counts["failed"] == 0
         and {case.get("rendered_prompt_tokens") for case in api_results["prompt_cases"]} >= set(PROMPT_TARGETS)
-        and api_results["steady_decode"].get("observed_tokens", 0) >= 256
+        and api_results["steady_decode"].get("observed_tokens", 0)
+        == api_results["steady_decode"].get("requested_tokens", -1)
+        and api_results["steady_decode"].get("finish_reason") == "length"
+        and api_results["steady_decode"].get("http_status") == 200
         and all(api_results["api"].values())
         and stability.get("attempted", 0) >= 100
         and stability.get("succeeded") == stability.get("attempted")

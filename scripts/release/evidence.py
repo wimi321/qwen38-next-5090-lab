@@ -303,6 +303,10 @@ def _validate_summary(
         raise EvidenceError("release evidence runtime_tree_sha256 must be 64 lowercase hex")
     if summary["execution"] != EXPECTED_EXECUTION:
         raise EvidenceError("release execution contract does not match the v0.1 preview")
+    _required(summary, "gates.steady_decode.requested_tokens", int)
+    _required(summary, "gates.steady_decode.finish_reason", str)
+    _required(summary, "gates.steady_decode.http_status", int)
+    _required(summary, "gates.steady_decode.decode_tokens_per_second", (int, float))
     for key, expected in EXPECTED_MODEL.items():
         if summary.get("model", {}).get(key) != expected:
             raise EvidenceError(f"release model.{key} does not match the pinned checkpoint")
@@ -320,8 +324,15 @@ def _validate_summary(
     if len(one_token_cases) != 1:
         raise EvidenceError("prompt gates must include content=1/rendered=13 exactly once")
     gates = summary["gates"]
-    if gates["steady_decode"]["observed_tokens"] < 256:
-        raise EvidenceError("steady decode gate requires at least 256 observed tokens")
+    steady = gates["steady_decode"]
+    if not 256 <= int(steady.get("requested_tokens", 0)) <= 512:
+        raise EvidenceError("steady decode requested_tokens must be in [256, 512]")
+    if steady["observed_tokens"] != steady["requested_tokens"]:
+        raise EvidenceError("steady decode gate requires the exact requested token budget")
+    if steady.get("finish_reason") != "length":
+        raise EvidenceError("steady decode gate requires finish_reason=length")
+    if steady.get("http_status") != 200:
+        raise EvidenceError("steady decode gate requires HTTP 200")
     if not all(gates["api"].values()):
         raise EvidenceError("all stream/thinking/tool API gates must pass")
     stability = gates["stability"]
@@ -679,8 +690,21 @@ def _crosscheck_release_raw(
         raise EvidenceError("steady decode requested_tokens must be in [256, 512]")
     if decode[0]["completion_tokens"] != steady_summary.get("observed_tokens"):
         raise EvidenceError("steady decode summary does not match the raw request")
-    if decode[0]["completion_tokens"] < 256:
-        raise EvidenceError("steady decode raw request observed fewer than 256 tokens")
+    if decode[0]["http_status"] != steady_summary.get("http_status"):
+        raise EvidenceError("steady decode HTTP status does not match the summary")
+    if decode[0]["completion_tokens"] != steady_summary["requested_tokens"]:
+        raise EvidenceError("steady decode raw request did not exhaust the exact token budget")
+    raw_requested = decode[0]["proof"].get("requested_tokens")
+    if isinstance(raw_requested, bool) or not isinstance(raw_requested, int):
+        raise EvidenceError("steady decode raw request must prove an integer requested_tokens")
+    if not 256 <= raw_requested <= 512:
+        raise EvidenceError("steady decode raw requested_tokens must be in [256, 512]")
+    if raw_requested != steady_summary["requested_tokens"]:
+        raise EvidenceError("steady decode raw requested_tokens do not match the summary")
+    if decode[0]["proof"].get("finish_reason") != "length":
+        raise EvidenceError("steady decode raw request must prove finish_reason=length")
+    if decode[0]["proof"]["finish_reason"] != steady_summary.get("finish_reason"):
+        raise EvidenceError("steady decode finish reason does not match the summary")
     decode_time_ms = float(decode[0]["total_ms"]) - float(decode[0]["ttft_ms"])
     if decode_time_ms <= 0:
         raise EvidenceError("steady decode timing must be longer than TTFT")

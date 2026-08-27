@@ -75,6 +75,8 @@ def write_release_bundle(directory: Path) -> None:
                     "tool_city": "shanghai",
                     "tool_name": "get_weather",
                 }
+            elif case == "steady-decode":
+                proof = {"finish_reason": "length", "requested_tokens": 256}
             else:
                 proof = {}
         requests.append({
@@ -186,6 +188,8 @@ def write_release_bundle(directory: Path) -> None:
         "steady_decode": {
             "requested_tokens": 256,
             "observed_tokens": 256,
+            "finish_reason": "length",
+            "http_status": 200,
             "decode_tokens_per_second": 28333.333,
         },
         "api": {"stream_nonstream_match": True, "thinking_none": True, "thinking_high": True, "tool_call": True},
@@ -326,6 +330,47 @@ class EvidenceTests(unittest.TestCase):
         evidence.write_checksums(self.directory)
         with self.assertRaisesRegex(evidence.EvidenceError, "API gates"):
             evidence.validate_directory(self.directory, release=True)
+
+    def test_release_steady_decode_requires_exact_length_termination(self) -> None:
+        mutations = (
+            (
+                lambda rows, summary: next(
+                    row for row in rows if row["case"] == "steady-decode"
+                )["proof"].update({"finish_reason": "stop"}),
+                "finish_reason=length",
+            ),
+            (
+                lambda rows, summary: summary["gates"]["steady_decode"].update(
+                    {"requested_tokens": 512}
+                ),
+                "exact requested token budget",
+            ),
+            (
+                lambda rows, summary: next(
+                    row for row in rows if row["case"] == "steady-decode"
+                )["proof"].update({"requested_tokens": 512}),
+                "raw requested_tokens do not match",
+            ),
+        )
+        for mutate, message in mutations:
+            with self.subTest(message=message):
+                write_release_bundle(self.directory)
+                rows = [
+                    json.loads(line)
+                    for line in (self.directory / "requests.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                summary = evidence.read_json(self.directory / "summary.json")
+                mutate(rows, summary)
+                (self.directory / "requests.jsonl").write_text(
+                    "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+                evidence.write_json(self.directory / "summary.json", summary)
+                evidence.write_checksums(self.directory)
+                with self.assertRaisesRegex(evidence.EvidenceError, message):
+                    evidence.validate_directory(self.directory, release=True)
 
     def test_one_content_token_and_rendered_length_are_both_proven(self) -> None:
         write_release_bundle(self.directory)
