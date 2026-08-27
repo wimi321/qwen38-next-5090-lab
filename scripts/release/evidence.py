@@ -38,6 +38,7 @@ REQUIRED_FILES = (
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_RUN_ID_RE = re.compile(r"^rtx5090-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RELEASE_ONLY_ALLOWED_FILES = set(REQUIRED_FILES) | {"SHA256SUMS"}
 V02_RUNTIME_TELEMETRY_FILE = "runtime-telemetry.json"
 V02_PLE_CHECKPOINT_PROBE_FILE = "ple-checkpoint-probe.json"
@@ -59,7 +60,6 @@ ALLOWED_POST_RUNTIME_FILES = {
     "docs/models.md",
     "docs/qwen4-exp.md",
 }
-ALLOWED_POST_RUNTIME_PREFIX = "results/rtx5090-"
 EXPECTED_MODEL = {
     "repository": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
     "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
@@ -390,6 +390,18 @@ def validate_tag_binding(
     runtime = str(summary.get("source", {}).get("validated_runtime_commit", ""))
     if not COMMIT_RE.fullmatch(runtime):
         raise EvidenceError("validated runtime commit must be exact 40-hex")
+    run_id = summary.get("run_id")
+    if not isinstance(run_id, str) or not RELEASE_RUN_ID_RE.fullmatch(run_id):
+        raise EvidenceError("release run_id must be a safe rtx5090-* directory name")
+    result_files = set(RELEASE_ONLY_ALLOWED_FILES)
+    if summary.get("execution", {}).get("profile") == PROFILE_V02:
+        result_files.update({
+            V02_RUNTIME_TELEMETRY_FILE,
+            V02_PLE_CHECKPOINT_PROBE_FILE,
+        })
+    allowed_result_paths = {
+        f"results/{run_id}/{name}" for name in result_files
+    }
     ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", runtime, tag], cwd=repo_root,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -400,10 +412,7 @@ def validate_tag_binding(
     forbidden = [
         path for path in changed
         if path not in ALLOWED_POST_RUNTIME_FILES
-        and not (
-            path.startswith(ALLOWED_POST_RUNTIME_PREFIX)
-            and "/" in path[len(ALLOWED_POST_RUNTIME_PREFIX):]
-        )
+        and path not in allowed_result_paths
     ]
     if forbidden:
         raise EvidenceError(
@@ -524,7 +533,7 @@ def _validate_summary(
     if summary.get("schema_version") != SCHEMA_VERSION:
         raise EvidenceError(f"summary.json: schema_version must be {SCHEMA_VERSION}")
     assert_sanitized(summary, "summary.json")
-    _required(summary, "run_id", str)
+    run_id = _required(summary, "run_id", str)
     _required(summary, "measured_at", str)
     runtime_commit = _required(summary, "source.validated_runtime_commit", str)
     _required(summary, "source.upstream_base", str)
@@ -573,6 +582,8 @@ def _validate_summary(
         raise EvidenceError("release evidence must have status=verified")
     if summary.get("source", {}).get("release_compatible") is not True:
         raise EvidenceError("release evidence needs a human-reviewed source.release_compatible=true")
+    if not RELEASE_RUN_ID_RE.fullmatch(run_id):
+        raise EvidenceError("release evidence run_id must be a safe rtx5090-* directory name")
     if not COMMIT_RE.fullmatch(runtime_commit):
         raise EvidenceError("release evidence runtime commit must be exact 40-hex")
     runtime_tree = _required(summary, "source.runtime_tree_sha256", str)
@@ -1523,6 +1534,8 @@ def validate_directory(
             raise EvidenceError(f"{name}: schema_version must be {SCHEMA_VERSION}")
         assert_sanitized(value, name)
     _validate_summary(summary, release=release, expected_commit=expected_commit)
+    if release and summary.get("run_id") != directory.name:
+        raise EvidenceError("release evidence run_id must match its directory name")
     if release:
         expected_files = set(RELEASE_ONLY_ALLOWED_FILES)
         if config.get("profile") == PROFILE_V02:

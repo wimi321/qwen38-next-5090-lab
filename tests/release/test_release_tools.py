@@ -129,6 +129,23 @@ class ReleaseToolTests(unittest.TestCase):
         ])
         self.assertGreaterEqual(args.request_timeout, 1200)
 
+    def test_256k_rejects_request_timeout_below_release_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "fixture.png"
+            image.write_bytes(b"fixture")
+            code = rtx5090_harness.main([
+                "--profile", rtx5090_harness.RTX5090_WSL2_256K_IMAGE_PROFILE.name,
+                "--model-dir", str(ROOT),
+                "--server-pid", "1",
+                "--expected-commit", "1" * 40,
+                "--out", str(root / "rtx5090-test"),
+                "--image-file", str(image),
+                "--https-image-url", "https://example.com/fixture.png",
+                "--request-timeout", "1199",
+            ])
+        self.assertEqual(code, 2)
+
     def test_rendered_length_disables_batch_encoding_return(self) -> None:
         tokenizer = DefaultBatchEncodingTokenizer()
         prompt = rtx5090_harness.exact_prompt(tokenizer, 13)

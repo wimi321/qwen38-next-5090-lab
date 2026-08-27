@@ -150,6 +150,7 @@ def test_bench_wraps_the_single_authoritative_release_harness(tmp_path):
     assert argv[argv.index("--duration-seconds") + 1] == "1800"
     assert argv[argv.index("--sequential-requests") + 1] == "100"
     assert argv[argv.index("--decode-tokens") + 1] == "256"
+    assert argv[argv.index("--request-timeout") + 1] == "120.0"
 
 
 def test_bench_rejects_weakened_release_counts_before_running_harness(
@@ -208,7 +209,7 @@ def test_256k_bench_forwards_profile_image_fixtures_and_1024_decode(tmp_path):
     calls = []
     deps = Dependencies(env={}, release_harness=lambda argv: calls.append(argv) or 0)
 
-    assert main([
+    bench_argv = [
         "bench",
         "--profile", "rtx5090-wsl2-256k-image",
         "--out", str(tmp_path / "results"),
@@ -217,7 +218,8 @@ def test_256k_bench_forwards_profile_image_fixtures_and_1024_decode(tmp_path):
         "--decode-tokens", "1024",
         "--image-file", str(image),
         "--https-image-url", "https://example.com/fixture.png",
-    ], deps=deps) == 0
+    ]
+    assert main(bench_argv, deps=deps) == 0
 
     argv = calls[0]
     assert argv[argv.index("--profile") + 1] == "rtx5090-wsl2-256k-image"
@@ -225,6 +227,16 @@ def test_256k_bench_forwards_profile_image_fixtures_and_1024_decode(tmp_path):
     assert argv[argv.index("--request-timeout") + 1] == "1200.0"
     assert argv[argv.index("--image-file") + 1] == str(image)
     assert argv[argv.index("--https-image-url") + 1] == "https://example.com/fixture.png"
+
+    env_calls = []
+    env_deps = Dependencies(
+        env={"Q38LAB_TIMEOUT": "1300"},
+        release_harness=lambda argv: env_calls.append(argv) or 0,
+    )
+    assert main(bench_argv, deps=env_deps) == 0
+    assert env_calls[-1][env_calls[-1].index("--request-timeout") + 1] == "1300.0"
+    assert main([*bench_argv, "--timeout", "1400"], deps=env_deps) == 0
+    assert env_calls[-1][env_calls[-1].index("--request-timeout") + 1] == "1400.0"
 
 
 def test_256k_serve_requires_native_ple_before_checkpoint_or_launch(tmp_path, capsys):

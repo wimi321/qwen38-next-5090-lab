@@ -267,6 +267,7 @@ def write_release_bundle(directory: Path) -> None:
         "1454 passed, 9 skipped, 11 deselected in 1.00s\n", encoding="utf-8"
     )
     summary = evidence.read_json(directory / "summary.json")
+    summary["run_id"] = directory.name
     summary.update({"status": "verified", "errors": []})
     summary["source"] = {
         "validated_runtime_commit": RUNTIME_COMMIT,
@@ -334,7 +335,7 @@ def write_release_bundle(directory: Path) -> None:
 class EvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name) / "bundle"
+        self.directory = Path(self.temporary.name) / "rtx5090-test"
         shutil.copytree(ROOT / "results" / "example-synthetic", self.directory)
 
     def tearDown(self) -> None:
@@ -382,6 +383,15 @@ class EvidenceTests(unittest.TestCase):
         evidence.write_json(self.directory / "summary.json", summary)
         evidence.write_checksums(self.directory)
         with self.assertRaisesRegex(evidence.EvidenceError, "below 31 GiB"):
+            evidence.validate_directory(self.directory, release=True)
+
+    def test_release_run_id_must_match_directory(self) -> None:
+        write_release_bundle(self.directory)
+        summary = evidence.read_json(self.directory / "summary.json")
+        summary["run_id"] = "rtx5090-other"
+        evidence.write_json(self.directory / "summary.json", summary)
+        evidence.write_checksums(self.directory)
+        with self.assertRaisesRegex(evidence.EvidenceError, "match its directory"):
             evidence.validate_directory(self.directory, release=True)
 
     def test_v02_summary_contract_requires_256k_images_and_runtime_telemetry(self) -> None:
@@ -1015,6 +1025,18 @@ class EvidenceTests(unittest.TestCase):
                 evidence.find_release_input(root, expected_profile="future-profile")
 
     def test_runtime_to_tag_binding_allows_only_evidence_and_docs(self) -> None:
+        expected_post_runtime_files = {
+            "README.md",
+            "README.zh-CN.md",
+            "CHANGELOG.md",
+            "MODIFICATIONS.md",
+            "SECURITY.md",
+            "docs/assets/q38lab-architecture.svg",
+            "docs/cli.md",
+            "docs/models.md",
+            "docs/qwen4-exp.md",
+        }
+        self.assertEqual(evidence.ALLOWED_POST_RUNTIME_FILES, expected_post_runtime_files)
         repo = Path(self.temporary.name) / "git-binding"
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -1041,17 +1063,39 @@ class EvidenceTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "runtime"], cwd=repo, check=True)
         runtime = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
         digest = evidence.runtime_tree_sha256(repo, runtime)
-        (repo / "results" / "rtx5090-test").mkdir(parents=True)
-        (repo / "results" / "rtx5090-test" / "summary.json").write_text("{}\n", encoding="utf-8")
-        for relative in sorted(evidence.ALLOWED_POST_RUNTIME_FILES):
+        result_dir = repo / "results" / "rtx5090-test"
+        result_dir.mkdir(parents=True)
+        (result_dir / "summary.json").write_text("{}\n", encoding="utf-8")
+        (result_dir / evidence.V02_RUNTIME_TELEMETRY_FILE).write_text(
+            "{}\n", encoding="utf-8",
+        )
+        (result_dir / evidence.V02_PLE_CHECKPOINT_PROBE_FILE).write_text(
+            "{}\n", encoding="utf-8",
+        )
+        for relative in sorted(expected_post_runtime_files):
             path = repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("reviewed release metadata\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-qm", "evidence"], cwd=repo, check=True)
         tag = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-        summary = {"source": {"validated_runtime_commit": runtime, "runtime_tree_sha256": digest}}
+        summary = {
+            "run_id": "rtx5090-test",
+            "execution": {"profile": evidence.PROFILE_V02},
+            "source": {
+                "validated_runtime_commit": runtime,
+                "runtime_tree_sha256": digest,
+            },
+        }
         evidence.validate_tag_binding(summary, tag_commit=tag, repo_root=repo)
+        junk = repo / "results" / "rtx5090-junk" / "extra.sh"
+        junk.parent.mkdir(parents=True)
+        junk.write_text("echo forbidden\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "forbidden evidence sibling"], cwd=repo, check=True)
+        junk_tag = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        with self.assertRaisesRegex(evidence.EvidenceError, "rtx5090-junk/extra.sh"):
+            evidence.validate_tag_binding(summary, tag_commit=junk_tag, repo_root=repo)
         (repo / "THIRD_PARTY_NOTICES.md").write_text("changed notices\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-qm", "forbidden notice change"], cwd=repo, check=True)
