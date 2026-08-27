@@ -298,6 +298,126 @@ def test_triton_overlap_prefill_matches_dequant_reference():
 
 
 @cuda
+def test_triton_sparse_prefill_matches_full_bank_reference(monkeypatch):
+    """Direct registered-host sparse copies leave inactive rows stale, while the
+    native grouped GEMM remains identical because routing only indexes active raw
+    expert ids. This also exercises the cudaMemcpyBatchAsync production branch.
+    """
+    import freetoken.moe.offload_cache as offload_cache
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 1)
+    device = torch.device("cuda")
+    sources = _make_native_sources(device, seed=23)
+    cache = OffloadMoeCache(
+        num_layers=L,
+        num_experts=E,
+        cache_size=2 * E,
+        device=device,
+        quant_format="nvfp4",
+        prefill_overlap=True,
+        prefill_sparse=True,
+    )
+    cache.set_bank_sources({name: sources[name] for name in cache.bank_schema})
+    for buffer in cache.prefill_bank_buffers:
+        buffer.zero_()
+
+    torch.manual_seed(24)
+    hidden = torch.randn(8, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.tensor([[1, 5]] * 8, dtype=torch.int32, device=device)
+    topk_weights = torch.rand(8, TOPK, dtype=torch.float32, device=device)
+    ref = _ref_moe(sources, 0, hidden, topk_weights, topk_ids)
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0, topk_ids)
+    banks = cache.wait_prefill_layer(0)
+    out = fused_experts_nvfp4(
+        hidden, *banks, topk_weights, topk_ids, E, "silu", False
+    )
+    _assert_close(out, ref)
+    assert cache.prefill_sparse_rows == 2
+    assert cache.prefill_sparse_total_rows == E
+    assert cache.prefill_sparse_bytes * (E // 2) == cache.prefill_sparse_full_bytes
+    cache.release_prefill_layer(0)
+
+
+@cuda
+def test_triton_sparse_prefill_reuses_events_across_layers_and_requests(monkeypatch):
+    """Sparse NVFP4 keeps both parity buffers correct across event re-records.
+
+    Four layers force buffer 0 and buffer 1 to be reused once per request.  A
+    second ``begin_prefill`` immediately follows the first request, so its begin
+    fence and the prior release-event generations are exercised too.  There is
+    deliberately no device synchronization between layers or requests; all
+    outputs are checked only after both request-shaped passes have been queued.
+    """
+    import freetoken.moe.offload_cache as offload_cache
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 1)
+    device = torch.device("cuda")
+    first = _make_native_sources(device, seed=31)
+    second = _make_native_sources(device, seed=32)
+    sources = {name: first[name] + second[name] for name in first}
+    num_layers = 4
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=E,
+        cache_size=2 * E,
+        device=device,
+        quant_format="nvfp4",
+        prefill_overlap=True,
+        prefill_sparse=True,
+    )
+    cache.set_bank_sources({name: sources[name] for name in cache.bank_schema})
+    for buffer in cache.prefill_bank_buffers:
+        buffer.fill_(0xA5)
+
+    torch.manual_seed(33)
+    tokens = 4
+    route_sets = (
+        ((0, 1), (2, 3), (4, 5), (6, 7)),
+        ((7, 0), (1, 6), (2, 5), (3, 4)),
+    )
+    cases = []
+    for request_id, per_layer_routes in enumerate(route_sets):
+        for layer_id, routes in enumerate(per_layer_routes):
+            hidden = torch.randn(tokens, H, dtype=torch.bfloat16, device=device) / 4
+            topk_ids = torch.tensor(
+                [routes] * tokens, dtype=torch.int32, device=device
+            )
+            topk_weights = torch.rand(tokens, TOPK, dtype=torch.float32, device=device)
+            ref = _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids)
+            cases.append(
+                (request_id, layer_id, hidden, topk_weights, topk_ids, ref)
+            )
+
+    outputs = []
+    for request_id in range(len(route_sets)):
+        cache.begin_prefill()
+        for case in cases:
+            case_request, layer_id, hidden, topk_weights, topk_ids, ref = case
+            if case_request != request_id:
+                continue
+            cache.prefetch_prefill_layer(layer_id, topk_ids)
+            banks = cache.wait_prefill_layer(layer_id)
+            out = fused_experts_nvfp4(
+                hidden, *banks, topk_weights, topk_ids, E, "silu", False
+            )
+            outputs.append((out, ref))
+            cache.release_prefill_layer(layer_id)
+
+    torch.cuda.synchronize()
+    for out, ref in outputs:
+        _assert_close(out, ref)
+    assert cache.prefill_sparse_rows == len(route_sets) * num_layers * TOPK
+    assert cache.prefill_sparse_total_rows == len(route_sets) * num_layers * E
+    assert cache.prefill_sparse_bytes * (E // TOPK) == cache.prefill_sparse_full_bytes
+
+
+@cuda
 def test_triton_swigluoai_matches_dequant_reference():
     """MiniMax-M3's swigluoai routed experts through the Triton prefill grouped GEMM
     and the marlin-style decode GEMV: same banks, the clamped (up+1) swiglu instead

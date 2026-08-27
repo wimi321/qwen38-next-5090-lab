@@ -26,11 +26,12 @@ from .constants import (
     MODEL_REVISION,
     PROFILE_NAME,
     QWEN_LICENSE_URL,
-    RTX5090_WSL2_PROFILE,
+    RTX5090_WSL2_256K_IMAGE_PROFILE,
+    SERVE_PROFILES,
 )
 from .doctor import evaluate_doctor, format_doctor_report
 from .http import Q38HTTPError
-from .runtime import Dependencies
+from .runtime import Dependencies, cuda_toolkit_environment, temporary_environment
 from .smoke import format_smoke_report, run_smoke
 
 
@@ -71,6 +72,24 @@ def _positive_float(raw: str) -> float:
     return value
 
 
+def _release_decode_tokens(raw: str) -> int:
+    value = _positive_int(raw)
+    if value > 1024:
+        raise argparse.ArgumentTypeError("must be no greater than 1024")
+    if value < 256:
+        raise argparse.ArgumentTypeError("must be at least 256")
+    return value
+
+
+def _boolean(raw: str) -> bool:
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("must be one of true/false, yes/no, on/off, or 1/0")
+
+
 def _env_value(
     cli_value,
     env: Mapping[str, str],
@@ -101,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--source-dir", type=Path, default=None)
     doctor.add_argument("--model-dir", type=Path, default=None)
     doctor.add_argument("--port", type=_port, default=None)
+    doctor.add_argument("--profile", default=None, choices=sorted(SERVE_PROFILES))
 
     download = subparsers.add_parser(
         "download",
@@ -120,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     serve = subparsers.add_parser("serve", help="Launch the verified FreeToken profile")
-    serve.add_argument("--profile", default=None, choices=[PROFILE_NAME])
+    serve.add_argument("--profile", default=None, choices=sorted(SERVE_PROFILES))
     serve.add_argument("--model-dir", type=Path, default=None)
     serve.add_argument("--served-model-name", default=None)
     serve.add_argument("--gpu", default=None)
@@ -141,11 +161,23 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--base-url", default=None)
     smoke.add_argument("--model", default=None)
     smoke.add_argument("--timeout", type=_positive_float, default=None)
+    smoke.add_argument(
+        "--images",
+        action="store_true",
+        default=None,
+        help="Run data-URL, four-image, streaming and media-security smoke checks",
+    )
+    smoke.add_argument(
+        "--https-image-url",
+        default=None,
+        help="Also fetch one caller-selected public HTTPS image (implies --images)",
+    )
     smoke.add_argument("--json", action="store_true")
 
     bench = subparsers.add_parser(
         "bench", help="Run the authoritative RTX 5090 release evidence harness",
     )
+    bench.add_argument("--profile", default=None, choices=sorted(SERVE_PROFILES))
     bench.add_argument("--out", type=Path, required=True)
     bench.add_argument("--base-url", default=None)
     bench.add_argument("--model-dir", type=Path, default=None)
@@ -157,8 +189,19 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--warmups", type=_positive_int, default=None)
     bench.add_argument("--measurements", type=_positive_int, default=None)
     bench.add_argument(
-        "--decode-tokens", type=int, choices=range(256, 513), default=None,
-        metavar="256..512",
+        "--decode-tokens", type=_release_decode_tokens, default=None,
+        metavar="256..1024",
+    )
+    bench.add_argument(
+        "--image-file",
+        type=Path,
+        default=None,
+        help="Local release-owned image fixture required by the 256K image profile",
+    )
+    bench.add_argument(
+        "--https-image-url",
+        default=None,
+        help="Public HTTPS image fixture required by the 256K image profile",
     )
     bench.add_argument("--timeout", type=_positive_float, default=None)
     return parser
@@ -175,6 +218,17 @@ def _model_dir(cli_value: Path | None, deps: Dependencies) -> Path:
 
 
 def _run_doctor(args: argparse.Namespace, deps: Dependencies) -> int:
+    profile_name = str(_env_value(
+        args.profile,
+        deps.env,
+        "Q38LAB_PROFILE",
+        PROFILE_NAME,
+        str,
+    ))
+    try:
+        profile = SERVE_PROFILES[profile_name]
+    except KeyError:
+        raise ConfigurationError(f"unknown profile: {profile_name!r}") from None
     source_dir = Path(_env_value(
         args.source_dir,
         deps.env,
@@ -187,12 +241,17 @@ def _run_doctor(args: argparse.Namespace, deps: Dependencies) -> int:
         args.port,
         deps.env,
         "Q38LAB_PORT",
-        RTX5090_WSL2_PROFILE.port,
+        profile.port,
         int,
     ))
     if not 1 <= port <= 65535:
         raise ConfigurationError(f"Q38LAB_PORT is outside [1, 65535]: {port}")
-    snapshot = deps.doctor_collector(source_dir=source_dir, model_dir=model_dir, port=port)
+    snapshot = deps.doctor_collector(
+        source_dir=source_dir,
+        model_dir=model_dir,
+        port=port,
+        profile_name=profile_name,
+    )
     report = evaluate_doctor(snapshot)
     print(report.to_json() if args.json else format_doctor_report(report))
     return 0 if report.ready else 1
@@ -223,15 +282,51 @@ def _run_serve(args: argparse.Namespace, deps: Dependencies) -> int:
         cli=vars(args),
         env=deps.env,
     )
+    toolkit_environment = cuda_toolkit_environment(deps.env)
+    preflight: dict[str, object] = {}
+    if config.ple_require_native_io_uring:
+        capability = deps.ple_capability_probe(config.model_dir)
+        if not bool(getattr(capability, "production_ready", False)):
+            detail = str(getattr(capability, "detail", "capability probe failed"))
+            raise ConfigurationError(
+                "the 256K profile requires native io_uring + O_DIRECT PLE "
+                f"streaming: {detail}"
+            )
+    if config.qsa_require_native_topk:
+        with temporary_environment(toolkit_environment):
+            capability = deps.qsa_native_topk_probe()
+        if not bool(getattr(capability, "production_ready", False)):
+            detail = str(getattr(capability, "detail", "capability probe failed"))
+            raise ConfigurationError(
+                "the 256K profile requires a verified native SM120 QSA "
+                f"fast-topk JIT and launch: {detail}"
+            )
+        with temporary_environment(toolkit_environment):
+            ple_report = deps.ple_checkpoint_probe(config.model_dir)
+        if (
+            ple_report.get("status") != "pass"
+            or ple_report.get("release_qualified") is not True
+        ):
+            raise ConfigurationError(
+                "the 256K profile requires a release-qualified PLE checkpoint "
+                "row/loader parity probe"
+            )
+        preflight["ple_checkpoint_probe"] = ple_report
     # A quick shape check prevents a moved tag or partial local download from ever
     # entering the 60+ second model loader. Full hashing remains opt-in.
     deps.verify_checkpoint_receipt(config.model_dir, require_full=False)
     argv = config.to_ft_argv()
     if any(item == "--moe-cpu-layers" or item.startswith("--moe-cpu-layers=") for item in argv):
         raise AssertionError("the reproducibility profile must leave CPU-layer selection on auto")
-    attestation = deps.attestation_writer(config, argv)
+    attestation = (
+        deps.attestation_writer(config, argv, preflight=preflight)
+        if preflight else deps.attestation_writer(config, argv)
+    )
     try:
-        deps.launch_server(argv, "q38lab serve")
+        runtime_environment = config.runtime_environment()
+        runtime_environment.update(toolkit_environment)
+        with temporary_environment(runtime_environment):
+            deps.launch_server(argv, "q38lab serve")
     finally:
         deps.attestation_remover(attestation)
     return 0
@@ -267,7 +362,26 @@ def _run_smoke(args: argparse.Namespace, deps: Dependencies) -> int:
         str,
     )
     client = deps.http_client_factory(base_url, timeout=timeout)
-    report = run_smoke(client, requested_model=model)
+    include_images = bool(_env_value(
+        args.images,
+        deps.env,
+        "Q38LAB_SMOKE_IMAGES",
+        False,
+        _boolean,
+    ))
+    https_image_url = _env_value(
+        args.https_image_url,
+        deps.env,
+        "Q38LAB_SMOKE_HTTPS_IMAGE_URL",
+        None,
+        str,
+    )
+    report = run_smoke(
+        client,
+        requested_model=model,
+        include_images=include_images or https_image_url is not None,
+        https_image_url=https_image_url,
+    )
     print(
         json.dumps(report.as_dict(), indent=2, sort_keys=True)
         if args.json
@@ -279,6 +393,13 @@ def _run_smoke(args: argparse.Namespace, deps: Dependencies) -> int:
 def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
     base_url, timeout = _client_settings(args, deps)
     model_dir = _model_dir(args.model_dir, deps)
+    profile_name = str(_env_value(
+        args.profile, deps.env, "Q38LAB_PROFILE", PROFILE_NAME, str,
+    ))
+    try:
+        profile = SERVE_PROFILES[profile_name]
+    except KeyError:
+        raise ConfigurationError(f"unknown profile: {profile_name!r}") from None
 
     def positive_env(cli_value, name: str, default: int | float, converter=int):
         value = converter(_env_value(cli_value, deps.env, name, default, converter))
@@ -302,8 +423,16 @@ def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
     decode_tokens = int(positive_env(
         args.decode_tokens, "Q38LAB_BENCH_DECODE_TOKENS", 256,
     ))
-    if not 256 <= decode_tokens <= 512:
-        raise ConfigurationError("Q38LAB_BENCH_DECODE_TOKENS must be in [256, 512]")
+    max_decode_tokens = (
+        1024
+        if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name
+        else 512
+    )
+    if not 256 <= decode_tokens <= max_decode_tokens:
+        raise ConfigurationError(
+            "Q38LAB_BENCH_DECODE_TOKENS must be in "
+            f"[256, {max_decode_tokens}] for {profile.name}"
+        )
     if duration < 1800:
         raise ConfigurationError("Q38LAB_BENCH_DURATION_SECONDS must be at least 1800")
     if not 0 < soak_interval <= 25:
@@ -324,7 +453,7 @@ def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
     if not (
         parsed.scheme == "http"
         and parsed.hostname == "127.0.0.1"
-        and port == RTX5090_WSL2_PROFILE.port
+        and port == profile.port
         and parsed.path in {"", "/"}
         and not parsed.query
         and not parsed.fragment
@@ -356,11 +485,12 @@ def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
         raise ConfigurationError("serve attestation has no resolved profile")
     if (
         attested_config.get("profile_contract_verified") is not True
+        or attested_config.get("profile") != profile.name
         or attested_config.get("host") != "127.0.0.1"
-        or attested_config.get("port") != RTX5090_WSL2_PROFILE.port
+        or attested_config.get("port") != profile.port
     ):
         raise ConfigurationError(
-            "release bench requires q38lab serve's unmodified rtx5090-wsl2 profile"
+            f"release bench requires q38lab serve's unmodified {profile.name} profile"
         )
     try:
         attested_model = Path(str(attestation.get("model_realpath"))).resolve()
@@ -385,6 +515,7 @@ def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
         )
 
     harness_argv = [
+        "--profile", profile.name,
         "--model-dir", str(model_dir),
         "--server-pid", str(server_pid_raw),
         "--base-url", base_url,
@@ -399,6 +530,32 @@ def _run_bench(args: argparse.Namespace, deps: Dependencies) -> int:
         "--decode-tokens", str(decode_tokens),
         "--request-timeout", str(timeout),
     ]
+    image_file = _env_value(
+        args.image_file, deps.env, "Q38LAB_BENCH_IMAGE_FILE", None, Path,
+    )
+    https_image_url = _env_value(
+        args.https_image_url,
+        deps.env,
+        "Q38LAB_BENCH_HTTPS_IMAGE_URL",
+        None,
+        str,
+    )
+    if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+        if image_file is None:
+            raise ConfigurationError(
+                "the 256K image release bench requires --image-file"
+            )
+        image_path = Path(image_file).expanduser()
+        if not image_path.is_file():
+            raise ConfigurationError(f"--image-file is not a file: {image_path}")
+        if not isinstance(https_image_url, str) or not https_image_url.startswith("https://"):
+            raise ConfigurationError(
+                "the 256K image release bench requires --https-image-url with HTTPS"
+            )
+        harness_argv.extend([
+            "--image-file", str(image_path),
+            "--https-image-url", https_image_url,
+        ])
     return int(deps.release_harness(harness_argv))
 
 

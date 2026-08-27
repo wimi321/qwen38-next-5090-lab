@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 from q38lab.config import ConfigurationError, is_loopback_host, resolve_serve_config
-from q38lab.constants import RTX5090_WSL2_PROFILE
+from q38lab.constants import (
+    RTX5090_WSL2_256K_IMAGE_PROFILE,
+    RTX5090_WSL2_PROFILE,
+)
 
 
 def test_profile_file_matches_runtime_profile():
@@ -125,3 +128,61 @@ def test_profile_contract_requires_the_canonical_loopback_spelling(tmp_path):
     )
     assert config.host == "localhost"
     assert config.profile_contract_verified is False
+
+
+def test_256k_image_profile_file_runtime_and_environment_contract(tmp_path):
+    root = Path(__file__).parents[2]
+    document = json.loads(
+        (root / "profiles" / "rtx5090-wsl2-256k-image.json").read_text()
+    )
+    profile = RTX5090_WSL2_256K_IMAGE_PROFILE
+    assert document["profile"] == profile.name
+    assert document["max_seq_len"] == profile.max_seq_len == 262_144
+    assert document["max_prefill_length"] == profile.max_prefill_length == 512
+    assert document["num_tokens"] == profile.num_tokens == 262_144
+    assert document["load_vision"] is profile.load_vision is True
+    assert document["ple_io_backend"] == "io_uring_odirect"
+    assert document["ple_cache_bytes"] == profile.ple_cache_bytes == 4 * 1024**3
+    assert (
+        document["qsa_require_native_topk"]
+        is profile.qsa_require_native_topk
+        is True
+    )
+    assert (
+        document["gpu_memory_envelope_bytes"]
+        == profile.gpu_memory_envelope_bytes
+        == 31 * 1024**3
+    )
+    assert (
+        document["gpu_runtime_reserve_bytes"]
+        == profile.gpu_runtime_reserve_bytes
+        == 512 * 1024**2
+    )
+
+    config = resolve_serve_config(
+        profile_name=profile.name,
+        cli={"model_dir": tmp_path, "unsafe_non_loopback": False},
+        env={},
+    )
+    assert config.profile_contract_verified
+    assert config.moe_prefill_sparse is True
+    assert config.runtime_environment()["FREETOKEN_MOE_PREFILL_SPARSE"] == "1"
+    assert config.attention_backend == "qsa_triton_sm120"
+    environment = config.runtime_environment()
+    assert environment["FREETOKEN_LOAD_VISION"] == "1"
+    assert environment["FREETOKEN_PLE_IO_BACKEND"] == "io_uring_odirect"
+    assert environment["FREETOKEN_PLE_CACHE_BYTES"] == str(4 * 1024**3)
+    assert environment["FREETOKEN_QSA_REQUIRE_NATIVE_TOPK"] == "1"
+    assert environment["FREETOKEN_GPU_MEMORY_ENVELOPE_BYTES"] == str(31 * 1024**3)
+
+
+def test_8k_profile_explicitly_keeps_vision_and_native_streaming_off(tmp_path):
+    config = resolve_serve_config(
+        profile_name=RTX5090_WSL2_PROFILE.name,
+        cli={"model_dir": tmp_path, "unsafe_non_loopback": False},
+        env={},
+    )
+    environment = config.runtime_environment()
+    assert environment["FREETOKEN_LOAD_VISION"] == "0"
+    assert environment["FREETOKEN_PLE_IO_BACKEND"] == "mmap"
+    assert environment["FREETOKEN_QSA_REQUIRE_NATIVE_TOPK"] == "0"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +16,19 @@ def test_download_requires_explicit_license_acceptance():
     with pytest.raises(SystemExit) as exc:
         parser.parse_args(["download"])
     assert exc.value.code == 2
+
+
+def test_smoke_image_flags_are_parameterized() -> None:
+    args = build_parser().parse_args(
+        [
+            "smoke",
+            "--images",
+            "--https-image-url",
+            "https://images.example/public.png",
+        ]
+    )
+    assert args.images is True
+    assert args.https_image_url == "https://images.example/public.png"
 
 
 def test_serve_validates_checkpoint_and_launches_exact_profile(tmp_path):
@@ -103,6 +118,7 @@ def test_bench_wraps_the_single_authoritative_release_harness(tmp_path):
             "runtime_commit": "a" * 40,
             "model_realpath": str(model.resolve()),
             "resolved_config": {
+                "profile": "rtx5090-wsl2",
                 "profile_contract_verified": True,
                 "host": "127.0.0.1",
                 "port": 1919,
@@ -130,6 +146,7 @@ def test_bench_wraps_the_single_authoritative_release_harness(tmp_path):
     assert argv[argv.index("--model-dir") + 1] == str(model)
     assert argv[argv.index("--server-pid") + 1] == "4321"
     assert argv[argv.index("--expected-commit") + 1] == "a" * 40
+    assert argv[argv.index("--profile") + 1] == "rtx5090-wsl2"
     assert argv[argv.index("--duration-seconds") + 1] == "1800"
     assert argv[argv.index("--sequential-requests") + 1] == "100"
     assert argv[argv.index("--decode-tokens") + 1] == "256"
@@ -146,6 +163,7 @@ def test_bench_rejects_weakened_release_counts_before_running_harness(
             "runtime_commit": "a" * 40,
             "model_realpath": str(model.resolve()),
             "resolved_config": {
+                "profile": "rtx5090-wsl2",
                 "profile_contract_verified": True,
                 "host": "127.0.0.1",
                 "port": 1919,
@@ -166,3 +184,189 @@ def test_bench_rejects_weakened_release_counts_before_running_harness(
     assert code == 1
     assert calls == []
     assert "must be at least 3" in capsys.readouterr().err
+
+
+def test_256k_bench_forwards_profile_image_fixtures_and_1024_decode(tmp_path):
+    model = tmp_path / "model"
+    image = tmp_path / "fixture.png"
+    image.write_bytes(b"not-decoded-by-cli")
+    attestation = tmp_path / "serve.json"
+    attestation.write_text(
+        json.dumps({
+            "pid": 4321,
+            "runtime_commit": "b" * 40,
+            "model_realpath": str(model.resolve()),
+            "resolved_config": {
+                "profile": "rtx5090-wsl2-256k-image",
+                "profile_contract_verified": True,
+                "host": "127.0.0.1",
+                "port": 1919,
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    calls = []
+    deps = Dependencies(env={}, release_harness=lambda argv: calls.append(argv) or 0)
+
+    assert main([
+        "bench",
+        "--profile", "rtx5090-wsl2-256k-image",
+        "--out", str(tmp_path / "results"),
+        "--model-dir", str(model),
+        "--attestation", str(attestation),
+        "--decode-tokens", "1024",
+        "--image-file", str(image),
+        "--https-image-url", "https://example.com/fixture.png",
+    ], deps=deps) == 0
+
+    argv = calls[0]
+    assert argv[argv.index("--profile") + 1] == "rtx5090-wsl2-256k-image"
+    assert argv[argv.index("--decode-tokens") + 1] == "1024"
+    assert argv[argv.index("--image-file") + 1] == str(image)
+    assert argv[argv.index("--https-image-url") + 1] == "https://example.com/fixture.png"
+
+
+def test_256k_serve_requires_native_ple_before_checkpoint_or_launch(tmp_path, capsys):
+    calls = []
+    deps = Dependencies(
+        env={},
+        ple_capability_probe=lambda path: SimpleNamespace(
+            production_ready=False,
+            detail="native extension absent",
+        ),
+        verify_checkpoint_receipt=lambda *args, **kwargs: calls.append("verify"),
+        launch_server=lambda *args, **kwargs: calls.append("launch"),
+    )
+    code = main(
+        [
+            "serve",
+            "--profile",
+            "rtx5090-wsl2-256k-image",
+            "--model-dir",
+            str(tmp_path),
+        ],
+        deps=deps,
+    )
+    assert code == 1
+    assert calls == []
+    assert "native io_uring + O_DIRECT" in capsys.readouterr().err
+
+
+def test_256k_serve_sets_vision_and_ple_environment_only_during_launch(tmp_path):
+    observed = {}
+
+    def launch(argv, prog):
+        observed["argv"] = argv
+        observed["vision"] = os.environ.get("FREETOKEN_LOAD_VISION")
+        observed["ple"] = os.environ.get("FREETOKEN_PLE_IO_BACKEND")
+        observed["native_topk"] = os.environ.get("FREETOKEN_QSA_REQUIRE_NATIVE_TOPK")
+
+    previous_vision = os.environ.get("FREETOKEN_LOAD_VISION")
+    previous_ple = os.environ.get("FREETOKEN_PLE_IO_BACKEND")
+    previous_native_topk = os.environ.get("FREETOKEN_QSA_REQUIRE_NATIVE_TOPK")
+    deps = Dependencies(
+        env={},
+        ple_capability_probe=lambda path: SimpleNamespace(
+            production_ready=True,
+            detail="ok",
+        ),
+        qsa_native_topk_probe=lambda: SimpleNamespace(
+            production_ready=True,
+            detail="native JIT/launch/parity passed",
+        ),
+        ple_checkpoint_probe=lambda path: {
+            "status": "pass",
+            "release_qualified": True,
+        },
+        verify_checkpoint_receipt=lambda *args, **kwargs: None,
+        launch_server=launch,
+        attestation_writer=lambda config, argv, **kwargs: tmp_path / "attestation.json",
+        attestation_remover=lambda path: None,
+    )
+    assert main(
+        [
+            "serve",
+            "--profile",
+            "rtx5090-wsl2-256k-image",
+            "--model-dir",
+            str(tmp_path),
+        ],
+        deps=deps,
+    ) == 0
+    assert observed["vision"] == "1"
+    assert observed["ple"] == "io_uring_odirect"
+    assert observed["native_topk"] == "1"
+    argv = observed["argv"]
+    assert argv[argv.index("--max-seq-len-override") + 1] == "262144"
+    assert argv[argv.index("--max-prefill-length") + 1] == "512"
+    assert os.environ.get("FREETOKEN_LOAD_VISION") == previous_vision
+    assert os.environ.get("FREETOKEN_PLE_IO_BACKEND") == previous_ple
+    assert os.environ.get("FREETOKEN_QSA_REQUIRE_NATIVE_TOPK") == previous_native_topk
+
+
+def test_256k_serve_requires_native_fast_topk_before_checkpoint_or_launch(
+    tmp_path, capsys
+):
+    calls = []
+    deps = Dependencies(
+        env={},
+        ple_capability_probe=lambda path: SimpleNamespace(
+            production_ready=True,
+            detail="ok",
+        ),
+        qsa_native_topk_probe=lambda: SimpleNamespace(
+            production_ready=False,
+            detail="JIT launch failed",
+        ),
+        verify_checkpoint_receipt=lambda *args, **kwargs: calls.append("verify"),
+        launch_server=lambda *args, **kwargs: calls.append("launch"),
+    )
+    code = main(
+        [
+            "serve",
+            "--profile",
+            "rtx5090-wsl2-256k-image",
+            "--model-dir",
+            str(tmp_path),
+        ],
+        deps=deps,
+    )
+    assert code == 1
+    assert calls == []
+    assert "native SM120 QSA fast-topk" in capsys.readouterr().err
+
+
+def test_256k_serve_requires_release_qualified_ple_row_probe_before_launch(
+    tmp_path, capsys
+):
+    calls = []
+    deps = Dependencies(
+        env={},
+        ple_capability_probe=lambda path: SimpleNamespace(
+            production_ready=True,
+            detail="ok",
+        ),
+        qsa_native_topk_probe=lambda: SimpleNamespace(
+            production_ready=True,
+            detail="native JIT/launch/parity passed",
+        ),
+        ple_checkpoint_probe=lambda path: {
+            "status": "pass",
+            "release_qualified": False,
+        },
+        verify_checkpoint_receipt=lambda *args, **kwargs: calls.append("verify"),
+        launch_server=lambda *args, **kwargs: calls.append("launch"),
+    )
+    code = main(
+        [
+            "serve",
+            "--profile",
+            "rtx5090-wsl2-256k-image",
+            "--model-dir",
+            str(tmp_path),
+        ],
+        deps=deps,
+    )
+    assert code == 1
+    assert calls == []
+    assert "PLE checkpoint row/loader parity" in capsys.readouterr().err

@@ -23,7 +23,10 @@ def test_atomic_attestation_has_release_binding_fields(tmp_path, monkeypatch):
     monkeypatch.setattr(attestation, "_source_root", lambda: tmp_path)
     target = tmp_path / "state" / "serve.json"
     path = attestation.write_launch_attestation(
-        config, config.to_ft_argv(), target=target,
+        config,
+        config.to_ft_argv(),
+        target=target,
+        preflight={"ple_checkpoint_probe": {"status": "pass"}},
     )
     document = json.loads(path.read_text(encoding="utf-8"))
     assert document["schema_version"] == "1.0"
@@ -33,6 +36,9 @@ def test_atomic_attestation_has_release_binding_fields(tmp_path, monkeypatch):
     assert document["resolved_config"] == config.public_dict()
     assert document["argv"] == config.to_ft_argv()
     assert document["proc_start_ticks"] == 12345
+    assert document["preflight"] == {
+        "ple_checkpoint_probe": {"status": "pass"}
+    }
 
 
 def test_cleanup_never_removes_another_process_attestation(tmp_path):

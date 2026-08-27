@@ -1,9 +1,26 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import sys
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import Extension, setup
+
+
+if sys.platform == "linux" and not os.environ.get("CUDA_HOME"):
+    for _cuda_candidate in (Path("/usr/local/cuda"), Path("/usr/local/cuda-13.3")):
+        if (_cuda_candidate / "bin" / "nvcc").is_file():
+            os.environ["CUDA_HOME"] = str(_cuda_candidate)
+            os.environ.setdefault("CUDA_PATH", str(_cuda_candidate))
+            os.environ.setdefault("CUDACXX", str(_cuda_candidate / "bin" / "nvcc"))
+            os.environ["PATH"] = (
+                str(_cuda_candidate / "bin")
+                + os.pathsep
+                + os.environ.get("PATH", os.defpath)
+            )
+            break
+
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
 
@@ -34,6 +51,22 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
 cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
 _check_toolchain()
 
+linux_ple_extensions = (
+    [
+        Extension(
+            name="freetoken.models.qwen4_exp._ple_io_uring",
+            sources=[
+                "python/freetoken/models/qwen4_exp/csrc/ple_io_uring.cpp",
+            ],
+            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+            extra_link_args=["-pthread"],
+            language="c++",
+        )
+    ]
+    if sys.platform == "linux"
+    else []
+)
+
 
 setup(
     ext_modules=[
@@ -62,6 +95,7 @@ setup(
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
         ),
+        *linux_ple_extensions,
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

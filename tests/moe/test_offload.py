@@ -658,6 +658,30 @@ def test_offload_cache_rebuild_keeps_overlap_at_boundary():
     assert cache.cache_size == 8
 
 
+def test_offload_cache_rebuild_rejects_disabling_sparse_prefill_overlap():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+        prefill_sparse=True,
+    )
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8)],
+        "down": [torch.randn(4, 8, 16)],
+    }
+    cache.set_bank_sources(sources)
+
+    with pytest.raises(ValueError, match="2\\*num_experts"):
+        cache.rebuild(7)
+    assert cache.cache_size == 8
+    assert cache.prefill_overlap is True
+
+
 def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
     # The constructor caps nvfp4_marlin slots at 992; a runtime rebuild must enforce the
     # same upper cap (and the num_experts floor), else marlin decode kernels later break.
@@ -677,7 +701,13 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
         bf16.validate_rebuild(3)  # below the num_experts floor
 
 
-def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
+def _make_split_cache(
+    num_layers=2,
+    locked=(1,),
+    prefill_overlap=False,
+    prefill_sparse=False,
+    device="cpu",
+):
     """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
     from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -687,6 +717,7 @@ def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="
     cache = OffloadMoeCache(
         num_layers=num_layers, num_experts=4, cache_size=8,
         device=dev, prefill_overlap=prefill_overlap,
+        prefill_sparse=prefill_sparse,
     )
     cache.cpu_layer_ids = frozenset(locked)
     src_dev = dev if dev.type == "cuda" else torch.device("cpu")
@@ -729,8 +760,10 @@ def test_set_bank_sources_locked_layer_requires_cpu_layer_ids():
         )
 
 
-def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
-    # prefill overlap DMAs from registered banks; a LOCKED layer cannot feed it
+def test_set_bank_sources_locked_layer_prefill_overlap_uses_cpu_fallback():
+    # CPU fixtures have no CUDA copy stream, so the split-residency path mirrors
+    # the bounce semantics with a synchronous full-layer copy into the same GPU-
+    # buffer-shaped views.  It must preserve raw expert-id row positions.
     from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -744,11 +777,134 @@ def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
         "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
         "down": [torch.randn(4, 8, 16) for _ in range(2)],
     }
-    with pytest.raises(ValueError, match="[Pp]refill overlap"):
-        cache.set_bank_sources(
-            sources,
-            layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
+    )
+    assert cache.has_unpinned_layers
+    cache.prefetch_prefill_layer(1)
+    gate_up, down = cache.wait_prefill_layer(1)
+    assert torch.equal(gate_up, sources["gate_up"][1])
+    assert torch.equal(down, sources["down"][1])
+    cache.release_prefill_layer(1)
+
+
+def test_sparse_prefill_copies_only_active_raw_id_rows_on_cpu(monkeypatch):
+    import freetoken.moe.offload_cache as offload_cache
+
+    # Treat the tiny fixture rows as large banks. Production native-NVFP4 packed
+    # rows already exceed the 256 KiB threshold; lowering it here lets a small CPU
+    # test prove that inactive raw-id destinations are never touched.
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 1)
+    cache, sources = _make_split_cache(
+        num_layers=2,
+        locked=(1,),
+        prefill_overlap=True,
+        prefill_sparse=True,
+    )
+    for buffer in cache.prefill_bank_buffers:
+        buffer.fill_(-17)
+
+    ids = torch.tensor([[3, 1], [1, 3]], dtype=torch.int32)
+    cache.prefetch_prefill_layer(1, ids)
+    gate_up, down = cache.wait_prefill_layer(1)
+
+    for expert_id in (1, 3):
+        assert torch.equal(gate_up[expert_id], sources["gate_up"][1][expert_id])
+        assert torch.equal(down[expert_id], sources["down"][1][expert_id])
+    for expert_id in (0, 2):
+        assert torch.all(gate_up[expert_id] == -17)
+        assert torch.all(down[expert_id] == -17)
+    assert cache.prefill_sparse_rows == 2
+    assert cache.prefill_sparse_total_rows == 4
+    assert cache.prefill_sparse_bytes * 2 == cache.prefill_sparse_full_bytes
+    cache.reset_stats()
+    assert cache.prefill_sparse_stats() == {
+        "active_rows": 0,
+        "possible_rows": 0,
+        "bytes_copied": 0,
+        "full_bytes": 0,
+        "row_fraction": 0.0,
+        "byte_fraction": 0.0,
+    }
+    cache.release_prefill_layer(1)
+
+
+@pytest.mark.parametrize("invalid_id", [-1, 4])
+def test_sparse_prefill_rejects_invalid_expert_ids(invalid_id):
+    cache, _sources = _make_split_cache(
+        num_layers=2,
+        locked=(1,),
+        prefill_overlap=True,
+        prefill_sparse=True,
+    )
+
+    with pytest.raises(RuntimeError, match="every expert id"):
+        cache.prefetch_prefill_layer(
+            1,
+            torch.tensor([[0, invalid_id]], dtype=torch.int32),
         )
+
+
+def test_sparse_prefill_coalesces_sorted_expert_ids():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    assert OffloadMoeCache._coalesced_expert_runs([]) == []
+    assert OffloadMoeCache._coalesced_expert_runs([0, 1, 4, 6, 7, 8]) == [
+        (0, 2),
+        (4, 1),
+        (6, 3),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_locked_layer_prefill_overlap_bounces_tail_chunks_on_cuda():
+    # The deliberately tiny, non-32MiB-aligned banks exercise the final partial
+    # slab for multiple dtypes.  The exact pinned slabs stay a fixed 64MiB.
+    cache, sources = _make_split_cache(
+        num_layers=2, locked=(1,), prefill_overlap=True, device="cuda"
+    )
+
+    cache.prefetch_prefill_layer(1)
+    gate_up, down = cache.wait_prefill_layer(1)
+    torch.cuda.synchronize()
+    assert torch.equal(gate_up.cpu(), sources["gate_up"][1])
+    assert torch.equal(down.cpu(), sources["down"][1])
+    assert cache.prefill_bounce_staging is not None
+    assert cache.prefill_bounce_staging.numel() == 64 << 20
+    cache.release_prefill_layer(1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_locked_layer_sparse_prefill_bounces_only_active_rows_on_cuda(monkeypatch):
+    import freetoken.moe.offload_cache as offload_cache
+
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 1)
+    cache, sources = _make_split_cache(
+        num_layers=2,
+        locked=(1,),
+        prefill_overlap=True,
+        prefill_sparse=True,
+        device="cuda",
+    )
+    for buffer in cache.prefill_bank_buffers:
+        buffer.fill_(-11)
+
+    ids = torch.tensor([[2, 0, 2, 0]], dtype=torch.int32, device="cuda")
+    cache.prefetch_prefill_layer(1, ids)
+    gate_up, down = cache.wait_prefill_layer(1)
+    torch.cuda.synchronize()
+
+    for expert_id in (0, 2):
+        assert torch.equal(gate_up[expert_id].cpu(), sources["gate_up"][1][expert_id])
+        assert torch.equal(down[expert_id].cpu(), sources["down"][1][expert_id])
+    for expert_id in (1, 3):
+        assert torch.all(gate_up[expert_id] == -11)
+        assert torch.all(down[expert_id] == -11)
+    assert cache.prefill_sparse_rows == 2
+    assert cache.prefill_sparse_total_rows == 4
+    assert cache.prefill_sparse_bytes * 2 == cache.prefill_sparse_full_bytes
+    cache.release_prefill_layer(1)
 
 
 def test_locked_layer_prefill_materialize_copies_whole_layer_pageable():

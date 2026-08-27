@@ -11,13 +11,22 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import (
+    align_ceil,
+    init_logger,
+    is_sm90_family,
+    is_sm100_family,
+    is_sm120_family,
+    mem_GB,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -112,6 +121,8 @@ def _backend_requirements_met(name: str) -> bool:
         return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
         return False
+    if any(i.requires_sm120 for i in infos) and not is_sm120_family():
+        return False
     return True
 
 
@@ -190,7 +201,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 name
                 for name in (
                     "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse",
-                    "m3_sparse", "qsa_triton", "qsa_torch",
+                    "m3_sparse", "qsa_triton", "qsa_triton_sm120", "qsa_torch",
                 )
                 if required <= attention_backend_info(name).supported_types
             ]
@@ -235,6 +246,12 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"Attention backend {config.attention_backend!r} requires a compute capability "
                 "10.x GPU: flashinfer's trtllm-gen kernels ship sm_100a/103a cubins only. "
                 "Use --attention-backend fi (or triton) instead."
+            )
+        if info.requires_sm120 and not is_sm120_family():
+            raise RuntimeError(
+                f"Attention backend {config.attention_backend!r} requires a compute "
+                "capability 12.x consumer Blackwell GPU (RTX 50-series). Use "
+                "--attention-backend qsa_triton on other GPUs."
             )
 
     if required & {AttnType.MLA, AttnType.DSA} and config.page_size != 1:
@@ -331,6 +348,26 @@ class Engine:
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
+        from freetoken.engine.cache_budget import enforce_gpu_memory_envelope
+
+        envelope_bytes = int(ENV.GPU_MEMORY_ENVELOPE_BYTES.value)
+        runtime_reserve_bytes = int(
+            getattr(config.model_config, "moe_auto_runtime_reserve_bytes", 0)
+        )
+        self._planned_gpu_peak_bytes = enforce_gpu_memory_envelope(
+            total_bytes=torch.cuda.get_device_properties(self.device).total_memory,
+            baseline_free=self._baseline_free,
+            memory_ratio=config.memory_ratio,
+            envelope_bytes=envelope_bytes,
+            runtime_reserve_bytes=runtime_reserve_bytes,
+        )
+        if envelope_bytes:
+            logger.info_rank0(
+                "GPU envelope preflight: planned_peak=%s envelope=%s runtime_reserve=%s",
+                mem_GB(self._planned_gpu_peak_bytes),
+                mem_GB(envelope_bytes),
+                mem_GB(runtime_reserve_bytes),
+            )
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
@@ -541,6 +578,16 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config) + runtime_reserve
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        # A fixed --num-tokens/--num-pages request is already resolved before
+        # expert-cache construction.  Reserve that entire KV geometry so
+        # --moe-cache-auto shrinks expert residency around a 256K QSA cache
+        # instead of planning for the legacy 8K floor and OOMing later.
+        num_page_override = getattr(config, "num_page_override", None)
+        requested_kv_tokens = (
+            num_page_override * page_tokens
+            if num_page_override is not None
+            else config.kv_reserve_tokens
+        )
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -551,7 +598,7 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=max(requested_kv_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )
@@ -611,12 +658,13 @@ class Engine:
                     f"pin budget; OS-locking all layers instead of pinning"
                 )
         if split_residency and config.moe_prefill_overlap:
-            # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
+            # LOCKED/PAGEABLE layers use OffloadMoeCache's bounded pinned bounce
+            # staging; registered layers keep their direct-DMA path.  Do not disable
+            # overlap for the whole model merely because a subset decodes on CPU.
             logger.info_rank0(
-                "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
+                "--moe-cpu-layers split residency: MoE prefill overlap uses bounded "
+                "pinned bounce staging for locked layers"
             )
-            object.__setattr__(config, "moe_prefill_overlap", False)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -643,6 +691,20 @@ class Engine:
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
             )
+            if os.environ.get("Q38LAB_REQUIRE_LOCKED_MOE") == "1" and split_residency:
+                actual = banks.layer_residency or []
+                not_locked = [
+                    layer_id
+                    for layer_id in sorted(cpu_layer_ids)
+                    if layer_id >= len(actual) or actual[layer_id] != "locked"
+                ]
+                if not_locked:
+                    raise RuntimeError(
+                        "the 256K q38lab profile requires every CPU MoE bank to remain "
+                        "OS-locked, but layers "
+                        f"{not_locked} settled as PAGEABLE/non-locked; raise the process "
+                        "RLIMIT_MEMLOCK to cover all locked expert banks before serving"
+                    )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
@@ -666,6 +728,22 @@ class Engine:
                     f"runtime_reserve={runtime_reserve_mib:.0f} MiB)"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            prefill_sparse = os.environ.get("FREETOKEN_MOE_PREFILL_SPARSE") == "1"
+            if prefill_sparse and not config.moe_prefill_overlap:
+                raise RuntimeError(
+                    "route-aware sparse MoE prefill requires the double-buffered "
+                    "prefill overlap cache; increase the MoE cache budget"
+                )
+            if prefill_sparse and banks.quant_format != "nvfp4":
+                raise RuntimeError(
+                    "route-aware sparse MoE prefill is release-qualified only for "
+                    f"native nvfp4 banks, not {banks.quant_format!r}"
+                )
+            if prefill_sparse:
+                logger.info_rank0(
+                    "Route-aware sparse MoE prefill is enabled: raw expert ids are "
+                    "preserved and only routed packed rows cross PCIe"
+                )
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -676,6 +754,7 @@ class Engine:
                 cache_policy=config.moe_cache_policy,
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                prefill_sparse=prefill_sparse,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -1056,6 +1135,10 @@ class Engine:
             dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
+                # Warmup is not a user workload. In particular, route-aware
+                # prefill counters feed release evidence and must start at zero
+                # when the API becomes ready.
+                self.moe_offload_cache.reset_stats()
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
@@ -1254,6 +1337,19 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int
     budget = _pin_budget_bytes()
     if budget is None or bank_bytes <= budget:
         return frozenset()
+    # Split prefill needs two exact 32 MiB cudaMallocHost bounce slabs. Qwen4-Exp's
+    # PLE row pipeline independently owns two 16 MiB pinned slabs. Reserve both
+    # before choosing how many expert layers may remain cudaHostRegister'd.
+    from freetoken.moe.offload_cache import (
+        PREFILL_BOUNCE_BUFFERS,
+        PREFILL_BOUNCE_CHUNK_BYTES,
+    )
+
+    staging_reserve = PREFILL_BOUNCE_BUFFERS * PREFILL_BOUNCE_CHUNK_BYTES
+    qwen4_args = getattr(config.model_config, "qwen4_args", None)
+    if qwen4_args is not None and getattr(qwen4_args, "ple_layer_ids", ()):
+        staging_reserve += 32 << 20
+    effective_budget = max(0, budget - staging_reserve)
     if not _cpu_moe_executor_viable(config.model_config):
         logger.info_rank0(
             f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB exceed the "
@@ -1261,12 +1357,16 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int
             f"serve this model; keeping every layer pinned on the GPU offload path"
         )
         return frozenset()
-    n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
+    n = min(
+        num_moe_layers,
+        math.ceil(num_moe_layers * (1 - effective_budget / bank_bytes)),
+    )
     head = (n + 1) // 2
     ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
     logger.info_rank0(
         f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; locking {n} head+tail MoE layers for CPU decode "
+        f"{budget / 2**30:.2f} GiB (reserving {staging_reserve / 2**20:.0f} MiB "
+        f"for pinned staging); locking {n} head+tail MoE layers for CPU decode "
         f"({sorted(ids)})"
     )
     return ids

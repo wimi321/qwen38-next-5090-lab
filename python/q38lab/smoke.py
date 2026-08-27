@@ -6,7 +6,14 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
-from .http import SSEResponse
+from .http import Q38HTTPError, SSEResponse
+
+
+_TINY_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAAU0lEQVR4nO3PQQ3AIADAQEAJ0pCG1IngcVnSU9DO"
+    "fe74s6UDXjWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaB9ozEBgFr2bzkAAAAASUVORK5CYII="
+)
 
 
 class SmokeClient(Protocol):
@@ -63,7 +70,141 @@ def _stream_text(response: SSEResponse) -> str:
     return "".join(pieces)
 
 
-def run_smoke(client: SmokeClient, *, requested_model: str | None = None) -> SmokeReport:
+def _image_request(model: str, urls: list[str], *, stream: bool) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [
+        {"type": "image_url", "image_url": {"url": url}} for url in urls
+    ]
+    content.append({"type": "text", "text": "Describe the image(s) briefly."})
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 64,
+        "temperature": 0.0,
+        "top_k": 1,
+        "stream": stream,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+def _require_assistant_text(response: dict[str, Any], mode: str) -> str:
+    content = _first_message(response).get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"{mode} image response has empty content")
+    return content
+
+
+def run_image_smoke(
+    client: SmokeClient,
+    *,
+    model: str,
+    https_image_url: str | None = None,
+) -> tuple[SmokeCheck, ...]:
+    """Exercise the image wire contract independently of release evidence.
+
+    The built-in data URL keeps the basic and four-image checks reproducible.
+    A caller-supplied public HTTPS image adds a real network-fetch check without
+    hard-coding a third-party host into the project.
+    """
+
+    checks: list[SmokeCheck] = []
+
+    try:
+        response = client.post_json(
+            "/v1/chat/completions",
+            _image_request(model, [_TINY_PNG_DATA_URL], stream=False),
+        )
+        content = _require_assistant_text(response, "data URL")
+        checks.append(SmokeCheck("image_data_url", True, f"received {len(content)} characters"))
+    except Exception as exc:
+        checks.append(SmokeCheck("image_data_url", False, str(exc)))
+
+    try:
+        response = client.post_sse(
+            "/v1/chat/completions",
+            _image_request(model, [_TINY_PNG_DATA_URL], stream=True),
+        )
+        content = _stream_text(response)
+        if not content.strip():
+            raise ValueError("streaming image response has empty content")
+        checks.append(SmokeCheck("image_streaming", True, f"received {len(content)} characters"))
+    except Exception as exc:
+        checks.append(SmokeCheck("image_streaming", False, str(exc)))
+
+    try:
+        response = client.post_json(
+            "/v1/chat/completions",
+            _image_request(model, [_TINY_PNG_DATA_URL] * 4, stream=False),
+        )
+        _require_assistant_text(response, "four-image")
+        checks.append(SmokeCheck("image_four", True, "accepted exactly four images"))
+    except Exception as exc:
+        checks.append(SmokeCheck("image_four", False, str(exc)))
+
+    if https_image_url is not None:
+        try:
+            response = client.post_json(
+                "/v1/chat/completions",
+                _image_request(model, [https_image_url], stream=False),
+            )
+            _require_assistant_text(response, "HTTPS")
+            checks.append(SmokeCheck("image_https", True, "public HTTPS image accepted"))
+        except Exception as exc:
+            checks.append(SmokeCheck("image_https", False, str(exc)))
+
+    try:
+        unsafe_urls = (
+            "http://127.0.0.1/private.png",
+            "file:///etc/passwd",
+            "https://127.0.0.1/private.png",
+            "https://169.254.169.254/latest/meta-data",
+        )
+        for unsafe_url in unsafe_urls:
+            try:
+                client.post_json(
+                    "/v1/chat/completions",
+                    _image_request(model, [unsafe_url], stream=False),
+                )
+            except Q38HTTPError as exc:
+                if "unsafe_image_url" not in str(exc):
+                    raise ValueError(
+                        f"unsafe source returned an unclassified error: {unsafe_url}: {exc}"
+                    ) from exc
+            else:
+                raise ValueError(f"unsafe image source was accepted: {unsafe_url}")
+        checks.append(SmokeCheck("image_security", True, "unsafe/local/private sources rejected"))
+    except Exception as exc:
+        checks.append(SmokeCheck("image_security", False, str(exc)))
+
+    try:
+        for part_type in ("input_audio", "video_url"):
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": [{"type": part_type, "audio_url": "x"}]}
+                ],
+                "max_tokens": 1,
+            }
+            try:
+                client.post_json("/v1/chat/completions", payload)
+            except Q38HTTPError as exc:
+                if "unsupported_content_type" not in str(exc):
+                    raise ValueError(f"{part_type} returned an unclassified error: {exc}") from exc
+            else:
+                raise ValueError(f"unsupported {part_type} content was accepted")
+        checks.append(SmokeCheck("image_only_modalities", True, "audio and video rejected"))
+    except Exception as exc:
+        checks.append(SmokeCheck("image_only_modalities", False, str(exc)))
+
+    return tuple(checks)
+
+
+def run_smoke(
+    client: SmokeClient,
+    *,
+    requested_model: str | None = None,
+    include_images: bool = False,
+    https_image_url: str | None = None,
+) -> SmokeReport:
     checks: list[SmokeCheck] = []
     model: str | None = requested_model
 
@@ -208,6 +349,11 @@ def run_smoke(client: SmokeClient, *, requested_model: str | None = None) -> Smo
         checks.append(SmokeCheck("tool_call", True, "get_weather(Shanghai) parsed"))
     except Exception as exc:
         checks.append(SmokeCheck("tool_call", False, str(exc)))
+
+    if include_images or https_image_url is not None:
+        checks.extend(
+            run_image_smoke(client, model=model, https_image_url=https_image_url)
+        )
 
     return SmokeReport(
         schema_version=1,

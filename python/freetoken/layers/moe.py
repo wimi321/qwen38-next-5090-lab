@@ -9,7 +9,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
-from freetoken.utils import div_even
+from freetoken.utils import div_even, init_logger
 
 from .base import BaseOP
 
@@ -27,6 +27,8 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+_DEBUG_PREFILL_ACTIVE = os.getenv("FREETOKEN_DEBUG_PREFILL_ACTIVE", "0") == "1"
+logger = init_logger(__name__)
 
 
 class MoELayer(BaseOP):
@@ -386,8 +388,18 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if _DEBUG_PREFILL_ACTIVE and self.layer_id in {0, 8, 24, 40, 47}:
+            logged = getattr(cache, "_debug_prefill_active_layers", set())
+            if self.layer_id not in logged:
+                active = int(torch.unique(topk_ids).numel())
+                logger.info_rank0(
+                    f"MoE prefill active experts: layer={self.layer_id} "
+                    f"unique={active}/{self.num_experts} routes={topk_ids.numel()}"
+                )
+                logged.add(self.layer_id)
+                cache._debug_prefill_active_layers = logged
         if cache.prefill_overlap:
-            views = self._wait_prefill_overlap(cache)
+            views = self._wait_prefill_overlap(cache, topk_ids)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -399,6 +411,12 @@ class OffloadMoELayer(MoELayer):
                 is_prefill=True,
             )
             cache.release_prefill_layer(self.layer_id)
+            if cache.has_unpinned_layers and not cache.prefill_sparse:
+                # A split-residency next layer may need a synchronous CPU -> pinned
+                # bounce fill.  Start it only after this layer's GEMM and release
+                # event are enqueued, so that host staging + H2D overlap the current
+                # GPU work instead of delaying it.
+                cache.prefetch_prefill_layer(self.layer_id + 1)
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
@@ -413,7 +431,11 @@ class OffloadMoELayer(MoELayer):
             is_prefill=True,
         )
 
-    def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
+    def _wait_prefill_overlap(
+        self,
+        cache: OffloadMoeCache,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
         next layer's full-layer H2D copy, then return this layer's bank views (in
         bank registration order; buffer position == expert id, so routing ids pass
@@ -421,8 +443,11 @@ class OffloadMoELayer(MoELayer):
         """
         if self.layer_id == 0:
             cache.begin_prefill()
-        cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
+        cache.prefetch_prefill_layer(self.layer_id, topk_ids)
+        if not cache.has_unpinned_layers and not cache.prefill_sparse:
+            # Registered-bank DMA is host-asynchronous, so the original eager
+            # next-layer prefetch remains optimal for all-pinned deployments.
+            cache.prefetch_prefill_layer(self.layer_id + 1)
         return cache.wait_prefill_layer(self.layer_id)
 
     # ------------------------------------------------------------------

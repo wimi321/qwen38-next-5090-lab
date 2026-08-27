@@ -63,6 +63,7 @@ def build_launch_attestation(
     argv: list[str],
     *,
     pid: int | None = None,
+    preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     process_id = os.getpid() if pid is None else pid
     source_root = _source_root()
@@ -77,6 +78,7 @@ def build_launch_attestation(
         "model_realpath": str(config.model_dir.resolve()),
         "resolved_config": config.public_dict(),
         "argv": list(argv),
+        "preflight": dict(preflight or {}),
     }
 
 
@@ -85,10 +87,11 @@ def write_launch_attestation(
     argv: list[str],
     *,
     target: Path | None = None,
+    preflight: dict[str, Any] | None = None,
 ) -> Path:
     path = (target or default_attestation_path(config.port)).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    document = build_launch_attestation(config, argv)
+    document = build_launch_attestation(config, argv, preflight=preflight)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
     )

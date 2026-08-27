@@ -9,7 +9,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .constants import MODEL_DIRECTORY_NAME, RTX5090_WSL2_PROFILE, ServeProfile
+from .constants import (
+    MODEL_DIRECTORY_NAME,
+    PROFILE_256K_IMAGE_NAME,
+    RTX5090_WSL2_PROFILE,
+    SERVE_PROFILES,
+    ServeProfile,
+)
 
 
 class ConfigurationError(ValueError):
@@ -95,7 +101,21 @@ class ResolvedServeConfig:
     graph: int
     moe_backend: str
     moe_cache_auto: bool
+    moe_prefill_sparse: bool
     nvfp4_backend: str
+    load_vision: bool
+    ple_io_backend: str
+    ple_require_native_io_uring: bool
+    ple_cache_bytes: int
+    ple_queue_depth: int
+    ple_max_batch_pages: int
+    ple_staging_buffers: int
+    selector_workspace_bytes: int
+    qsa_require_native_topk: bool
+    qsa_cache_bytes: int
+    vision_weights_bytes: int
+    gpu_memory_envelope_bytes: int
+    gpu_runtime_reserve_bytes: int
     profile_contract_verified: bool
 
     def to_ft_argv(self) -> list[str]:
@@ -128,13 +148,39 @@ class ResolvedServeConfig:
         data["model_dir"] = str(self.model_dir)
         return data
 
+    def runtime_environment(self) -> dict[str, str]:
+        """Environment consumed by model construction and PLE bank setup."""
+
+        return {
+            "FREETOKEN_LOAD_VISION": "1" if self.load_vision else "0",
+            "FREETOKEN_PLE_IO_BACKEND": self.ple_io_backend,
+            "FREETOKEN_PLE_CACHE_BYTES": str(self.ple_cache_bytes),
+            "FREETOKEN_PLE_QUEUE_DEPTH": str(self.ple_queue_depth),
+            "FREETOKEN_PLE_MAX_BATCH_PAGES": str(self.ple_max_batch_pages),
+            "FREETOKEN_PLE_STAGING_BUFFERS": str(self.ple_staging_buffers),
+            "FREETOKEN_QSA_REQUIRE_NATIVE_TOPK": (
+                "1" if self.qsa_require_native_topk else "0"
+            ),
+            "FREETOKEN_MOE_PREFILL_SPARSE": (
+                "1" if self.moe_prefill_sparse else "0"
+            ),
+            "FREETOKEN_GPU_MEMORY_ENVELOPE_BYTES": str(
+                self.gpu_memory_envelope_bytes
+            ),
+            # The 256K profile promises swap-free resident CPU expert banks.
+            # Fail startup if an mlock request silently settles as PAGEABLE.
+            "Q38LAB_REQUIRE_LOCKED_MOE": (
+                "1" if self.profile == PROFILE_256K_IMAGE_NAME else "0"
+            ),
+        }
+
 
 def resolve_serve_config(
     *,
     profile_name: str,
     cli: Mapping[str, object | None],
     env: Mapping[str, str] | None = None,
-    profile: ServeProfile = RTX5090_WSL2_PROFILE,
+    profile: ServeProfile | None = None,
 ) -> ResolvedServeConfig:
     """Resolve CLI > ``Q38LAB_*`` > profile and enforce safe binding.
 
@@ -142,7 +188,12 @@ def resolve_serve_config(
     intentionally profile-only for this first reproducibility release.
     """
 
-    if profile_name != profile.name:
+    if profile is None:
+        try:
+            profile = SERVE_PROFILES[profile_name]
+        except KeyError:
+            raise ConfigurationError(f"unknown profile: {profile_name!r}") from None
+    elif profile_name != profile.name:
         raise ConfigurationError(f"unknown profile: {profile_name!r}")
     environ = os.environ if env is None else env
 
@@ -220,6 +271,20 @@ def resolve_serve_config(
         graph=profile.graph,
         moe_backend=profile.moe_backend,
         moe_cache_auto=profile.moe_cache_auto,
+        moe_prefill_sparse=profile.moe_prefill_sparse,
         nvfp4_backend=profile.nvfp4_backend,
+        load_vision=profile.load_vision,
+        ple_io_backend=profile.ple_io_backend,
+        ple_require_native_io_uring=profile.ple_require_native_io_uring,
+        ple_cache_bytes=profile.ple_cache_bytes,
+        ple_queue_depth=profile.ple_queue_depth,
+        ple_max_batch_pages=profile.ple_max_batch_pages,
+        ple_staging_buffers=profile.ple_staging_buffers,
+        selector_workspace_bytes=profile.selector_workspace_bytes,
+        qsa_require_native_topk=profile.qsa_require_native_topk,
+        qsa_cache_bytes=profile.qsa_cache_bytes,
+        vision_weights_bytes=profile.vision_weights_bytes,
+        gpu_memory_envelope_bytes=profile.gpu_memory_envelope_bytes,
+        gpu_runtime_reserve_bytes=profile.gpu_runtime_reserve_bytes,
         profile_contract_verified=contract_verified,
     )

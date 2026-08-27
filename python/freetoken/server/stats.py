@@ -6,6 +6,7 @@ average like tok_s), so idle polls decay to zero by wall clock."""
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from collections import deque
 from typing import Any
 
@@ -37,6 +38,33 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        # Always expose a schema-complete, non-negative snapshot.  Models which
+        # do not implement these optional counters simply leave the values at 0.
+        self.runtime_telemetry: dict[str, Any] = {
+            "selector": {
+                "workspace_peak_bytes": 0,
+                "native_calls": 0,
+                "fallback_calls": 0,
+                "errors": 0,
+            },
+            "ple": {
+                "bytes_read": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "wait_ms": 0.0,
+                "page_faults": 0,
+            },
+            "vision": {"image_tokens": 0, "latency_ms": 0.0},
+            "prefill_chunks": {"count": 0, "total_ms": 0.0},
+            "moe_prefill": {
+                "active_rows": 0,
+                "possible_rows": 0,
+                "bytes_copied": 0,
+                "full_bytes": 0,
+                "row_fraction": 0.0,
+                "byte_fraction": 0.0,
+            },
+        }
 
     @property
     def active(self) -> int:
@@ -74,6 +102,11 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        telemetry = getattr(reply, "runtime_telemetry", None)
+        if isinstance(telemetry, dict):
+            # Message decoding already owns this object, but retaining a copy
+            # prevents a future reply consumer from mutating /v1/stats state.
+            self.runtime_telemetry = deepcopy(telemetry)
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -127,6 +160,21 @@ def _swa_page_size(config: Any) -> int:
     return 1
 
 
+def _effective_kv_page_size(state: Any) -> int:
+    """Resolved engine page size, falling back for older readiness payloads.
+
+    ``state.config`` belongs to the frontend process and can still contain the
+    requested value when the backend overrides the page size while resolving an
+    attention backend.  The readiness ``pools`` metadata is produced from the
+    live engine config, so it is the authoritative source for stats geometry.
+    """
+    pools = getattr(state, "cache_pools", None) or {}
+    resolved = int(pools.get("page_size", 0) or 0)
+    if resolved > 0:
+        return resolved
+    return max(1, int(getattr(state.config, "page_size", 1) or 1))
+
+
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
@@ -139,7 +187,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
     kv = (
         {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages,
-         "page_size": getattr(config, "page_size", 1)}
+         "page_size": _effective_kv_page_size(state)}
         if tr.kv_total_pages > 0 else None
     )
     mamba = (
@@ -161,6 +209,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "swa": swa,
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
+        "q38lab": deepcopy(tr.runtime_telemetry),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),
             "prefill_tps": round(tr.prefill_tps(), 1),

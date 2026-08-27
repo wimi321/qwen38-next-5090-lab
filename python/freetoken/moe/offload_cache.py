@@ -25,6 +25,14 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# A LOCKED/PAGEABLE expert bank has no CUDA device alias, so it cannot feed the
+# normal direct-DMA prefill path.  Bounce it through two exact cudaMallocHost
+# slabs instead.  32 MiB is large enough to stay near the WSL/WDDM PCIe roofline
+# while the second slab is filled from CPU memory; the pair costs only 64 MiB of
+# the host pin quota regardless of model size.
+PREFILL_BOUNCE_CHUNK_BYTES = 32 << 20
+PREFILL_BOUNCE_BUFFERS = 2
+
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -107,6 +115,13 @@ class OffloadMoeCache:
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
+    # Route-aware prefill streaming: keep the ordinary [E] double buffers and raw
+    # expert ids, but transfer only rows selected by the current prefill chunk.
+    # Small banks still move as one whole-layer entry (see
+    # _SMALL_BANK_FEAT_BYTES) so cudaMemcpyBatchAsync stays asynchronous.  This is
+    # intentionally opt-in because discovering the active rows introduces one
+    # device -> host synchronization per MoE layer.
+    prefill_sparse: bool = False
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
@@ -262,6 +277,12 @@ class OffloadMoeCache:
         self._prefill_buffer_layer: list[int | None] = [None, None]
         self._prefill_buffer_released: list[bool] = [True, True]
         self._prefill_buffer_has_release_event: list[bool] = [False, False]
+        # Split-residency prefill: fixed-size pinned CPU bounce slabs plus one
+        # completion event per slab.  They are allocated only when a CUDA cache
+        # has at least one LOCKED/PAGEABLE layer.
+        self.prefill_bounce_staging: torch.Tensor | None = None
+        self.prefill_bounce_events: list[torch.cuda.Event] = []
+        self._prefill_bounce_used: list[bool] = [False] * PREFILL_BOUNCE_BUFFERS
         # hit-D2D split state: pinned begin-of-chunk snapshot of slot_for_id (the
         # classification input; frozen for the chunk -- no decode runs inside one,
         # and buffer invalidation only clears slot < 2E entries, which classify as
@@ -274,6 +295,11 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.prefill_sparse_rows = 0
+        self.prefill_sparse_total_rows = 0
+        self.prefill_sparse_bytes = 0
+        self.prefill_sparse_full_bytes = 0
+        self._prefill_active_mask_host: torch.Tensor | None = None
 
     def set_bank_sources(
         self,
@@ -291,7 +317,10 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be
+        routed to the CPU executor for decode (``cpu_layer_ids``, set BEFORE this call).
+        The copy plan skips their rows; prefill serves them through the fixed-size pinned
+        bounce slabs initialized by :meth:`_init_prefill_overlap_buffers`.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -310,11 +339,6 @@ class OffloadMoeCache:
                     f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
                     f"cpu_layer_ids: a layer without a device address can only decode on "
                     f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
-                )
-            if self.prefill_overlap:
-                raise ValueError(
-                    "prefill overlap DMAs from registered banks; it must be disabled "
-                    "when any layer is LOCKED/PAGEABLE (the engine does this)"
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
@@ -405,13 +429,19 @@ class OffloadMoeCache:
     def validate_rebuild(self, cache_size: int) -> None:
         """Pure geometry validation of a rebuild target (no GPU side effects).
 
-        Raises ``ValueError`` if ``cache_size`` is below the ``num_experts`` floor or
-        above the marlin slot cap. Called by :meth:`rebuild` and by the engine's
-        pre-teardown check, so an invalid target rejects with the old cache intact
-        (no destructive free first).
+        Raises ``ValueError`` if ``cache_size`` is below the ``num_experts`` floor,
+        cannot retain sparse prefill's two full raw-id buffers, or is above the
+        marlin slot cap. Called by :meth:`rebuild` and by the engine's pre-teardown
+        check, so an invalid target rejects with the old cache intact (no
+        destructive free first).
         """
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
+        if self.prefill_sparse and cache_size < 2 * self.num_experts:
+            raise ValueError(
+                "route-aware sparse MoE prefill requires cache_size >= "
+                f"2*num_experts ({2 * self.num_experts}), got {cache_size}"
+            )
         if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "
@@ -436,6 +466,10 @@ class OffloadMoeCache:
         self.prefill_begin_event = None
         self.prefill_ready_events = []
         self.prefill_release_events = []
+        self.prefill_bounce_staging = None
+        self.prefill_bounce_events = []
+        self._prefill_bounce_used = [False] * PREFILL_BOUNCE_BUFFERS
+        self._prefill_active_mask_host = None
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
@@ -479,6 +513,10 @@ class OffloadMoeCache:
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.prefill_sparse_rows = 0
+        self.prefill_sparse_total_rows = 0
+        self.prefill_sparse_bytes = 0
+        self.prefill_sparse_full_bytes = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
@@ -530,6 +568,11 @@ class OffloadMoeCache:
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
         return layer_id in self._unpinned_layers
 
+    @property
+    def has_unpinned_layers(self) -> bool:
+        """Whether split-residency prefill needs the pinned bounce path."""
+        return bool(self._unpinned_layers)
+
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
         keeps no GPU-resident alphas (bf16 / triton-nvfp4). Slots of other layers
@@ -576,6 +619,24 @@ class OffloadMoeCache:
             self.prefill_ready_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_release_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_begin_event = torch.cuda.Event()
+            if self._unpinned_layers:
+                from freetoken.kernel.pinned import alloc_pinned_tensor
+
+                self.prefill_bounce_staging = alloc_pinned_tensor(
+                    PREFILL_BOUNCE_BUFFERS,
+                    PREFILL_BOUNCE_CHUNK_BYTES,
+                    dtype=torch.uint8,
+                )
+                self.prefill_bounce_events = [
+                    torch.cuda.Event() for _ in range(PREFILL_BOUNCE_BUFFERS)
+                ]
+                self._prefill_bounce_used = [False] * PREFILL_BOUNCE_BUFFERS
+            if self.prefill_sparse:
+                from freetoken.kernel.pinned import alloc_pinned_tensor
+
+                self._prefill_active_mask_host = alloc_pinned_tensor(
+                    self.num_experts, dtype=torch.int32
+                )
         if self.prefill_hit_d2d and self.device.type == "cuda":
             self._prefill_slot_snapshot = torch.empty(
                 (self.num_layers, self.num_experts), dtype=torch.int32, pin_memory=True
@@ -613,7 +674,11 @@ class OffloadMoeCache:
             # fence the first prefetch would stomp bytes a running GEMM is reading.
             self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
             self.prefill_copy_stream.wait_event(self.prefill_begin_event)
-        self._prefill_hit_d2d_active = self.prefill_hit_d2d and self._hit_d2d_usable()
+        self._prefill_hit_d2d_active = (
+            not self.prefill_sparse
+            and self.prefill_hit_d2d
+            and self._hit_d2d_usable()
+        )
         if self._prefill_hit_d2d_active:
             # The copy stream is fenced behind the previous decode, so the snapshot
             # observes its final slot map; one host sync per chunk, then per-layer
@@ -622,7 +687,11 @@ class OffloadMoeCache:
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
             self.prefill_copy_stream.synchronize()
 
-    def prefetch_prefill_layer(self, layer_id: int) -> None:
+    def prefetch_prefill_layer(
+        self,
+        layer_id: int,
+        expert_ids: torch.Tensor | None = None,
+    ) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
             return
         if layer_id < 0:
@@ -643,8 +712,17 @@ class OffloadMoeCache:
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
-        if self._prefill_hit_d2d_active:
+        if self.prefill_sparse:
+            if expert_ids is None:
+                raise RuntimeError(
+                    "route-aware MoE prefill requires current-layer expert ids"
+                )
+            active = self._prefill_active_experts(expert_ids)
+            self._prefetch_sparse(layer_id, buffer_id, active)
+        elif self._prefill_hit_d2d_active and layer_id not in self._unpinned_layers:
             self._prefetch_split(layer_id, buffer_id)
+        elif layer_id in self._unpinned_layers and self.prefill_copy_stream is not None:
+            self._prefetch_unpinned(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
             copy()
         else:
@@ -656,6 +734,234 @@ class OffloadMoeCache:
 
         self._prefill_buffer_layer[buffer_id] = layer_id
         self._prefill_buffer_released[buffer_id] = False
+
+    def _prefill_active_experts(self, expert_ids: torch.Tensor) -> list[int]:
+        """Return sorted raw expert ids selected by this prefill layer.
+
+        The grouped GEMM keeps its original ``num_experts`` and raw routing ids;
+        this host list controls movement only.  A 512-entry mask bounds the D2H
+        traffic independently of ``tokens * top_k``. Unlike hybrid decode,
+        prefill has no CPU overflow path: an invalid id would leave an unwritten
+        grouped-GEMM row or address past the expert bank, so fail closed instead
+        of silently excluding it from the movement mask.
+        """
+        if expert_ids.numel() == 0:
+            return []
+        flat = expert_ids.reshape(-1).long()
+        valid = (flat >= 0) & (flat < self.num_experts)
+        indices = flat.clamp(0, self.num_experts - 1)
+        if self.device.type == "cuda":
+            assert expert_ids.is_cuda
+            assert self._prefill_active_mask_host is not None
+            invalid_count_device = (~valid).sum(dtype=torch.int32)
+            self.active_mask.zero_()
+            self.active_mask.scatter_add_(0, indices, valid.to(torch.int32))
+            self._prefill_active_mask_host.copy_(self.active_mask, non_blocking=True)
+            torch.cuda.current_stream(self.device).synchronize()
+            invalid_count = int(invalid_count_device.item())
+            mask = self._prefill_active_mask_host
+        else:
+            invalid_count = int((~valid).sum().item())
+            mask = torch.zeros(self.num_experts, dtype=torch.int32)
+            mask.scatter_add_(
+                0,
+                indices.detach().cpu(),
+                valid.to(torch.int32).detach().cpu(),
+            )
+        if invalid_count:
+            raise RuntimeError(
+                "route-aware MoE prefill requires every expert id to be in "
+                f"[0, {self.num_experts}); found {invalid_count} invalid route(s)"
+            )
+        return mask.nonzero(as_tuple=False).reshape(-1).tolist()
+
+    @staticmethod
+    def _coalesced_expert_runs(active: list[int]) -> list[tuple[int, int]]:
+        """Turn sorted expert ids into ``(start, length)`` contiguous runs."""
+        if not active:
+            return []
+        runs: list[tuple[int, int]] = []
+        start = previous = active[0]
+        for expert_id in active[1:]:
+            if expert_id != previous + 1:
+                runs.append((start, previous - start + 1))
+                start = expert_id
+            previous = expert_id
+        runs.append((start, previous - start + 1))
+        return runs
+
+    def _prefetch_sparse(
+        self,
+        layer_id: int,
+        buffer_id: int,
+        active: list[int],
+    ) -> None:
+        """Copy only routed expert rows while preserving raw-id buffer positions."""
+        runs = self._coalesced_expert_runs(active)
+        self.prefill_sparse_rows += len(active)
+        self.prefill_sparse_total_rows += self.num_experts
+        if self.prefill_copy_stream is None:
+            self._invalidate_prefill_buffer(buffer_id)
+            copied = full = 0
+            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                source = per_layer[layer_id]
+                target = buffer[buffer_id]
+                feat = source[0].numel() * source.element_size()
+                full += self.num_experts * feat
+                selected = [(0, self.num_experts)] if feat < _SMALL_BANK_FEAT_BYTES else runs
+                for start, length in selected:
+                    target[start : start + length].copy_(source[start : start + length])
+                    copied += length * feat
+            self.prefill_sparse_bytes += copied
+            self.prefill_sparse_full_bytes += full
+            return
+
+        if layer_id in self._unpinned_layers:
+            copied, full = self._prefetch_sparse_unpinned(
+                layer_id, buffer_id, runs
+            )
+        else:
+            copied, full = self._prefetch_sparse_pinned(
+                layer_id, buffer_id, runs
+            )
+        self.prefill_sparse_bytes += copied
+        self.prefill_sparse_full_bytes += full
+
+    def _prefetch_sparse_pinned(
+        self,
+        layer_id: int,
+        buffer_id: int,
+        runs: list[tuple[int, int]],
+    ) -> tuple[int, int]:
+        """Direct-DMA selected registered rows with one batched runtime call."""
+        assert self.prefill_copy_stream is not None
+        batch = False
+        if self._copy_fused_ok and self._resolve_batch_memcpy():
+            batch = self._batch_memcpy
+        copied = full = 0
+        with torch.cuda.stream(self.prefill_copy_stream):
+            if self._prefill_buffer_has_release_event[buffer_id]:
+                self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+            self._invalidate_prefill_buffer(buffer_id)
+            dst_ptrs: list[int] = []
+            src_ptrs: list[int] = []
+            sizes: list[int] = []
+            for bank_id, ((per_layer, _), buffer) in enumerate(
+                zip(self.banks, self.prefill_bank_buffers)
+            ):
+                source = per_layer[layer_id]
+                feat = self._copy_feat_bytes_host[bank_id] if self._copy_fused_ok else (
+                    source[0].numel() * source.element_size()
+                )
+                full += self.num_experts * feat
+                selected = [(0, self.num_experts)] if feat < _SMALL_BANK_FEAT_BYTES else runs
+                copied += sum(length * feat for _, length in selected)
+                if batch:
+                    dst_base = self._copy_dst_ptrs_host[bank_id] + buffer_id * self.num_experts * feat
+                    src_base = self._copy_src_ptrs_host[layer_id][bank_id]
+                    for start, length in selected:
+                        dst_ptrs.append(dst_base + start * feat)
+                        src_ptrs.append(src_base + start * feat)
+                        sizes.append(length * feat)
+                else:
+                    target = buffer[buffer_id]
+                    for start, length in selected:
+                        target[start : start + length].copy_(
+                            source[start : start + length], non_blocking=True
+                        )
+            if batch and sizes:
+                batch(
+                    torch.tensor(dst_ptrs, dtype=torch.int64),
+                    torch.tensor(src_ptrs, dtype=torch.int64),
+                    torch.tensor(sizes, dtype=torch.int64),
+                    torch.cuda.current_stream(self.device).cuda_stream,
+                )
+            self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+        return copied, full
+
+    def _prefetch_sparse_unpinned(
+        self,
+        layer_id: int,
+        buffer_id: int,
+        runs: list[tuple[int, int]],
+    ) -> tuple[int, int]:
+        """Bounce selected LOCKED/PAGEABLE rows through the two pinned slabs."""
+        assert self.prefill_copy_stream is not None
+        assert self.prefill_bounce_staging is not None
+        chunk_index = 0
+        copied = full = 0
+        with torch.cuda.stream(self.prefill_copy_stream):
+            if self._prefill_buffer_has_release_event[buffer_id]:
+                self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+            self._invalidate_prefill_buffer(buffer_id)
+            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                source_rows = per_layer[layer_id].view(torch.uint8).reshape(
+                    self.num_experts, -1
+                )
+                target_rows = buffer[buffer_id].view(torch.uint8).reshape(
+                    self.num_experts, -1
+                )
+                feat = source_rows.shape[1]
+                full += self.num_experts * feat
+                selected = [(0, self.num_experts)] if feat < _SMALL_BANK_FEAT_BYTES else runs
+                copied += sum(length * feat for _, length in selected)
+                for start, length in selected:
+                    source = source_rows[start : start + length].reshape(-1)
+                    target = target_rows[start : start + length].reshape(-1)
+                    for offset in range(0, source.numel(), PREFILL_BOUNCE_CHUNK_BYTES):
+                        count = min(PREFILL_BOUNCE_CHUNK_BYTES, source.numel() - offset)
+                        slab_id = chunk_index % PREFILL_BOUNCE_BUFFERS
+                        if self._prefill_bounce_used[slab_id]:
+                            self.prefill_bounce_events[slab_id].synchronize()
+                        slab = self.prefill_bounce_staging[slab_id, :count]
+                        slab.copy_(source[offset : offset + count])
+                        target[offset : offset + count].copy_(slab, non_blocking=True)
+                        self.prefill_bounce_events[slab_id].record(self.prefill_copy_stream)
+                        self._prefill_bounce_used[slab_id] = True
+                        chunk_index += 1
+            self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+        return copied, full
+
+    def _prefetch_unpinned(self, layer_id: int, buffer_id: int) -> None:
+        """Stage one LOCKED/PAGEABLE expert layer through two 32 MiB pinned slabs.
+
+        CPU -> pinned copies alternate between the slabs while the previous slab's
+        asynchronous H2D is in flight on ``prefill_copy_stream``.  The destination is
+        still the ordinary full-layer GPU prefill buffer, so routing ids remain raw
+        expert ids and every quantized bank/dtype follows the same byte-copy path.
+        """
+        assert layer_id in self._unpinned_layers
+        assert self.prefill_copy_stream is not None
+        assert self.prefill_bounce_staging is not None
+        assert len(self.prefill_bounce_events) == PREFILL_BOUNCE_BUFFERS
+
+        chunk_index = 0
+        with torch.cuda.stream(self.prefill_copy_stream):
+            if self._prefill_buffer_has_release_event[buffer_id]:
+                self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+            self._invalidate_prefill_buffer(buffer_id)
+            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                source = per_layer[layer_id].view(torch.uint8).reshape(-1)
+                target = buffer[buffer_id].view(torch.uint8).reshape(-1)
+                assert source.numel() == target.numel(), (
+                    layer_id,
+                    source.numel(),
+                    target.numel(),
+                )
+                for offset in range(0, source.numel(), PREFILL_BOUNCE_CHUNK_BYTES):
+                    count = min(PREFILL_BOUNCE_CHUNK_BYTES, source.numel() - offset)
+                    slab_id = chunk_index % PREFILL_BOUNCE_BUFFERS
+                    if self._prefill_bounce_used[slab_id]:
+                        # The event was recorded after this slab's preceding H2D.
+                        # Waiting here makes it safe for the CPU to overwrite the slab.
+                        self.prefill_bounce_events[slab_id].synchronize()
+                    slab = self.prefill_bounce_staging[slab_id, :count]
+                    slab.copy_(source[offset : offset + count])
+                    target[offset : offset + count].copy_(slab, non_blocking=True)
+                    self.prefill_bounce_events[slab_id].record(self.prefill_copy_stream)
+                    self._prefill_bounce_used[slab_id] = True
+                    chunk_index += 1
+            self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
     def _hit_d2d_usable(self) -> bool:
         """Whether the hit-D2D split can serve this prefill; logs the first fallback.
@@ -848,6 +1154,10 @@ class OffloadMoeCache:
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.prefill_sparse_rows = 0
+        self.prefill_sparse_total_rows = 0
+        self.prefill_sparse_bytes = 0
+        self.prefill_sparse_full_bytes = 0
         self.lru_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
@@ -857,6 +1167,22 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        self.decode_freq.zero_()
+
+    def prefill_sparse_stats(self) -> dict[str, int | float]:
+        """Host-only route-aware prefill counters for release telemetry."""
+        rows = self.prefill_sparse_rows
+        total_rows = self.prefill_sparse_total_rows
+        copied = self.prefill_sparse_bytes
+        full = self.prefill_sparse_full_bytes
+        return {
+            "active_rows": rows,
+            "possible_rows": total_rows,
+            "bytes_copied": copied,
+            "full_bytes": full,
+            "row_fraction": (rows / total_rows) if total_rows else 0.0,
+            "byte_fraction": (copied / full) if full else 0.0,
+        }
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -903,6 +1229,10 @@ class OffloadMoeCache:
             # rows prefetched into the double buffer since the last reset.
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
+            "prefill_sparse_rows": self.prefill_sparse_rows,
+            "prefill_sparse_total_rows": self.prefill_sparse_total_rows,
+            "prefill_sparse_bytes": self.prefill_sparse_bytes,
+            "prefill_sparse_full_bytes": self.prefill_sparse_full_bytes,
         }
 
     def decode_miss_stats_per_layer(self) -> dict:
