@@ -308,7 +308,8 @@ eight-token output cap.
 | Checkpoint quant recipe / executed expert path | W4A4 / W4A16 compatibility |
 | Cold-start time (3 runs) | approximately 66.0 s (log resolution), 107.272 s, 162.509 s |
 | Peak GPU memory | 31,567 MiB (30.827 GiB), sampled once per second |
-| Peak WSL RSS / swap | 71,192,992 kB (67.895 GiB) / 0 kB |
+| Peak WSL RSS / WSL swap | 71,192,992 kB (67.895 GiB) / 0 kB |
+| Windows pagefile | pre-existing `D:\pagefile.sys`, 131,072 MiB allocated; 814 MiB system-wide current usage after the run; configuration was not changed |
 | Final scheduler page faults | 19,100,768 minor / 1,673 major |
 | PCIe receive/transmit | peak 60,710 / 9,970 MB/s; 300-s sampled sums 4,184,741 / 573,790 MB |
 | Expert/cache geometry | CPU layers 0-7 and 41-47 (15, pageable); MoE cache 6,558 slots; resolver pages 8,273; allocated KV 8,192 tokens |
@@ -330,10 +331,13 @@ tokens after TTFT.
 | 8,176 / 7 | 7.225 / 7.238 s | 7.643 / 7.667 s | 1,130.83 tok/s | 14.24 tok/s |
 
 The final 100-request run left `VmHWM` unchanged and moved `VmRSS` by only
-about 0.5 MiB between its pre-run and midpoint/final snapshots.  The system
-had no configured swap.  Streaming and non-streaming returned the same
-deterministic text, `reasoning_effort=high` produced `reasoning_content`, and a
-required tool request produced `get_weather({"city": "Paris"})` with
+about 0.5 MiB between its pre-run and midpoint/final snapshots.  WSL had no
+configured swap.  The Windows host already had a 128 GiB pagefile; it was not
+created, resized or selected as a workaround for this run.  WMI reports only
+aggregate host usage, so the observed 814 MiB cannot prove zero host paging by
+the WSL VM.  Streaming and non-streaming returned the same deterministic text,
+`reasoning_effort=high` produced `reasoning_content`, and a required tool
+request produced `get_weather({"city": "Paris"})` with
 `finish_reason=tool_calls`.
 
 Use `ft ctl --json stats` for FreeToken's TTFT, throughput, request count and
@@ -389,3 +393,8 @@ The recorded run satisfies the first text-only hardware milestone, including
 the 8K and stability resource gates.  It remains experimental rather than a
 formal supported-model claim because W4A4 execution, graph-mode parity, MTP and
 multimodal serving are deliberately outside this result.
+
+The WSL `swap=0` condition is proven.  A stronger claim that no host pagefile
+existed or was touched is not proven because the pre-existing Windows pagefile
+had non-zero aggregate system usage; keep that caveat with any published
+benchmark result.
