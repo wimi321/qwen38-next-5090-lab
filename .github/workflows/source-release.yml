@@ -21,6 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - name: Require successful hosted CI for the evidence commit
@@ -45,6 +46,11 @@ jobs:
             echo "only vX.Y.Z-alpha.N tags are accepted" >&2
             exit 1
           }
+          # actions/checkout peels the event tag to GITHUB_SHA and can replace
+          # the local annotated-tag ref with a lightweight one. Restore the
+          # exact remote tag object before enforcing the annotated-tag gate.
+          git fetch --force --no-tags origin \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
           test "$(git cat-file -t "$RELEASE_TAG")" = tag || {
             echo "release tag must be annotated" >&2
             exit 1

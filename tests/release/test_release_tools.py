@@ -578,12 +578,96 @@ class ReleaseToolTests(unittest.TestCase):
 
     def test_release_workflow_binds_tag_version_runtime_and_source_only_assets(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "source-release.yml").read_text(encoding="utf-8")
+        self.assertIn("ref: ${{ github.ref }}", workflow)
+        restore_tag = (
+            'git fetch --force --no-tags origin \\\n'
+            '            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"'
+        )
+        self.assertIn(restore_tag, workflow)
+        self.assertLess(workflow.index(restore_tag), workflow.index('git cat-file -t "$RELEASE_TAG"'))
         self.assertIn('git rev-parse "${RELEASE_TAG}^{commit}"', workflow)
         self.assertIn("python/freetoken/version.py", workflow)
         self.assertIn('--tag-commit "$RELEASE_COMMIT"', workflow)
         self.assertNotIn("twine upload", workflow)
         self.assertNotIn("docker push", workflow)
         self.assertNotIn("bdist_wheel", workflow)
+
+    def test_release_tag_refetch_restores_annotated_object(self) -> None:
+        tag = "v0.2.0-alpha.1"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            origin = root / "origin.git"
+            producer = root / "producer"
+            runner = root / "runner"
+            subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+            subprocess.run(["git", "init", "-q", str(producer)], check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=producer, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=producer, check=True)
+            (producer / "tracked.txt").write_text("release\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=producer, check=True)
+            subprocess.run(["git", "commit", "-qm", "release"], cwd=producer, check=True)
+            subprocess.run(["git", "tag", "-a", tag, "-m", tag], cwd=producer, check=True)
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=producer, text=True
+            ).strip()
+            subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=producer, check=True)
+            subprocess.run(
+                ["git", "push", "-q", "origin", f"HEAD:refs/heads/main", f"refs/tags/{tag}"],
+                cwd=producer,
+                check=True,
+            )
+
+            subprocess.run(["git", "init", "-q", str(runner)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=runner, check=True)
+            subprocess.run(
+                ["git", "fetch", "-q", "origin", f"refs/tags/{tag}:refs/tags/{tag}"],
+                cwd=runner,
+                check=True,
+            )
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "cat-file", "-t", f"refs/tags/{tag}"], cwd=runner, text=True
+                ).strip(),
+                "tag",
+            )
+
+            subprocess.run(
+                ["git", "fetch", "-q", "--force", "origin", f"+{commit}:refs/tags/{tag}"],
+                cwd=runner,
+                check=True,
+            )
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "cat-file", "-t", f"refs/tags/{tag}"], cwd=runner, text=True
+                ).strip(),
+                "commit",
+            )
+
+            subprocess.run(
+                [
+                    "git",
+                    "fetch",
+                    "-q",
+                    "--force",
+                    "--no-tags",
+                    "origin",
+                    f"refs/tags/{tag}:refs/tags/{tag}",
+                ],
+                cwd=runner,
+                check=True,
+            )
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "cat-file", "-t", f"refs/tags/{tag}"], cwd=runner, text=True
+                ).strip(),
+                "tag",
+            )
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"], cwd=runner, text=True
+                ).strip(),
+                commit,
+            )
 
 
 if __name__ == "__main__":
