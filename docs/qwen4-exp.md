@@ -175,11 +175,11 @@ ft serve \
   --nvfp4-backend auto
 ```
 
-The `0.89` ratio is the validated RTX 5090 setting for this checkpoint.  A
-ratio of `0.90` reached 31,847 MiB after an 8,176-token prompt and missed the
-strict `<31 GiB` acceptance threshold; `0.89` kept the same request at 31,542
-MiB.  Do not round this value back to the CLI default in the reproducibility
-record.
+The `0.89` ratio is the validated RTX 5090 setting for this checkpoint. The
+Qwen4-Exp auto planner also deducts a model-scoped 512 MiB runtime guard before
+choosing expert-cache geometry. Do not round the ratio back to the CLI default
+or remove the guard; the authoritative peak is read from the release evidence,
+and must remain below the strict `<31 GiB` threshold.
 
 Do not force the original four-layer estimate. This checkpoint's expert banks
 occupy about 63.46 GiB, while a 112 GiB WSL instance receives a FreeToken pin
@@ -297,50 +297,26 @@ ft ctl --json stats
 
 ## Measurement record
 
-The following result was measured on 2026-08-27.  The runtime code was
-`a0c07783cdd45b9f4b31b4a938c2bff535f07137`; the later documentation-only
-commit does not change the measured tree.  Each prompt class used three
-warm-ups followed by ten measured SSE requests with greedy sampling and an
-eight-token output cap.
+Do not hand-maintain benchmark numbers in this document. The authoritative
+record is the newest reviewed `results/rtx5090-<date>/summary.json`; the English
+README table is generated from that file and CI rejects a stale table. Every
+tracked evidence directory contains exactly the environment, resolved config,
+summary, request log, latency CSV, resource CSV, pytest log, and exhaustive
+`SHA256SUMS` files.
 
-| Field | Record |
-|---|---|
-| Upstream base / checkpoint revision | `9ef3651` / `7b71922` (the evidence manifest records the downstream release commit) |
-| Driver / CUDA toolkit / torch / Triton | 591.86 / 13.3 / 2.11.0+cu130 / 3.6.0 |
-| Checkpoint quant recipe / executed expert path | W4A4 / W4A16 compatibility |
-| Cold-start time (3 runs) | approximately 66.0 s (log resolution), 107.272 s, 162.509 s |
-| Peak GPU memory | 31,567 MiB (30.827 GiB), sampled once per second |
-| Peak WSL RSS / WSL swap | 71,192,992 kB (67.895 GiB) / 0 kB |
-| Windows pagefile | pre-existing `D:\pagefile.sys`, 131,072 MiB allocated; 814 MiB system-wide current usage after the run; configuration was not changed |
-| Final scheduler page faults | 19,100,768 minor / 1,673 major |
-| PCIe receive/transmit | peak 60,710 / 9,970 MB/s; 300-s sampled sums 4,184,741 / 573,790 MB |
-| Expert/cache geometry | CPU layers 0-7 and 41-47 (15, pageable); MoE cache 6,558 slots; resolver pages 8,273; allocated KV 8,192 tokens |
-| Stability gate | 100/100 on runtime HEAD in 234.858 s; p50/p95/max 2.345/2.363/2.555 s; first/last-ten mean 2.369/2.344 s |
-| Test suite | `python -m pytest -m 'not slow'`: 1,454 passed, 9 skipped, 11 deselected in 95.99 s |
+The release harness re-hashes the complete checkpoint, runs the non-slow test
+suite, verifies the four rendered prompt boundaries and API semantics, executes
+an exact 256--512-token steady decode, completes 100 sequential requests, and
+then runs a separate 30-minute soak. Short seven-token prompt completions are
+never used to infer sustained decode throughput. TTFT is client-observed, and
+"effective prefill" includes request and CPU-staging overhead rather than being
+a pure kernel measurement.
 
-The one-token case below means one user-content token; the rendered chat prompt
-contains 13 tokens.  TTFT is client-observed time to the first non-empty SSE
-content delta.  "Effective prefill" is rendered prompt tokens divided by that
-end-to-end TTFT, so it includes fixed request and CPU-staging overhead and is
-not a pure kernel benchmark.  Decode throughput uses the remaining six output
-tokens after TTFT.
-
-| Rendered prompt / completion tokens | TTFT p50 / p95 | Total p50 / p95 | Effective prefill p50 | Decode p50 |
-|---|---:|---:|---:|---:|
-| 13 / 7 | 2.238 / 2.245 s | 2.653 / 2.673 s | 5.80 tok/s | 14.31 tok/s |
-| 128 / 7 | 2.295 / 2.309 s | 2.712 / 2.725 s | 55.76 tok/s | 14.34 tok/s |
-| 2,048 / 7 | 3.411 / 3.419 s | 3.831 / 3.851 s | 600.29 tok/s | 14.26 tok/s |
-| 8,176 / 7 | 7.225 / 7.238 s | 7.643 / 7.667 s | 1,130.83 tok/s | 14.24 tok/s |
-
-The final 100-request run left `VmHWM` unchanged and moved `VmRSS` by only
-about 0.5 MiB between its pre-run and midpoint/final snapshots.  WSL had no
-configured swap.  The Windows host already had a 128 GiB pagefile; it was not
-created, resized or selected as a workaround for this run.  WMI reports only
-aggregate host usage, so the observed 814 MiB cannot prove zero host paging by
-the WSL VM.  Streaming and non-streaming returned the same deterministic text,
-`reasoning_effort=high` produced `reasoning_content`, and a required tool
-request produced `get_weather({"city": "Paris"})` with
-`finish_reason=tool_calls`.
+WSL must have no configured swap. A pre-existing Windows pagefile is recorded
+but never modified, and zero host paging is not claimed. Portable
+`nvidia-smi` sampling does not expose reliable PCIe RX/TX counters, so the
+evidence marks them unavailable rather than inventing a value. Evidence remains
+non-releasable while `source.release_compatible` is false.
 
 Use `ft ctl --json stats` for FreeToken's TTFT, throughput, request count and
 VRAM fields. Cross-check process RSS/page faults through `/proc/<pid>/status`

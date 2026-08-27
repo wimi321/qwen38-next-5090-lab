@@ -669,7 +669,7 @@ class ResourceSampler:
             "pcie_rx_mib_s", "pcie_tx_mib_s",
         ]
         with self.target.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
             writer.writeheader()
             writer.writerows(self.samples)
 
@@ -798,7 +798,18 @@ class Recorder:
         self.origin = origin
         self.requests = (directory / "requests.jsonl").open("w", encoding="utf-8")
         self.latency_handle = (directory / "latency.csv").open("w", newline="", encoding="utf-8")
-        self.latency = csv.DictWriter(self.latency_handle, fieldnames=["case", "iteration", "prompt_tokens", "completion_tokens", "ttft_ms", "total_ms"])
+        self.latency = csv.DictWriter(
+            self.latency_handle,
+            fieldnames=[
+                "case",
+                "iteration",
+                "prompt_tokens",
+                "completion_tokens",
+                "ttft_ms",
+                "total_ms",
+            ],
+            lineterminator="\n",
+        )
         self.latency.writeheader()
 
     def record(

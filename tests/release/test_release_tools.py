@@ -99,6 +99,28 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(item["started_elapsed_s"], persisted["started_elapsed_s"])
             self.assertEqual(item["finished_elapsed_s"], persisted["finished_elapsed_s"])
             self.assertEqual(item["total_ms"], persisted["total_ms"])
+            self.assertNotIn(b"\r\n", (directory / "latency.csv").read_bytes())
+
+            sampler = rtx5090_harness.ResourceSampler.__new__(
+                rtx5090_harness.ResourceSampler
+            )
+            sampler.target = directory / "resource-samples.csv"
+            sampler.samples = [{
+                "elapsed_s": 1.0,
+                "gpu_memory_mib": 1.0,
+                "wsl_rss_kib": 1,
+                "wsl_rss_source": "test",
+                "wsl_swap_kib": 0,
+                "minor_faults": 1,
+                "major_faults": 0,
+                "fault_processes": 1,
+                "pcie_rx_mib_s": None,
+                "pcie_tx_mib_s": None,
+            }]
+            sampler._write()
+            self.assertNotIn(
+                b"\r\n", (directory / "resource-samples.csv").read_bytes()
+            )
 
     def test_server_profile_rejects_manual_cpu_layer_override(self) -> None:
         model_dir = ROOT / "model"
