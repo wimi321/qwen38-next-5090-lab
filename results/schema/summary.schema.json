@@ -11,11 +11,63 @@
     "measured_at": {"type": "string", "format": "date-time"},
     "source": {"type": "object"},
     "model": {"type": "object"},
-    "execution": {"type": "object"},
+    "execution": {
+      "type": "object",
+      "required": ["attention_backend", "cache_type", "context_tokens", "cuda_graph", "quantization", "text_only", "tp_size"],
+      "properties": {
+        "profile": {"const": "rtx5090-wsl2-256k-image"},
+        "attention_backend": {"enum": ["qsa_triton", "qsa_triton_sm120"]},
+        "cache_type": {"const": "naive"},
+        "context_tokens": {"enum": [8192, 262144]},
+        "cuda_graph": {"const": false},
+        "quantization": {"const": "W4A16 compatibility"},
+        "text_only": {"type": "boolean"},
+        "image_input": {"type": "boolean"},
+        "tp_size": {"const": 1}
+      }
+    },
     "gates": {"type": "object"},
     "resources": {"type": "object"},
     "benchmarks": {"type": "object"},
+    "telemetry": {
+      "type": "object",
+      "required": ["selector", "ple", "vision", "prefill_chunks", "moe_prefill"],
+      "properties": {
+        "selector": {"type": "object", "required": ["workspace_peak_bytes", "native_calls", "fallback_calls", "errors"]},
+        "ple": {"type": "object", "required": ["cold_runs", "warm_runs", "bytes_read", "cache_hits", "cache_misses", "wait_ms", "page_faults"]},
+        "vision": {"type": "object", "required": ["image_tokens", "latency_ms"]},
+        "prefill_chunks": {"type": "object", "required": ["count", "total_ms"]},
+        "moe_prefill": {"$ref": "#/$defs/moePrefillGroup"}
+      }
+    },
     "caveats": {"type": "array", "items": {"type": "string"}}
-  }
+  },
+  "$defs": {
+    "moePrefillGroup": {
+      "type": "object",
+      "required": ["active_rows", "possible_rows", "bytes_copied", "full_bytes", "row_fraction", "byte_fraction"],
+      "properties": {
+        "active_rows": {"type": "integer", "minimum": 0},
+        "possible_rows": {"type": "integer", "minimum": 0},
+        "bytes_copied": {"type": "integer", "minimum": 0},
+        "full_bytes": {"type": "integer", "minimum": 0},
+        "row_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "byte_fraction": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [{
+    "if": {"properties": {"execution": {"properties": {"profile": {"const": "rtx5090-wsl2-256k-image"}}, "required": ["profile"]}}},
+    "then": {
+      "required": ["telemetry"],
+      "properties": {"execution": {
+        "required": ["profile", "image_input"],
+        "properties": {
+          "attention_backend": {"const": "qsa_triton_sm120"},
+          "context_tokens": {"const": 262144}, "text_only": {"const": false}, "image_input": {"const": true}
+        }
+      }}
+    }
+  }]
 }
-

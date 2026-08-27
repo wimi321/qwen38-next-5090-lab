@@ -32,6 +32,8 @@ marks are used only to identify the origin of this derivative work.
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | FreeToken's GGUF Q4_0 and CPU/CUDA MoE files identify llama.cpp/ggml kernel and layout sources inline. | MIT; [`licenses/llama.cpp-LICENSE`](licenses/llama.cpp-LICENSE) |
 | [NVIDIA NCCL](https://github.com/NVIDIA/nccl) | `python/freetoken/kernel/csrc/include/freetoken/nccl227.h` vendors the NCCL 2.27.1 public header and retains NVIDIA's copyright notice. | Combined Apache-2.0/BSD terms; [`licenses/NCCL-LICENSE.txt`](licenses/NCCL-LICENSE.txt) |
 | [SGLang](https://github.com/sgl-project/sglang) | Multiple inherited FreeToken kernels and serving paths identify specific SGLang implementations in their module headers or comments. | See the upstream project license and retained inline notices. |
+| [`yhfgyyf/sglang-qwen38-flash-next-sm120`](https://github.com/yhfgyyf/sglang-qwen38-flash-next-sm120) | The downstream `python/freetoken/kernel/csrc/jit/qsa_fast_topk.cuh` is an adaptation of `python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh` at exact commit `30edf3503961a471b25150aa890f8166031b5738`. The wrapper was converted to FreeToken's tvm-ffi utilities, limited to QSA top-512, and hardened for wide threshold bins. The source file retains this provenance inline. | Apache-2.0; the complete Apache text is in [`LICENSE`](LICENSE), and the downstream modification notice remains in the adapted file. |
+| [Hugging Face Transformers](https://github.com/huggingface/transformers) | The v0.2 candidate pins Transformers `5.16.1` for `AutoProcessor`/`Qwen3VLProcessor`. The downstream Qwen4-Exp image-tower tensor layout and parameter names are adapted from that version's `Qwen4ExpVisionModel`, with Qwen and Hugging Face copyright text retained in the file header. | Apache-2.0; the complete text is in [`LICENSE`](LICENSE), and retained source-level notices apply. |
 | [vLLM](https://github.com/vllm-project/vllm) | Inherited NVFP4 Marlin, parser/API, sampling, and sparse-attention modules identify their vLLM sources inline. | Apache-2.0; the repository-wide Apache text is in [`LICENSE`](LICENSE); retained upstream copyright notices still apply. |
 | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | The inherited NVFP4 b12x backend identifies FlashInfer as its source and is also loaded as an optional dependency. | Apache-2.0; see the upstream project and package metadata. |
 | [LightLLM](https://github.com/ModelTC/lightllm) | Inherited rotary and function-call parsing modules identify the specific LightLLM files they adapt. | See the upstream project license and retained inline notices. |
@@ -48,13 +50,28 @@ The upstream FreeToken README states that FreeToken was deeply inspired by
 SGLang, vLLM, FlashInfer, flash-linear-attention, LightLLM, and llama.cpp.
 Listing a project here does not imply its authors endorse this downstream.
 
+The v0.2 design review additionally used these public SGLang changes as
+engineering references:
+
+- [Qwen3.8 integration PR #36497](https://github.com/sgl-project/sglang/pull/36497)
+- [PLE NVMe PR #36567](https://github.com/sgl-project/sglang/pull/36567)
+- [SM120 QSA PR #36556](https://github.com/sgl-project/sglang/pull/36556)
+
+They are cited to make influence auditable, not to claim code identity,
+endorsement, or performance parity. This project does not import their 96 GB
+GPU configuration, MTP/CUDA Graph settings, or benchmark numbers. The only
+direct v0.2 kernel adaptation identified by this audit is the exact-file,
+exact-commit top-512 entry in the table above; its retained inline notice is
+authoritative.
+
 ## Runtime dependencies
 
 Python/CUDA dependencies installed from package indexes remain under their own
 licenses. They are not copied into this source repository merely because they
-appear in `pyproject.toml`. Release preparation generates an SBOM from the
-resolved environment; consult that release artifact for the exact dependency
-versions and license metadata used in a particular build.
+appear in `pyproject.toml`. Release preparation generates a source-tree SBOM
+covering tracked files and vendored source. Exact runtime dependency versions
+are recorded separately by `uv.lock` and the evidence environment snapshot;
+consult upstream package metadata for their licenses.
 
 For the supported Linux x86_64 profile, uv resolves `sglang-kernel` from the
 official SGLang wheel repository's v0.4.5 GitHub release asset and verifies the

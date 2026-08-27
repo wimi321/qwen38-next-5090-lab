@@ -4,9 +4,48 @@
 > reproducibility entry point is `q38lab`; run `q38lab --help` and see
 > [qwen4-exp.md](qwen4-exp.md) for its fixed RTX 5090 profile.
 
-`q38lab bench --out results/rtx5090-YYYY-MM-DD` invokes the same authoritative
-full-hash, test, API, stability, 30-minute soak, and resource-evidence harness
-used by source releases. It is intentionally not a short benchmark mode.
+## q38lab
+
+| Command | Purpose |
+|---|---|
+| `q38lab doctor [--json] [--profile NAME]` | Check WSL/ext4, RTX 5090/SM120, CUDA/Torch/Triton, RAM/disk/swap, checkpoint, port, and profile-specific budgets |
+| `q38lab download --accept-qwen-license [--full-verify]` | Download only the pinned checkpoint revision and optionally hash all 135 GB |
+| `q38lab serve --profile rtx5090-wsl2` | Start the hardware-validated v0.1 text-only 8K profile |
+| `q38lab serve --profile rtx5090-wsl2-256k-image` | Start the unreleased 262,144-total-token/image candidate; native direct I/O is mandatory |
+| `q38lab smoke [--images] [--https-image-url URL]` | Exercise health/models, streaming, thinking, tools and optional bounded image/security cases |
+| `q38lab bench --profile NAME --out DIR` | Run the profile-bound full-hash, API, stability, soak, telemetry, and evidence harness |
+
+The 256K/image profile is present for validation; it is not in the supported
+matrix until its full RTX 5090 release gates pass. Its bench invocation also
+requires `--image-file PATH` and `--https-image-url URL`, and permits
+`--decode-tokens` from 256 through 1,024. The v0.1 profile retains a 512-token
+decode-measurement ceiling. The candidate profile also enables the internal
+`FREETOKEN_MOE_PREFILL_SPARSE=1` contract: native-NVFP4 large-bank rows are
+selected by raw expert ID, small banks remain whole-layer copies, and the full
+`[E]` GPU double buffers remain allocated. `ft ctl --json stats` exposes the
+resulting active/possible-row and copied/full-byte counters under
+`q38lab.moe_prefill`; their presence is not a performance or support claim.
+
+Configuration precedence is CLI flag, then `Q38LAB_*` environment variable,
+then profile default. Unauthenticated serving binds to `127.0.0.1`; a
+non-loopback bind is rejected unless the explicit unsafe acknowledgement is
+provided, which does not add authentication or TLS.
+
+`Q38LAB_DOH_FALLBACK=1` is a separate, default-off compatibility opt-in for
+transparent fake-IP DNS environments. It is not a general resolver override or
+an SSRF allowlist bypass. If every system answer for a hostname is non-global,
+the media loader may query `cloudflare-dns.com` through fixed Cloudflare public
+IPs `1.1.1.1` and `1.0.0.1` with normal TLS SNI/certificate verification;
+every returned target answer must still be global. Mixed public/non-public
+answers and numeric literals are rejected without fallback. Use the same
+setting for `doctor`, `serve`, and `bench`. `doctor --json` and evidence record
+both the opt-in and the fact that a libc `getaddrinfo` already in progress has
+only deadline-bounded, four-slot soft cancellation, not a portable hard cancel.
+
+`q38lab bench` is intentionally not a short benchmark mode. It consumes the
+clean-checkout launch attestation and refuses release-compatible output when a
+required full-hash, test, API, stability, 30-minute soak, resource, image, or
+telemetry gate is absent.
 
 ```
 ft <command> [args]
@@ -180,4 +219,3 @@ profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then 
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
-

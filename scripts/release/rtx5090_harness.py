@@ -10,9 +10,11 @@ in memory and never written to the bundle.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import ipaddress
+import io
 import json
 import os
 import platform
@@ -38,9 +40,12 @@ sys.path.insert(0, str(ROOT / "python"))
 from evidence import (  # noqa: E402
     COMMIT_RE,
     SCHEMA_VERSION,
+    V02_PLE_CHECKPOINT_PROBE_FILE,
     EvidenceError,
     detect_monotonic_rss_leak,
     runtime_tree_sha256,
+    validate_moe_prefill_telemetry,
+    validate_ple_checkpoint_probe,
     validate_directory,
     write_checksums,
     write_json,
@@ -57,12 +62,25 @@ from q38lab.constants import (  # noqa: E402
     MODEL_REPO as MODEL_REPOSITORY,
     MODEL_REVISION,
     RTX5090_WSL2_PROFILE,
+    RTX5090_WSL2_256K_IMAGE_PROFILE,
+    SERVE_PROFILES,
     SERVED_MODEL_NAME as SERVED_MODEL,
 )
 
 
 UPSTREAM_BASE = "9ef3651309fe4058672f2cc92069238dea06be1b"
 PROMPT_TARGETS = (13, 128, 2048, 8176)
+PROMPT_TARGETS_256K = (8176, 32768, 131072, 261120)
+NIAH_CASES = {
+    8176: (0.10, "Q38-8176-A"),
+    32768: (0.35, "Q38-32768-B"),
+    131072: (0.65, "Q38-131072-C"),
+    261120: (0.90, "Q38-261120-D"),
+}
+
+
+def selected_profile(args: argparse.Namespace):
+    return SERVE_PROFILES[args.profile]
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -112,6 +130,29 @@ def post_json(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, d
         raise EvidenceError(f"HTTP {exc.code} from {url}: {detail}") from exc
 
 
+def post_json_response(
+    url: str, payload: dict[str, Any], timeout: float
+) -> tuple[int, dict[str, Any], float]:
+    """POST JSON while preserving expected OpenAI error responses for negative gates."""
+
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    started = time.perf_counter()
+    try:
+        with LOCAL_OPENER.open(request, timeout=timeout) as response:
+            value = json.load(response)
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            value = json.loads(exc.read().decode("utf-8", "replace"))
+        except json.JSONDecodeError as parse_exc:
+            raise EvidenceError(f"HTTP {status} did not return an OpenAI JSON error") from parse_exc
+    if not isinstance(value, dict):
+        raise EvidenceError(f"POST {url} did not return a JSON object")
+    return status, value, (time.perf_counter() - started) * 1000
+
+
 def get_json(url: str, timeout: float = 30) -> dict[str, Any]:
     try:
         with LOCAL_OPENER.open(url, timeout=timeout) as response:
@@ -135,6 +176,15 @@ class StreamResult:
     finish_reason: str
     ttft_ms: float
     total_ms: float
+
+
+@dataclass(frozen=True)
+class ImagePromptAccounting:
+    """Processor-derived accounting for one fully rendered image prompt."""
+
+    total_tokens: int
+    text_tokens: int
+    image_tokens: int
 
 
 def post_sse(url: str, payload: dict[str, Any], timeout: float) -> StreamResult:
@@ -329,6 +379,231 @@ def exact_prompt(tokenizer: Any, target: int) -> str:
     raise EvidenceError(f"could not construct an exact {target}-token rendered Qwen chat prompt")
 
 
+def exact_needle_prompt(
+    tokenizer: Any,
+    target: int,
+    *,
+    depth: float,
+    code: str,
+) -> str:
+    """Build an exact rendered-length prompt with one needle at a fixed depth."""
+
+    if not 0 < depth < 1:
+        raise EvidenceError("needle depth must be strictly between zero and one")
+    prefix = (
+        "A secret code appears exactly once in the filler below. Remember it. "
+        "After reading everything, reply with only that secret code.\n"
+    )
+    needle = f"\nSECRET CODE: {code}\n"
+    suffix = "\nEnd of filler. What was the secret code? Reply with the code only."
+    baseline = rendered_length(tokenizer, prefix + needle + suffix)
+    if target < baseline:
+        raise EvidenceError(f"rendered target {target} is below the NIAH minimum {baseline}")
+    estimate = target - baseline
+    for total_filler in range(max(0, estimate - 12), estimate + 13):
+        before = round(total_filler * depth)
+        after = total_filler - before
+        candidate = prefix + " x" * before + needle + " x" * after + suffix
+        if rendered_length(tokenizer, candidate) == target:
+            return candidate
+    raise EvidenceError(
+        f"could not construct an exact {target}-token NIAH prompt at depth {depth}"
+    )
+
+
+def _canonical_answer(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", value.upper())
+
+
+def synthetic_vision_fixture(kind: str) -> tuple[str, str]:
+    """Return a deterministic real PNG data URL and its SHA-256 digest."""
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise EvidenceError("Pillow is required for deterministic vision fixtures") from exc
+
+    image = Image.new("RGB", (1024, 512) if kind == "ocr" else (768, 512), "white")
+    draw = ImageDraw.Draw(image)
+    if kind == "ocr":
+        try:
+            # Ubuntu 24.04 provides this true-type face.  A real font avoids the
+            # ambiguous Q/0 and 3/8 glyphs produced by scaling Pillow's bitmap
+            # fallback, while keeping the fixture deterministic and local.
+            large = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 112)
+            medium = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 52)
+        except OSError as exc:
+            raise EvidenceError(
+                "the deterministic OCR gate requires DejaVuSansMono-Bold.ttf"
+            ) from exc
+    else:
+        try:
+            large = ImageFont.load_default(size=72)
+            medium = ImageFont.load_default(size=44)
+        except TypeError:  # pragma: no cover - pinned Pillow supports scalable default font
+            large = medium = ImageFont.load_default()
+    if kind == "ocr":
+        draw.rectangle((35, 50, 989, 462), outline="black", width=8)
+        for text, y, font in (
+            ("ACCESS CODE", 90, medium),
+            ("382741", 235, large),
+        ):
+            left, _top, right, _bottom = draw.textbbox((0, 0), text, font=font)
+            draw.text(((image.width - (right - left)) // 2, y), text, fill="black", font=font)
+    elif kind == "object":
+        draw.rectangle((184, 64, 584, 464), fill=(225, 30, 35), outline="black", width=8)
+    elif kind == "chart":
+        draw.line((90, 430, 700, 430), fill="black", width=6)
+        draw.line((90, 60, 90, 430), fill="black", width=6)
+        bars = (("A", 170, 180), ("B", 350, 330), ("C", 530, 240))
+        for label, x, height in bars:
+            draw.rectangle((x, 430 - height, x + 100, 430), fill=(45, 105, 190))
+            draw.text((x + 25, 445), label, fill="black", font=medium)
+    else:
+        raise EvidenceError(f"unknown synthetic vision fixture: {kind}")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=False)
+    payload = buffer.getvalue()
+    digest = hashlib.sha256(payload).hexdigest()
+    return f"data:image/png;base64,{base64.b64encode(payload).decode('ascii')}", digest
+
+
+def image_data_url(path: Path) -> str:
+    data = path.read_bytes()
+    if not data:
+        raise EvidenceError("--image-file must not be empty")
+    if len(data) > 20 * 1024**2:
+        raise EvidenceError("--image-file exceeds the 20MiB single-image limit")
+    suffix = path.suffix.lower()
+    mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
+    if mime is None:
+        raise EvidenceError("--image-file must be PNG, JPEG, or WebP")
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def image_content(image_url: str, text: str) -> list[dict[str, Any]]:
+    return [
+        {"type": "image_url", "image_url": {"url": image_url}},
+        {"type": "text", "text": text},
+    ]
+
+
+def load_processor(model_dir: Path) -> Any:
+    try:
+        from transformers import AutoProcessor
+    except ImportError as exc:
+        raise EvidenceError("transformers is required for exact image-token accounting") from exc
+    return AutoProcessor.from_pretrained(
+        str(model_dir), trust_remote_code=False, local_files_only=True, use_fast=True
+    )
+
+
+def rendered_image_accounting(
+    processor: Any, image_path: Path, text: str
+) -> ImagePromptAccounting:
+    try:
+        from PIL import Image
+        with Image.open(image_path) as opened:
+            opened.load()
+            image = opened.convert("RGB")
+    except (ImportError, OSError) as exc:
+        raise EvidenceError(f"cannot decode --image-file: {exc}") from exc
+    messages = [{"role": "user", "content": [
+        {"type": "image"}, {"type": "text", "text": text},
+    ]}]
+    prompt = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+        thinking_mode="disabled",
+    )
+    encoded = processor(
+        images=[image], text=[prompt], return_tensors="pt",
+        return_mm_token_type_ids=True, add_special_tokens=False,
+    )
+    input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else getattr(encoded, "input_ids", None)
+    if input_ids is None:
+        raise EvidenceError("processor did not return input_ids for image prompt")
+    shape = getattr(input_ids, "shape", None)
+    if shape is not None:
+        total_tokens = int(shape[-1])
+    else:
+        values = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
+        if values and isinstance(values[0], Sequence):
+            values = values[0]
+        total_tokens = len(values)
+
+    mm_types = (
+        encoded.get("mm_token_type_ids")
+        if isinstance(encoded, dict)
+        else getattr(encoded, "mm_token_type_ids", None)
+    )
+    grid = (
+        encoded.get("image_grid_thw")
+        if isinstance(encoded, dict)
+        else getattr(encoded, "image_grid_thw", None)
+    )
+    if mm_types is None or grid is None:
+        raise EvidenceError(
+            "processor did not return mm_token_type_ids/image_grid_thw for image accounting"
+        )
+    type_values = mm_types.tolist() if hasattr(mm_types, "tolist") else mm_types
+    if type_values and isinstance(type_values[0], Sequence):
+        if len(type_values) != 1:
+            raise EvidenceError("processor returned more than one image prompt sequence")
+        type_values = type_values[0]
+    image_tokens = sum(int(value) == 1 for value in type_values)
+
+    merge_size = int(
+        getattr(processor.image_processor, "merge_size", None)
+        or getattr(processor.image_processor, "spatial_merge_size", 0)
+    )
+    if merge_size <= 0:
+        raise EvidenceError("processor does not expose a positive spatial merge size")
+    grid_values = grid.tolist() if hasattr(grid, "tolist") else grid
+    grid_tokens = 0
+    for item in grid_values:
+        if not isinstance(item, Sequence) or len(item) != 3:
+            raise EvidenceError("processor image_grid_thw must contain [t, h, w] rows")
+        grid_t, grid_h, grid_w = (int(value) for value in item)
+        if (
+            grid_t <= 0
+            or grid_h <= 0
+            or grid_w <= 0
+            or grid_h % merge_size
+            or grid_w % merge_size
+        ):
+            raise EvidenceError("processor returned invalid image-grid geometry")
+        grid_tokens += grid_t * (grid_h // merge_size) * (grid_w // merge_size)
+    if image_tokens <= 0 or image_tokens != grid_tokens or len(type_values) != total_tokens:
+        raise EvidenceError(
+            "processor image-token types, grid geometry, and input length disagree"
+        )
+    return ImagePromptAccounting(
+        total_tokens=total_tokens,
+        text_tokens=total_tokens - image_tokens,
+        image_tokens=image_tokens,
+    )
+
+
+def rendered_image_length(processor: Any, image_path: Path, text: str) -> int:
+    return rendered_image_accounting(processor, image_path, text).total_tokens
+
+
+def exact_image_prompt(processor: Any, image_path: Path, target: int) -> str:
+    base = "Describe the image briefly. x"
+    baseline = rendered_image_length(processor, image_path, base)
+    if target < baseline:
+        raise EvidenceError(f"image target {target} is below processor minimum {baseline}")
+    estimate = target - baseline
+    for count in range(max(0, estimate - 8), estimate + 9):
+        candidate = base + " x" * count
+        if rendered_image_length(processor, image_path, candidate) == target:
+            return candidate
+    raise EvidenceError(f"could not construct an exact {target}-token rendered image prompt")
+
+
 def verify_checkpoint(model_dir: Path) -> None:
     """Use the same pinned canonical manifest verifier as ``q38lab download``."""
 
@@ -363,19 +638,19 @@ def _flag_values(command: list[str]) -> dict[str, str | bool]:
 
 
 def verify_launch_argv(
-    command: list[str], *, model_dir: Path, host: str, port: int
+    command: list[str], *, model_dir: Path, host: str, port: int, profile=RTX5090_WSL2_PROFILE
 ) -> None:
     values = _flag_values(command)
     expected = {
         "--gpu": "0",
         "--tp-size": "1",
         "--max-running-requests": "1",
-        "--max-seq-len-override": "8192",
-        "--max-prefill-length": "8192",
-        "--num-tokens": "8192",
+        "--max-seq-len-override": str(profile.max_seq_len),
+        "--max-prefill-length": str(profile.max_prefill_length),
+        "--num-tokens": str(profile.num_tokens),
         "--memory-ratio": "0.89",
         "--cache-type": "naive",
-        "--attention-backend": "qsa_triton",
+        "--attention-backend": profile.attention_backend,
         "--graph": "0",
         "--moe-backend": "offload",
         "--nvfp4-backend": "auto",
@@ -393,7 +668,7 @@ def verify_launch_argv(
     model_value = values.get("--model", values.get("--model-path"))
     if not isinstance(model_value, str) or Path(model_value).resolve() != model_dir.resolve():
         raise EvidenceError("server launch argv model path does not match --model-dir")
-    if host != "127.0.0.1" or port != RTX5090_WSL2_PROFILE.port:
+    if host != "127.0.0.1" or port != profile.port:
         raise EvidenceError("release harness requires 127.0.0.1:1919 exactly")
 
 
@@ -417,7 +692,12 @@ def process_cwd(pid: int) -> Path:
         raise EvidenceError(f"cannot resolve cwd for PID {pid}") from exc
 
 
-def verify_clean_runtime(root: Path, expected_commit: str) -> str:
+def verify_clean_runtime(
+    root: Path,
+    expected_commit: str,
+    *,
+    allowed_untracked_root: Path | None = None,
+) -> str:
     if not COMMIT_RE.fullmatch(expected_commit):
         raise EvidenceError("--expected-commit must be exact 40-hex")
     commit = command_output(["git", "-C", str(root), "rev-parse", "HEAD"])
@@ -426,13 +706,32 @@ def verify_clean_runtime(root: Path, expected_commit: str) -> str:
     status = command_output([
         "git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"
     ])
-    if status is None or status:
+    if status is None:
+        raise EvidenceError("cannot inspect runtime checkout status")
+    dirty = status.splitlines() if status else []
+    if allowed_untracked_root is not None:
+        try:
+            allowed = allowed_untracked_root.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            allowed = ""
+        if allowed:
+            prefix = allowed.rstrip("/") + "/"
+            dirty = [
+                line for line in dirty
+                if not (
+                    line.startswith("?? ")
+                    and (
+                        line[3:].replace("\\", "/") == allowed
+                        or line[3:].replace("\\", "/").startswith(prefix)
+                    )
+                )
+            ]
+    if dirty:
         raise EvidenceError("release harness requires a completely clean runtime checkout")
     return runtime_tree_sha256(root, expected_commit)
 
 
-def _expected_public_config(model_dir: Path, host: str, port: int) -> dict[str, Any]:
-    profile = RTX5090_WSL2_PROFILE
+def _expected_public_config(model_dir: Path, host: str, port: int, profile=RTX5090_WSL2_PROFILE) -> dict[str, Any]:
     resolved = resolve_serve_config(
         profile_name=profile.name,
         cli={
@@ -442,9 +741,9 @@ def _expected_public_config(model_dir: Path, host: str, port: int) -> dict[str, 
             "host": host,
             "port": port,
             "memory_ratio": 0.89,
-            "num_tokens": 8192,
-            "max_seq_len": 8192,
-            "max_prefill_length": 8192,
+            "num_tokens": profile.num_tokens,
+            "max_seq_len": profile.max_seq_len,
+            "max_prefill_length": profile.max_prefill_length,
             "unsafe_non_loopback": False,
         },
         env={},
@@ -462,6 +761,7 @@ def verify_launch_attestation(
     model_dir: Path,
     host: str,
     port: int,
+    profile=RTX5090_WSL2_PROFILE,
 ) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -476,14 +776,14 @@ def verify_launch_attestation(
     if Path(str(value.get("model_realpath", ""))).resolve() != model_dir.resolve():
         raise EvidenceError("launch attestation model realpath does not match --model-dir")
     config = value.get("resolved_config")
-    if config != _expected_public_config(model_dir, host, port):
+    if config != _expected_public_config(model_dir, host, port, profile):
         raise EvidenceError("launch attestation resolved config does not match the release profile")
     if not isinstance(config, dict) or config.get("profile_contract_verified") is not True:
         raise EvidenceError("launch attestation must prove the exact release profile contract")
     argv = value.get("argv")
     if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
         raise EvidenceError("launch attestation argv must be a string array")
-    verify_launch_argv(argv, model_dir=model_dir, host=host, port=port)
+    verify_launch_argv(argv, model_dir=model_dir, host=host, port=port, profile=profile)
     if process_cwd(pid) != root.resolve():
         raise EvidenceError("live server process cwd is not the validated runtime checkout")
     return value
@@ -762,14 +1062,19 @@ def environment_document() -> dict[str, Any]:
             "torch_cuda": torch_cuda_version,
             "triton": triton_version,
             "cuda_runtime_probe": cuda_runtime_probe,
+            # Security-relevant network compatibility is explicit evidence:
+            # the opt-in changes DNS provenance, while libc getaddrinfo has no
+            # portable hard-cancel primitive (the server uses bounded soft cancellation).
+            "media_doh_fallback_enabled": os.getenv("Q38LAB_DOH_FALLBACK") == "1",
+            "media_system_dns_hard_cancel_supported": False,
         },
     }
 
 
-def resolved_config(model_dir: Path) -> dict[str, Any]:
+def resolved_config(model_dir: Path, profile=RTX5090_WSL2_PROFILE) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "profile": "rtx5090-wsl2",
+        "profile": profile.name,
         "served_model_name": SERVED_MODEL,
         "model_basename": model_dir.name,
         "settings": {
@@ -777,17 +1082,30 @@ def resolved_config(model_dir: Path) -> dict[str, Any]:
             "port": 1919,
             "tp_size": 1,
             "max_running_requests": 1,
-            "max_seq_len": 8192,
-            "max_prefill_length": 8192,
-            "num_tokens": 8192,
+            "max_seq_len": profile.max_seq_len,
+            "max_prefill_length": profile.max_prefill_length,
+            "num_tokens": profile.num_tokens,
             "memory_ratio": 0.89,
             "cache_type": "naive",
-            "attention_backend": "qsa_triton",
+            "attention_backend": profile.attention_backend,
             "cuda_graph": False,
             "moe_backend": "offload",
             "moe_cache_auto": True,
             "moe_cpu_layers": None,
             "nvfp4_backend": "auto",
+            **({
+                "moe_prefill_sparse": profile.moe_prefill_sparse,
+                "ple_io_backend": profile.ple_io_backend,
+                "ple_require_native_io_uring": profile.ple_require_native_io_uring,
+                "ple_cache_bytes": profile.ple_cache_bytes,
+                "ple_queue_depth": profile.ple_queue_depth,
+                "ple_max_batch_pages": profile.ple_max_batch_pages,
+                "ple_staging_buffers": profile.ple_staging_buffers,
+                "qsa_require_native_topk": profile.qsa_require_native_topk,
+                "vision_enabled": profile.load_vision,
+                "gpu_memory_envelope_bytes": profile.gpu_memory_envelope_bytes,
+                "gpu_runtime_reserve_bytes": profile.gpu_runtime_reserve_bytes,
+            } if profile.name == "rtx5090-wsl2-256k-image" else {}),
         },
     }
 
@@ -796,6 +1114,7 @@ class Recorder:
     def __init__(self, directory: Path, *, origin: float) -> None:
         self.directory = directory
         self.origin = origin
+        self.first_started_elapsed_s: float | None = None
         self.requests = (directory / "requests.jsonl").open("w", encoding="utf-8")
         self.latency_handle = (directory / "latency.csv").open("w", newline="", encoding="utf-8")
         self.latency = csv.DictWriter(
@@ -839,6 +1158,11 @@ class Recorder:
             started_elapsed = started_elapsed_s
             finished_elapsed = finished_elapsed_s
             total_ms = max(0.0, (finished_elapsed - started_elapsed) * 1000)
+        if (
+            self.first_started_elapsed_s is None
+            or started_elapsed < self.first_started_elapsed_s
+        ):
+            self.first_started_elapsed_s = started_elapsed
         item = {
             "case": case,
             "iteration": iteration,
@@ -988,18 +1312,629 @@ def run_api_gates(args: argparse.Namespace, recorder: Recorder, tokenizer: Any) 
     return {"api": api, "prompt_cases": prompt_cases, "steady_decode": steady}, {"endpoint": endpoint}
 
 
+def _text_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _error_code(value: dict[str, Any]) -> str:
+    error = value.get("error") or {}
+    return str(error.get("code") or error.get("type") or "") if isinstance(error, dict) else ""
+
+
+def valid_boundary_result(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    image_tokens = value.get("image_tokens")
+    text_tokens = value.get("text_tokens")
+    return (
+        value.get("input_tokens") == 261120
+        and value.get("output_tokens") == 1024
+        and value.get("total_tokens") == 262144
+        and value.get("text_completed") is True
+        and value.get("image_completed") is True
+        and isinstance(image_tokens, int)
+        and not isinstance(image_tokens, bool)
+        and image_tokens > 0
+        and isinstance(text_tokens, int)
+        and not isinstance(text_tokens, bool)
+        and text_tokens > 0
+        and image_tokens + text_tokens == 261120
+        and set(value) == {
+            "input_tokens", "output_tokens", "total_tokens", "text_completed",
+            "image_completed", "image_tokens", "text_tokens",
+        }
+    )
+
+
+def run_256k_image_gates(
+    args: argparse.Namespace,
+    recorder: Recorder,
+    tokenizer: Any,
+    processor: Any,
+) -> dict[str, Any]:
+    """Run v0.2-only long-context/image gates and retain only aggregate proofs."""
+
+    endpoint = args.base_url.rstrip("/") + "/v1/chat/completions"
+    data_url = image_data_url(args.image_file)
+    short_content = image_content(data_url, "Describe the main object in one short sentence.")
+    api: dict[str, bool] = {}
+
+    status, response, total_ms = post_json(
+        endpoint, chat_payload(short_content, 32, reasoning_effort="none"), args.request_timeout
+    )
+    usage = response.get("usage") or {}
+    text = completion_text(response)
+    ok = status == 200 and bool(text)
+    recorder.record(case="image-data-url", iteration=0, warmup=False, stream=False, success=ok,
+                    prompt_tokens=int(usage.get("prompt_tokens") or 0), completion_tokens=int(usage.get("completion_tokens") or 0),
+                    ttft_ms=None, total_ms=total_ms, http_status=status, proof={"image_count": 1, "text_sha256": _text_hash(text)})
+    api["image_data_url"] = ok
+
+    status, response, total_ms = post_json(
+        endpoint,
+        chat_payload(image_content(args.https_image_url, "Describe the image briefly."), 32, reasoning_effort="none"),
+        args.request_timeout,
+    )
+    usage = response.get("usage") or {}
+    https_text = completion_text(response)
+    ok = status == 200 and bool(https_text)
+    recorder.record(case="image-https", iteration=0, warmup=False, stream=False, success=ok,
+                    prompt_tokens=int(usage.get("prompt_tokens") or 0), completion_tokens=int(usage.get("completion_tokens") or 0),
+                    ttft_ms=None, total_ms=total_ms, http_status=status, proof={"https": True, "text_sha256": _text_hash(https_text)})
+    api["image_https"] = ok
+
+    four_content: list[dict[str, Any]] = []
+    for _ in range(4):
+        four_content.append({"type": "image_url", "image_url": {"url": data_url}})
+    four_content.append({"type": "text", "text": "How many images were supplied? Reply with a number."})
+    status, response, total_ms = post_json(
+        endpoint, chat_payload(four_content, 16, reasoning_effort="none"), args.request_timeout
+    )
+    usage = response.get("usage") or {}
+    four_text = completion_text(response)
+    ok = status == 200 and "4" in four_text
+    recorder.record(case="image-four", iteration=0, warmup=False, stream=False, success=ok,
+                    prompt_tokens=int(usage.get("prompt_tokens") or 0), completion_tokens=int(usage.get("completion_tokens") or 0),
+                    ttft_ms=None, total_ms=total_ms, http_status=status, proof={"image_count": 4, "answer_contains_four": "4" in four_text})
+    api["image_four"] = ok
+
+    parity_payload = chat_payload(short_content, 32, reasoning_effort="none", seed=1234)
+    status, response, total_ms = post_json(endpoint, parity_payload, args.request_timeout)
+    usage = response.get("usage") or {}
+    nonstream_text = completion_text(response)
+    stream = post_sse(endpoint, parity_payload, args.request_timeout)
+    parity = bool(nonstream_text) and nonstream_text == stream.text and status == stream.status == 200
+    for iteration, is_stream, prompt_tokens, completion_tokens, ttft, duration, value in (
+        (0, False, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), None, total_ms, nonstream_text),
+        (1, True, stream.prompt_tokens, stream.completion_tokens, stream.ttft_ms, stream.total_ms, stream.text),
+    ):
+        recorder.record(case="image-stream-parity", iteration=iteration, warmup=False, stream=is_stream,
+                        success=parity, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                        ttft_ms=ttft, total_ms=duration, http_status=200,
+                        proof={"text_sha256": _text_hash(value), "image_count": 1})
+    api["image_stream_nonstream_match"] = parity
+
+    fixture_urls: dict[str, str] = {}
+    fixture_hashes: dict[str, str] = {}
+    for kind in ("ocr", "object", "chart"):
+        fixture_urls[kind], fixture_hashes[kind] = synthetic_vision_fixture(kind)
+
+    visual_cases = (
+        (
+            "ocr",
+            "Read the access code in the image. Reply with the code only.",
+            lambda value: "382741" in _canonical_answer(value),
+        ),
+        (
+            "object",
+            "What are the color and shape of the large object? Reply briefly.",
+            lambda value: "red" in value.casefold() and "square" in value.casefold(),
+        ),
+        (
+            "chart",
+            "Which labeled bar is tallest? Reply with the single label.",
+            lambda value: re.search(r"\bB\b", value.upper()) is not None,
+        ),
+    )
+    visual_quality: dict[str, bool] = {}
+    for kind, question, validator in visual_cases:
+        status, response, total_ms = post_json(
+            endpoint,
+            chat_payload(
+                image_content(fixture_urls[kind], question),
+                32,
+                reasoning_effort="none",
+            ),
+            args.request_timeout,
+        )
+        usage = response.get("usage") or {}
+        answer = completion_text(response)
+        passed = status == 200 and bool(answer) and bool(validator(answer))
+        recorder.record(
+            case=f"image-{kind}-quality",
+            iteration=0,
+            warmup=False,
+            stream=False,
+            success=passed,
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+            ttft_ms=None,
+            total_ms=total_ms,
+            http_status=status,
+            proof={
+                "answer_match": passed,
+                "fixture_sha256": fixture_hashes[kind],
+                "answer_sha256": _text_hash(answer),
+            },
+        )
+        visual_quality[kind] = passed
+        api[f"image_{kind}"] = passed
+
+    status, response, total_ms = post_json(
+        endpoint,
+        chat_payload(
+            image_content(
+                fixture_urls["object"],
+                "Think carefully, then describe the color and shape in one sentence.",
+            ),
+            128,
+            reasoning_effort="high",
+        ),
+        args.request_timeout,
+    )
+    usage = response.get("usage") or {}
+    message = ((response.get("choices") or [{}])[0].get("message") or {})
+    reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
+    visible = str(message.get("content") or "")
+    image_thinking_ok = (
+        status == 200
+        and thinking_response_valid("high", visible, reasoning)
+        and "red" in visible.casefold()
+        and "square" in visible.casefold()
+    )
+    recorder.record(
+        case="image-thinking",
+        iteration=0,
+        warmup=False,
+        stream=False,
+        success=image_thinking_ok,
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+        completion_tokens=int(usage.get("completion_tokens") or 0),
+        ttft_ms=None,
+        total_ms=total_ms,
+        http_status=status,
+        proof={
+            "reasoning_present": bool(reasoning),
+            "visible_text_present": bool(visible),
+            "answer_match": "red" in visible.casefold() and "square" in visible.casefold(),
+            "fixture_sha256": fixture_hashes["object"],
+        },
+    )
+    api["image_thinking"] = image_thinking_ok
+
+    report_tool = {
+        "type": "function",
+        "function": {
+            "name": "report_access_code",
+            "description": "Report the access code read from an image",
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+            },
+        },
+    }
+    status, response, total_ms = post_json(
+        endpoint,
+        chat_payload(
+            image_content(
+                fixture_urls["ocr"],
+                "Read the image and call report_access_code with the visible code.",
+            ),
+            128,
+            reasoning_effort="none",
+            tools=[report_tool],
+            tool_choice="required",
+        ),
+        args.request_timeout,
+    )
+    usage = response.get("usage") or {}
+    tool_name, tool_arguments = completion_tool(response)
+    try:
+        parsed_arguments = json.loads(tool_arguments)
+    except json.JSONDecodeError:
+        parsed_arguments = None
+    reported_code = (
+        str(parsed_arguments.get("code") or "")
+        if isinstance(parsed_arguments, dict)
+        else ""
+    )
+    image_tool_ok = (
+        status == 200
+        and tool_name == "report_access_code"
+        and "Q382741" in _canonical_answer(reported_code)
+    )
+    recorder.record(
+        case="image-tool-call",
+        iteration=0,
+        warmup=False,
+        stream=False,
+        success=image_tool_ok,
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+        completion_tokens=int(usage.get("completion_tokens") or 0),
+        ttft_ms=None,
+        total_ms=total_ms,
+        http_status=status,
+        proof={
+            "tool_name": tool_name,
+            "answer_match": "382741" in _canonical_answer(reported_code),
+            "arguments_sha256": _text_hash(normalize_json_arguments(tool_arguments)),
+            "fixture_sha256": fixture_hashes["ocr"],
+        },
+    )
+    api["image_tool_call"] = image_tool_ok
+
+    rejected = 0
+    unsafe_contents = [
+        image_content("http://example.com/image.png", "x"),
+        image_content("https://127.0.0.1/image.png", "x"),
+        image_content("file:///etc/passwd", "x"),
+        [{"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AA=="}}],
+    ]
+    reject_codes: list[str] = []
+    reject_total_ms = 0.0
+    for content in unsafe_contents:
+        code, value, elapsed = post_json_response(
+            endpoint, chat_payload(content, 1, reasoning_effort="none"), min(args.request_timeout, 30)
+        )
+        error_code = _error_code(value)
+        reject_total_ms += elapsed
+        if 400 <= code < 500 and error_code:
+            rejected += 1
+            reject_codes.append(error_code)
+    reject_ok = rejected == len(unsafe_contents)
+    recorder.record(case="image-security-rejections", iteration=0, warmup=False, stream=False,
+                    success=reject_ok, prompt_tokens=0, completion_tokens=0, ttft_ms=None,
+                    total_ms=reject_total_ms, http_status=400,
+                    proof={"attempted": len(unsafe_contents), "passed": rejected, "error_codes": sorted(set(reject_codes))})
+    api["image_security_rejections"] = reject_ok
+
+    prompt_cases: list[dict[str, Any]] = []
+    long_prompts: dict[int, str] = {}
+    niah_rows: list[dict[str, Any]] = []
+    for target in PROMPT_TARGETS_256K:
+        depth, code = NIAH_CASES[target]
+        content = exact_needle_prompt(
+            tokenizer, target, depth=depth, code=code
+        )
+        long_prompts[target] = content
+        result = post_sse(
+            endpoint,
+            chat_payload(content, 16, reasoning_effort="none"),
+            args.request_timeout,
+        )
+        needle_found = _canonical_answer(code) in _canonical_answer(result.text)
+        prompt_ok = (
+            result.status == 200
+            and result.prompt_tokens == target
+            and needle_found
+        )
+        recorder.record(case=f"prompt-{target}", iteration=0, warmup=False, stream=True,
+                        success=prompt_ok,
+                        prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
+                        ttft_ms=result.ttft_ms, total_ms=result.total_ms, http_status=result.status,
+                        content_tokens=len(tokenizer.encode(content, add_special_tokens=False)),
+                        proof={
+                            "needle_depth": depth,
+                            "needle_found": needle_found,
+                            "expected_code_sha256": _text_hash(code),
+                            "answer_sha256": _text_hash(result.text),
+                        })
+        niah_rows.append({
+            "rendered_prompt_tokens": target,
+            "depth": depth,
+            "passed": prompt_ok,
+        })
+        prompt_cases.append({
+            "content_prompt_tokens": len(tokenizer.encode(content, add_special_tokens=False)),
+            "rendered_prompt_tokens": target,
+            "completion_tokens": result.completion_tokens,
+            "ttft_p50_ms": round(result.ttft_ms, 3), "ttft_p95_ms": round(result.ttft_ms, 3),
+            "total_p50_ms": round(result.total_ms, 3), "total_p95_ms": round(result.total_ms, 3),
+        })
+
+    text_boundary = post_sse(
+        endpoint,
+        chat_payload(long_prompts[261120], 1024, reasoning_effort="none", ignore_eos=True),
+        args.request_timeout,
+    )
+    text_ok = text_boundary.prompt_tokens == 261120 and text_boundary.completion_tokens == 1024 and text_boundary.finish_reason == "length"
+    recorder.record(case="boundary-text", iteration=0, warmup=False, stream=True, success=text_ok,
+                    prompt_tokens=text_boundary.prompt_tokens, completion_tokens=text_boundary.completion_tokens,
+                    ttft_ms=text_boundary.ttft_ms, total_ms=text_boundary.total_ms, http_status=text_boundary.status,
+                    proof={"finish_reason": text_boundary.finish_reason})
+
+    image_text = exact_image_prompt(processor, args.image_file, 261120)
+    image_accounting = rendered_image_accounting(
+        processor, args.image_file, image_text
+    )
+    if image_accounting.total_tokens != 261120:
+        raise EvidenceError(
+            "processor image accounting changed after exact prompt construction"
+        )
+    vision_before = _runtime_telemetry(
+        get_json(args.base_url.rstrip("/") + "/v1/stats")
+    )["vision"].get("image_tokens")
+    if isinstance(vision_before, bool) or not isinstance(vision_before, int):
+        raise EvidenceError("runtime vision.image_tokens must be an integer")
+    image_boundary = post_sse(
+        endpoint,
+        chat_payload(image_content(data_url, image_text), 1024, reasoning_effort="none", ignore_eos=True),
+        args.request_timeout,
+    )
+    vision_after = _runtime_telemetry(
+        get_json(args.base_url.rstrip("/") + "/v1/stats")
+    )["vision"].get("image_tokens")
+    if isinstance(vision_after, bool) or not isinstance(vision_after, int):
+        raise EvidenceError("runtime vision.image_tokens must be an integer")
+    runtime_image_tokens = vision_after - vision_before
+    image_ok = (
+        image_boundary.prompt_tokens == 261120
+        and image_boundary.completion_tokens == 1024
+        and image_boundary.finish_reason == "length"
+        and runtime_image_tokens == image_accounting.image_tokens
+    )
+    recorder.record(case="boundary-image", iteration=0, warmup=False, stream=True, success=image_ok,
+                    prompt_tokens=image_boundary.prompt_tokens, completion_tokens=image_boundary.completion_tokens,
+                    ttft_ms=image_boundary.ttft_ms, total_ms=image_boundary.total_ms, http_status=image_boundary.status,
+                    proof={
+                        "finish_reason": image_boundary.finish_reason,
+                        "image_count": 1,
+                        "image_tokens": image_accounting.image_tokens,
+                        "text_tokens": image_accounting.text_tokens,
+                        "runtime_image_tokens_delta": runtime_image_tokens,
+                    })
+
+    reject_payload = chat_payload(long_prompts[261120], 1025, reasoning_effort="none")
+    code, value, elapsed = post_json_response(endpoint, reject_payload, min(args.request_timeout, 120))
+    error_code = _error_code(value)
+    context_ok = 400 <= code < 500 and error_code == "context_length_exceeded"
+    recorder.record(case="context-length-rejection", iteration=0, warmup=False, stream=False,
+                    success=context_ok, prompt_tokens=261120, completion_tokens=0, ttft_ms=None,
+                    total_ms=elapsed, http_status=code, proof={"error_code": error_code, "requested_output_tokens": 1025})
+    api["context_length_rejection"] = context_ok
+
+    return {
+        "api": api,
+        "prompt_cases": prompt_cases,
+        "boundary": {
+            "input_tokens": 261120, "output_tokens": 1024, "total_tokens": 262144,
+            "text_completed": text_ok, "image_completed": image_ok,
+            "image_tokens": image_accounting.image_tokens,
+            "text_tokens": image_accounting.text_tokens,
+        },
+        "long_context_ttft_ms": round(max(text_boundary.ttft_ms, image_boundary.ttft_ms), 3),
+        "niah": {
+            "attempted": len(niah_rows),
+            "succeeded": sum(bool(row["passed"]) for row in niah_rows),
+            "depths": [row["depth"] for row in niah_rows],
+        },
+        "vision_quality": visual_quality,
+    }
+
+
+def _runtime_telemetry(stats: dict[str, Any]) -> dict[str, Any]:
+    value = stats.get("q38lab") or stats.get("runtime_telemetry")
+    if not isinstance(value, dict):
+        raise EvidenceError(
+            "/v1/stats does not expose q38lab/runtime_telemetry; v0.2 evidence "
+            "requires selector, PLE, vision, and prefill-chunk counters"
+        )
+    for key in ("selector", "ple", "vision", "prefill_chunks", "moe_prefill"):
+        if not isinstance(value.get(key), dict):
+            raise EvidenceError(f"/v1/stats runtime telemetry is missing {key}")
+    validate_moe_prefill_telemetry(
+        value["moe_prefill"],
+        source="/v1/stats runtime telemetry.moe_prefill",
+    )
+    return value
+
+
+def _sanitized_runtime_snapshot(value: dict[str, Any], phase: str) -> dict[str, Any]:
+    validate_moe_prefill_telemetry(
+        value.get("moe_prefill"),
+        source="/v1/stats runtime telemetry.moe_prefill",
+    )
+    groups = {
+        "selector": (
+            "workspace_peak_bytes", "native_calls", "fallback_calls", "errors"
+        ),
+        "ple": ("bytes_read", "cache_hits", "cache_misses", "wait_ms", "page_faults"),
+        "vision": ("image_tokens", "latency_ms"),
+        "prefill_chunks": ("count", "total_ms"),
+        "moe_prefill": (
+            "active_rows", "possible_rows", "bytes_copied", "full_bytes",
+            "row_fraction", "byte_fraction",
+        ),
+    }
+    snapshot: dict[str, Any] = {"phase": phase}
+    for group, keys in groups.items():
+        snapshot[group] = {}
+        for key in keys:
+            item = value[group].get(key)
+            if isinstance(item, bool) or not isinstance(item, (int, float)) or item < 0:
+                raise EvidenceError(f"runtime telemetry {group}.{key} must be non-negative")
+            if group == "selector" and not isinstance(item, int):
+                raise EvidenceError(f"runtime telemetry selector.{key} must be an integer")
+            snapshot[group][key] = item
+    return snapshot
+
+
+def run_ple_telemetry_probe(args: argparse.Namespace, recorder: Recorder) -> dict[str, Any]:
+    """Prove one cold read followed by three warm reads from monotonic runtime counters."""
+
+    endpoint = args.base_url.rstrip("/") + "/v1/chat/completions"
+    stats_url = args.base_url.rstrip("/") + "/v1/stats"
+    data_url = image_data_url(args.image_file)
+    payload = chat_payload(image_content(data_url, "Reply with OK."), 8, reasoning_effort="none")
+    before = _runtime_telemetry(get_json(stats_url))
+    for key in ("bytes_read", "cache_hits", "cache_misses"):
+        if before["ple"].get(key) != 0:
+            raise EvidenceError(
+                "PLE cold measurement requires a freshly started server with zero "
+                f"baseline {key}"
+            )
+    snapshots = [before]
+    for iteration in range(4):
+        status, response, elapsed = post_json(endpoint, payload, args.request_timeout)
+        usage = response.get("usage") or {}
+        success = status == 200 and bool(completion_text(response))
+        recorder.record(case="ple-cold" if iteration == 0 else "ple-warm", iteration=iteration,
+                        warmup=iteration > 0, stream=False, success=success,
+                        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                        completion_tokens=int(usage.get("completion_tokens") or 0),
+                        ttft_ms=None, total_ms=elapsed, http_status=status,
+                        proof={"phase": "cold" if iteration == 0 else "warm"})
+        if not success:
+            raise EvidenceError(
+                f"PLE {'cold' if iteration == 0 else 'warm'} generation {iteration} failed"
+            )
+        snapshots.append(_runtime_telemetry(get_json(stats_url)))
+
+    write_json(args.out / "runtime-telemetry.json", {
+        "schema_version": SCHEMA_VERSION,
+        "samples": [
+            _sanitized_runtime_snapshot(value, phase)
+            for value, phase in zip(snapshots, ("baseline", "cold", "warm-1", "warm-2", "warm-3"))
+        ],
+    })
+
+    def number(snapshot: dict[str, Any], group: str, key: str) -> float:
+        value = snapshot[group].get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise EvidenceError(f"runtime telemetry {group}.{key} must be non-negative")
+        return float(value)
+
+    cold_read = number(snapshots[1], "ple", "bytes_read") - number(snapshots[0], "ple", "bytes_read")
+    cold_miss = number(snapshots[1], "ple", "cache_misses") - number(snapshots[0], "ple", "cache_misses")
+    if cold_read <= 0 or cold_miss <= 0:
+        raise EvidenceError("PLE counters do not prove the required cold read")
+    for index in range(2, 5):
+        previous = snapshots[index - 1]
+        current = snapshots[index]
+        hit_delta = number(current, "ple", "cache_hits") - number(
+            previous, "ple", "cache_hits"
+        )
+        read_delta = number(current, "ple", "bytes_read") - number(
+            previous, "ple", "bytes_read"
+        )
+        miss_delta = number(current, "ple", "cache_misses") - number(
+            previous, "ple", "cache_misses"
+        )
+        if hit_delta <= 0 or read_delta != 0 or miss_delta != 0:
+            raise EvidenceError(
+                "each PLE warm run must add cache hits without another read or miss"
+            )
+    final = snapshots[-1]
+    if number(final, "selector", "native_calls") <= 0:
+        raise EvidenceError("runtime counters do not prove a native SM120 fast-topk call")
+    if number(final, "selector", "fallback_calls") != 0:
+        raise EvidenceError("runtime counters report an SM120 fast-topk fallback")
+    if number(final, "selector", "errors") != 0:
+        raise EvidenceError("runtime counters report a native SM120 fast-topk error")
+    return {
+        "selector": {
+            key: int(number(final, "selector", key))
+            for key in (
+                "workspace_peak_bytes", "native_calls", "fallback_calls", "errors"
+            )
+        },
+        "ple": {
+            "cold_runs": 1, "warm_runs": 3,
+            **{key: round(number(final, "ple", key), 3) for key in (
+                "bytes_read", "cache_hits", "cache_misses", "wait_ms", "page_faults"
+            )},
+        },
+        "vision": {
+            "image_tokens": int(number(final, "vision", "image_tokens")),
+            "latency_ms": round(number(final, "vision", "latency_ms"), 3),
+        },
+        "prefill_chunks": {
+            "count": int(number(final, "prefill_chunks", "count")),
+            "total_ms": round(number(final, "prefill_chunks", "total_ms"), 3),
+        },
+        "moe_prefill": {
+            key: (
+                int(number(final, "moe_prefill", key))
+                if key in ("active_rows", "possible_rows", "bytes_copied", "full_bytes")
+                else round(number(final, "moe_prefill", key), 6)
+            )
+            for key in (
+                "active_rows", "possible_rows", "bytes_copied", "full_bytes",
+                "row_fraction", "byte_fraction",
+            )
+        },
+    }
+
+
+def refresh_runtime_telemetry(
+    current: dict[str, Any], stats: dict[str, Any], target: Path | None = None
+) -> dict[str, Any]:
+    final = _runtime_telemetry(stats)
+    validate_moe_prefill_telemetry(
+        final.get("moe_prefill"),
+        source="/v1/stats runtime telemetry.moe_prefill",
+    )
+    result = json.loads(json.dumps(current))
+    for group, keys in {
+        "selector": (
+            "workspace_peak_bytes", "native_calls", "fallback_calls", "errors"
+        ),
+        "ple": ("bytes_read", "cache_hits", "cache_misses", "wait_ms", "page_faults"),
+        "vision": ("image_tokens", "latency_ms"),
+        "prefill_chunks": ("count", "total_ms"),
+        "moe_prefill": (
+            "active_rows", "possible_rows", "bytes_copied", "full_bytes",
+            "row_fraction", "byte_fraction",
+        ),
+    }.items():
+        for key in keys:
+            value = final[group].get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise EvidenceError(f"runtime telemetry {group}.{key} must be non-negative")
+            result[group][key] = int(value) if key in {
+                "workspace_peak_bytes", "native_calls", "fallback_calls", "errors",
+                "image_tokens", "count", "active_rows", "possible_rows",
+                "bytes_copied", "full_bytes",
+            } else round(float(value), 6 if group == "moe_prefill" else 3)
+    if target is not None:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+        raw["samples"].append(_sanitized_runtime_snapshot(final, "final"))
+        write_json(target, raw)
+    return result
+
+
 def run_stability(args: argparse.Namespace, recorder: Recorder) -> dict[str, Any]:
     endpoint = args.base_url.rstrip("/") + "/v1/chat/completions"
-    payload = chat_payload("Reply with OK", 8, reasoning_effort="none")
+    text_payload = chat_payload("Reply with OK", 8, reasoning_effort="none")
+    image_payload = None
+    if args.profile == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+        image_payload = chat_payload(
+            image_content(image_data_url(args.image_file), "Reply with OK."),
+            8,
+            reasoning_effort="none",
+        )
     durations: list[float] = []
     succeeded = 0
     for iteration in range(args.sequential_requests):
+        uses_image = image_payload is not None and iteration % 2 == 1
+        payload = image_payload if uses_image else text_payload
         status, response, total_ms = post_json(endpoint, payload, args.request_timeout)
         usage = response.get("usage") or {}
         success = status == 200 and bool(completion_text(response))
         succeeded += int(success)
         durations.append(total_ms)
-        recorder.record(case="stability", iteration=iteration, warmup=False, stream=False, success=success, prompt_tokens=int(usage.get("prompt_tokens") or 0), completion_tokens=int(usage.get("completion_tokens") or 0), ttft_ms=None, total_ms=total_ms, http_status=status)
+        recorder.record(case="stability", iteration=iteration, warmup=False, stream=False, success=success, prompt_tokens=int(usage.get("prompt_tokens") or 0), completion_tokens=int(usage.get("completion_tokens") or 0), ttft_ms=None, total_ms=total_ms, http_status=status, proof={"image": uses_image})
         if not success:
             break
     return {
@@ -1012,16 +1947,31 @@ def run_stability(args: argparse.Namespace, recorder: Recorder) -> dict[str, Any
 
 
 def run_soak(args: argparse.Namespace, recorder: Recorder) -> dict[str, Any]:
-    """Start only after all initial gates, then periodically perform generation."""
+    """Start only after all initial gates, then periodically perform generation.
+
+    The image profile deliberately alternates text and image requests for the
+    entire soak.  A text-only soak can stabilize after leaking one allocation
+    per image during the preceding 100-request gate and therefore cannot prove
+    request-scoped vision buffers are reclaimed.
+    """
 
     endpoint = args.base_url.rstrip("/") + "/v1/chat/completions"
-    payload = chat_payload("Reply with OK", 8, reasoning_effort="none")
+    text_payload = chat_payload("Reply with OK", 8, reasoning_effort="none")
+    image_payload = None
+    if args.profile == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+        image_payload = chat_payload(
+            image_content(image_data_url(args.image_file), "Reply with OK."),
+            8,
+            reasoning_effort="none",
+        )
     soak_started = time.monotonic()
     iteration = 0
     succeeded = 0
     raw_starts: list[float] = []
     raw_finishes: list[float] = []
     while True:
+        uses_image = image_payload is not None and iteration % 2 == 1
+        payload = image_payload if uses_image else text_payload
         request_started = time.monotonic()
         status, response, total_ms = post_json(endpoint, payload, args.request_timeout)
         usage = response.get("usage") or {}
@@ -1035,6 +1985,7 @@ def run_soak(args: argparse.Namespace, recorder: Recorder) -> dict[str, Any]:
             ttft_ms=None, total_ms=total_ms, http_status=status,
             started_elapsed_s=request_started - recorder.origin,
             finished_elapsed_s=request_finished - recorder.origin,
+            proof={"image": uses_image},
         )
         raw_starts.append(float(recorded["started_elapsed_s"]))
         raw_finishes.append(float(recorded["finished_elapsed_s"]))
@@ -1060,7 +2011,10 @@ def run_soak(args: argparse.Namespace, recorder: Recorder) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=tuple(SERVE_PROFILES), default=RTX5090_WSL2_PROFILE.name)
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--image-file", type=Path, help="release-owned PNG/JPEG/WebP fixture (required by 256K image profile)")
+    parser.add_argument("--https-image-url", help="public HTTPS image fixture URL (required by 256K image profile)")
     parser.add_argument("--server-pid", type=int, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:1919")
     parser.add_argument("--attestation", type=Path)
@@ -1071,13 +2025,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequential-requests", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--measurements", type=int, default=10)
-    parser.add_argument("--decode-tokens", type=int, choices=range(256, 513), default=256, metavar="256..512")
-    parser.add_argument("--request-timeout", type=float, default=900)
+    parser.add_argument("--decode-tokens", type=int, choices=range(256, 1025), default=256, metavar="256..1024")
+    parser.add_argument("--request-timeout", type=float, default=1200)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    profile = selected_profile(args)
     root = ROOT
     if not COMMIT_RE.fullmatch(args.expected_commit):
         print("--expected-commit must be exact 40-hex", file=sys.stderr)
@@ -1097,13 +2052,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.measurements < 10:
         print("--measurements must be at least 10", file=sys.stderr)
         return 2
+    if profile.name == RTX5090_WSL2_PROFILE.name and args.decode_tokens > 512:
+        print("the v0.1 profile limits --decode-tokens to 512", file=sys.stderr)
+        return 2
+    if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+        if args.image_file is None or not args.image_file.is_file():
+            print("the 256K image profile requires --image-file", file=sys.stderr)
+            return 2
+        parsed_image = urllib.parse.urlsplit(args.https_image_url or "")
+        if parsed_image.scheme != "https" or not parsed_image.hostname:
+            print("the 256K image profile requires --https-image-url with an HTTPS URL", file=sys.stderr)
+            return 2
+        # The gate allows up to 900 seconds to first token and then requires a
+        # complete 1,024-token decode at >=5 tok/s.  A 900-second whole-request
+        # timeout would reject an otherwise conforming boundary run.
+        if args.request_timeout < 1200:
+            print(
+                "the 256K image profile requires --request-timeout >=1200 seconds",
+                file=sys.stderr,
+            )
+            return 2
     parsed_url = urllib.parse.urlsplit(args.base_url)
     host = parsed_url.hostname or ""
     port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
     if parsed_url.scheme != "http" or parsed_url.path not in {"", "/"}:
         print("--base-url must be a plain local http origin", file=sys.stderr)
         return 2
-    if host != "127.0.0.1" or port != RTX5090_WSL2_PROFILE.port:
+    if host != "127.0.0.1" or port != profile.port:
         print("--base-url must be exactly http://127.0.0.1:1919", file=sys.stderr)
         return 2
     try:
@@ -1119,10 +2094,11 @@ def main(argv: list[str] | None = None) -> int:
     measured_at = utc_now()
     errors: list[str] = []
     checkpoint_verified = False
+    ple_checkpoint_verified = False
     server_profile_verified = False
     attestation_verified = False
     server_port_verified = False
-    runtime_clean_verified = True
+    runtime_clean_verified = False
     recorder = Recorder(args.out, origin=started)
     sampler = ResourceSampler(args.server_pid, args.out / "resource-samples.csv", origin=started)
     pytest_counts = {"passed": 0, "failed": 1, "skipped": 0, "deselected": 0}
@@ -1135,8 +2111,11 @@ def main(argv: list[str] | None = None) -> int:
             "finish_reason": "",
             "http_status": 0,
         },
+        "niah": {"attempted": 0, "succeeded": 0, "depths": []},
+        "vision_quality": {"ocr": False, "object": False, "chart": False},
     }
     stability = {"attempted": 0, "succeeded": 0}
+    extended_telemetry: dict[str, Any] | None = None
     soak = {
         "attempted": 0, "succeeded": 0, "started_elapsed_s": 0.0,
         "finished_elapsed_s": 0.0, "duration_seconds": 0.0,
@@ -1179,7 +2158,7 @@ def main(argv: list[str] | None = None) -> int:
         attestation_path = args.attestation or (
             Path.home() / ".cache" / "q38lab" / f"serve-{port}.json"
         )
-        verify_launch_attestation(
+        attestation_document = verify_launch_attestation(
             attestation_path,
             pid=args.server_pid,
             root=root,
@@ -1187,8 +2166,21 @@ def main(argv: list[str] | None = None) -> int:
             model_dir=args.model_dir,
             host=host,
             port=port,
+            profile=profile,
         )
         attestation_verified = True
+        if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+            preflight = attestation_document.get("preflight")
+            if not isinstance(preflight, dict):
+                raise EvidenceError("v0.2 launch attestation has no preflight evidence")
+            ple_report = preflight.get("ple_checkpoint_probe")
+            if not isinstance(ple_report, dict):
+                raise EvidenceError(
+                    "v0.2 launch attestation has no PLE checkpoint row probe"
+                )
+            validate_ple_checkpoint_probe(ple_report)
+            write_json(args.out / V02_PLE_CHECKPOINT_PROBE_FILE, ple_report)
+            ple_checkpoint_verified = True
         verify_listening_port(args.server_pid, host, port)
         server_port_verified = True
         server_profile_verified = True
@@ -1197,8 +2189,8 @@ def main(argv: list[str] | None = None) -> int:
         models = get_json(args.base_url.rstrip("/") + "/v1/models")
         if health.get("status") != "ok":
             raise EvidenceError(f"server health is not ok: {health.get('status')}")
-        if (stats.get("model") or {}).get("ctx") != 8192:
-            raise EvidenceError("server /v1/stats does not report ctx=8192")
+        if (stats.get("model") or {}).get("ctx") != profile.max_seq_len:
+            raise EvidenceError(f"server /v1/stats does not report ctx={profile.max_seq_len}")
         model_ids = {item.get("id") for item in models.get("data", []) if isinstance(item, dict)}
         if model_ids != {SERVED_MODEL}:
             raise EvidenceError(f"/v1/models must contain only {SERVED_MODEL}")
@@ -1206,8 +2198,35 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint_verified = True
         pytest_counts = run_pytest(root, args.model_dir, args.out / "pytest.txt")
         tokenizer = load_tokenizer(args.model_dir)
+        processor = None
+        if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+            processor = load_processor(args.model_dir)
+        # Processor loading is preflight.  The recorder replaces this candidate
+        # with the exact start time of the first API request below; for v0.2 that
+        # request is the cold PLE probe and therefore precedes stream parity.
         acceptance_window_start = time.monotonic() - started
+        if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+            # This must be the first generation workload after server attestation;
+            # otherwise the claimed cold PLE sample could already be cache-warm.
+            extended_telemetry = run_ple_telemetry_probe(args, recorder)
         api_results, _private = run_api_gates(args, recorder, tokenizer)
+        if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name:
+            assert processor is not None and extended_telemetry is not None
+            image_results = run_256k_image_gates(args, recorder, tokenizer, processor)
+            api_results["api"].update(image_results["api"])
+            api_results["prompt_cases"] = image_results["prompt_cases"]
+            api_results["boundary"] = image_results["boundary"]
+            api_results["long_context_ttft_ms"] = image_results["long_context_ttft_ms"]
+            api_results["niah"] = image_results["niah"]
+            api_results["vision_quality"] = image_results["vision_quality"]
+            extended_telemetry = refresh_runtime_telemetry(
+                extended_telemetry,
+                get_json(args.base_url.rstrip("/") + "/v1/stats"),
+                args.out / "runtime-telemetry.json",
+            )
+        if recorder.first_started_elapsed_s is None:
+            raise EvidenceError("acceptance run did not record an API request")
+        acceptance_window_start = recorder.first_started_elapsed_s
         steady = api_results["steady_decode"]
         if not (
             steady.get("http_status") == 200
@@ -1230,10 +2249,27 @@ def main(argv: list[str] | None = None) -> int:
             == api_results["steady_decode"].get("requested_tokens", -1)
             and api_results["steady_decode"].get("finish_reason") == "length"
             and api_results["steady_decode"].get("http_status") == 200
+            and (profile.name != RTX5090_WSL2_256K_IMAGE_PROFILE.name
+                 or (api_results["steady_decode"].get("decode_tokens_per_second", 0) >= 5
+                     and api_results.get("boundary", {}).get("text_completed") is True
+                     and api_results.get("boundary", {}).get("image_completed") is True
+                     and api_results.get("niah", {}).get("attempted") == 4
+                     and api_results.get("niah", {}).get("succeeded") == 4
+                     and all(api_results.get("vision_quality", {}).values())
+                     and api_results.get("long_context_ttft_ms", float("inf")) <= 900000
+                     and extended_telemetry is not None))
         ):
             raise EvidenceError("an initial release gate failed; soak was not started")
         soak = run_soak(args, recorder)
         acceptance_window_end = float(soak["finished_elapsed_s"])
+        final_runtime_tree = verify_clean_runtime(
+            root,
+            args.expected_commit,
+            allowed_untracked_root=args.out,
+        )
+        if final_runtime_tree != runtime_tree:
+            raise EvidenceError("runtime tree digest changed during the acceptance run")
+        runtime_clean_verified = True
     except Exception as exc:  # produce an inspectable incomplete bundle on every failure
         errors.append(sanitize_test_log(f"{type(exc).__name__}: {exc}", args.model_dir))
         if not (args.out / "pytest.txt").exists():
@@ -1246,7 +2282,7 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = float(soak["duration_seconds"])
     write_json(args.out / "environment.json", env_doc)
-    write_json(args.out / "resolved-config.json", resolved_config(args.model_dir))
+    write_json(args.out / "resolved-config.json", resolved_config(args.model_dir, profile))
     numeric_samples = [
         {
             "elapsed_s": float(row["elapsed_s"]),
@@ -1285,6 +2321,10 @@ def main(argv: list[str] | None = None) -> int:
         and max(sample_gaps, default=float("inf")) <= 2.5
         and len(soak_samples) >= int(max(0, elapsed) // 2)
     )
+    # The earlier acceptance phase intentionally warms the bounded 4 GiB PLE
+    # LRU, so treating growth from the cold baseline as a leak would reject the
+    # designed cache lifecycle.  The 30-minute stabilized soak itself alternates
+    # text and image requests and is the leak-trend window.
     leak = (
         detect_monotonic_rss_leak(numeric_samples, soak_start, soak_end)
         if telemetry_ok else True
@@ -1298,6 +2338,12 @@ def main(argv: list[str] | None = None) -> int:
         "soak": soak,
         "continuous_run_seconds": round(elapsed, 3),
         "memory_leak_detected": leak,
+        **({
+            "boundary": api_results.get("boundary", {}),
+            "long_context_ttft_ms": api_results.get("long_context_ttft_ms", 0),
+            "niah": api_results.get("niah", {}),
+            "vision_quality": api_results.get("vision_quality", {}),
+        } if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name else {}),
     }
     resources = {
         "acceptance_window_start_elapsed_s": round(acceptance_window_start, 3),
@@ -1332,12 +2378,14 @@ def main(argv: list[str] | None = None) -> int:
             "total_bytes": MODEL_TOTAL_BYTES,
         },
         "execution": {
-            "attention_backend": "qsa_triton",
+            **({"profile": profile.name} if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name else {}),
+            "attention_backend": profile.attention_backend,
             "cache_type": "naive",
-            "context_tokens": 8192,
+            "context_tokens": profile.max_seq_len,
             "cuda_graph": False,
             "quantization": "W4A16 compatibility",
-            "text_only": True,
+            "text_only": not profile.load_vision,
+            **({"image_input": True} if profile.load_vision else {}),
             "tp_size": 1,
         },
         "verification": {
@@ -1347,9 +2395,14 @@ def main(argv: list[str] | None = None) -> int:
             "launch_attestation": attestation_verified,
             "runtime_clean_tree": runtime_clean_verified,
             "server_port_owner": server_port_verified,
+            **(
+                {"ple_checkpoint_rows": ple_checkpoint_verified}
+                if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name else {}
+            ),
         },
         "gates": gates,
         "resources": resources,
+        **({"telemetry": extended_telemetry or {}} if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name else {}),
         "benchmarks": {"prompt_classes": api_results["prompt_cases"], "steady_decode": api_results["steady_decode"]},
         "caveats": [
             "The checkpoint declares W4A4, but this release executes the W4A16 compatibility path.",
@@ -1363,18 +2416,48 @@ def main(argv: list[str] | None = None) -> int:
         not errors
         and pytest_counts["passed"] >= 1454
         and pytest_counts["failed"] == 0
-        and {case.get("rendered_prompt_tokens") for case in api_results["prompt_cases"]} >= set(PROMPT_TARGETS)
+        and {case.get("rendered_prompt_tokens") for case in api_results["prompt_cases"]} >= set(
+            PROMPT_TARGETS_256K if profile.name == RTX5090_WSL2_256K_IMAGE_PROFILE.name else PROMPT_TARGETS
+        )
         and api_results["steady_decode"].get("observed_tokens", 0)
         == api_results["steady_decode"].get("requested_tokens", -1)
         and api_results["steady_decode"].get("finish_reason") == "length"
         and api_results["steady_decode"].get("http_status") == 200
         and all(api_results["api"].values())
+        and (
+            profile.name != RTX5090_WSL2_256K_IMAGE_PROFILE.name
+            or ple_checkpoint_verified
+        )
+        and (profile.name != RTX5090_WSL2_256K_IMAGE_PROFILE.name or (
+            set(api_results["api"]) == {
+                "stream_nonstream_match", "thinking_none", "thinking_high", "tool_call",
+                "image_data_url", "image_https", "image_four", "image_stream_nonstream_match",
+                "image_security_rejections", "context_length_rejection", "image_ocr",
+                "image_object", "image_chart", "image_thinking", "image_tool_call",
+            }
+            and valid_boundary_result(api_results.get("boundary"))
+            and api_results.get("long_context_ttft_ms", float("inf")) <= 900000
+            and api_results.get("niah") == {
+                "attempted": 4,
+                "succeeded": 4,
+                "depths": [0.10, 0.35, 0.65, 0.90],
+            }
+            and api_results.get("vision_quality") == {
+                "ocr": True,
+                "object": True,
+                "chart": True,
+            }
+            and api_results["steady_decode"].get("decode_tokens_per_second", 0) >= 5
+            and extended_telemetry is not None
+        ))
         and stability.get("attempted", 0) >= 100
         and stability.get("succeeded") == stability.get("attempted")
         and soak.get("attempted", 0) >= 61
         and soak.get("succeeded") == soak.get("attempted")
+        and soak.get("max_start_gap_seconds", float("inf")) <= 30
         and elapsed >= 1800
         and telemetry_ok
+        and runtime_clean_verified
         and resources["peak_vram_mib"] < 31 * 1024
         and resources["peak_wsl_rss_kib"] < 105 * 1024 * 1024
         and resources["wsl_swap_kib"] == 0

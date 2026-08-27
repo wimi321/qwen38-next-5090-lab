@@ -1,28 +1,32 @@
-# Qwen3.8-Flash-Next (Qwen4-Exp) text-only reproducibility record
+# Qwen3.8-Flash-Next (Qwen4-Exp) reproducibility record
 
 This document was substantially modified by Qwen3.8 Next 5090 Lab contributors
 in 2026; see [`../MODIFICATIONS.md`](../MODIFICATIONS.md). It describes an
 unofficial FreeToken downstream, not an upstream FreeToken support claim.
 
-This page is the reproducibility record for the first Qwen4-Exp milestone. It
-targets exactly
+This page records two deliberately separate milestones for exactly
 [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
 at revision `7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 
-The integration is experimental until every item in [Acceptance](#acceptance)
-has a recorded result. Its first milestone is deliberately narrow:
+The released `v0.1.0-alpha.1` milestone has recorded hardware evidence for a
+deliberately narrow contract:
 
 - text only, one RTX 5090, tensor parallel size 1;
 - the complete HF checkpoint, read directly without FTW conversion;
 - an 8,192-token total context budget and the naive cache;
 - MTP, vision, video, audio and radix prefix reuse disabled.
 
-This is not a claim of 32K or 262K support. The PLE auxiliary table remains a
-host-mapped, row-on-demand bank; never load the complete table onto the GPU.
-Decode CUDA graphs are also disabled during the initial bring-up: PLE row
-staging now has a fixed-address replay seam, but the new QSA Triton kernels
-still need real capture/replay parity on the target RTX 5090 before graph mode
-is a valid optimization.
+The development branch also contains an unreleased `0.2.0a1` candidate. Its
+intended profile combines a 262,144-token total budget with image input, but it is **not
+supported or release-ready until every v0.2 item in [Acceptance](#acceptance)
+has a reviewed result**. Total tokens include rendered text, expanded image
+tokens, and output; the exact boundary gate is 261,120 input plus 1,024 output,
+once for text and once with a real image.
+
+Both profiles disable CUDA graphs and radix prefix reuse. The complete PLE
+auxiliary table must never be materialized on the GPU. The candidate adds
+native direct-I/O streaming and compressed QSA state, but neither source code
+nor unit tests substitute for the target-GPU full-checkpoint evidence.
 
 The pinned checkpoint declares a ModelOpt **W4A4** recipe for routed experts.
 FreeToken's existing NVFP4 expert backends preserve its packed E2M1 weights,
@@ -33,6 +37,125 @@ metadata. This is sufficient only for the experimental hardware bring-up: it
 is not checkpoint-numerically equivalent and does not inherit the checkpoint's
 published W4A4 quality claims. Formal support requires a W4A4 execution path
 and reference/GPU parity.
+
+## v0.2 candidate architecture
+
+The unverified `rtx5090-wsl2-256k-image` candidate profile configures TP=1, one
+running request, naive cache, graph disabled, a 262,144-token total target, and
+512-token prefill chunks. It is specific to one 32 GB RTX 5090 under WSL2 and
+fails closed if the fixed cache geometry plus minimum expert residency cannot
+fit the resolved
+0.89 planning budget. The later hardware evidence independently enforces the
+strict measured peak below 31 GiB.
+
+### Compressed QSA and SM120 selection
+
+Only the 12 QSA layers allocate sparse-attention cache. Main BF16 K/V remains
+available for selected attention, while index keys are persisted once per
+four-token block rather than once per token. Each request also keeps a
+four-token pending tail and the original three-axis positions required for
+mRoPE. At 262,144 tokens the combined main K/V and compressed index-key budget
+is 6.1875 GiB.
+
+`qsa_triton_sm120` retains the Triton scorer but bounds its FP32 selector
+workspace at 128 MiB. A CUDA top-512 specialization is adapted under
+Apache-2.0 from
+[`yhfgyyf/sglang-qwen38-flash-next-sm120`](https://github.com/yhfgyyf/sglang-qwen38-flash-next-sm120),
+exact commit `30edf3503961a471b25150aa890f8166031b5738`, file
+`python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh`. The wrapper and
+specialization were changed for FreeToken and a wide threshold-bin rescan was
+added; the source header and
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) retain the attribution.
+The PyTorch oracle and original `qsa_triton` path remain correctness fallbacks,
+not alternate release configurations.
+
+### Native PLE streaming
+
+The candidate rejects startup unless the checkpoint resides on Linux/WSL ext4
+and a read-only probe proves native `io_uring` plus `O_DIRECT`. The backend uses
+4 KiB-aligned reads, queue depth 512, at most 4,096 pages per batch, and one
+globally bounded 4 GiB C++ LRU shared across the physical shards. The next
+prefill chunk is prefetched while later GPU layers process the current chunk.
+
+Only hashed rows are read. Double-buffered pinned FP8 staging is copied to the
+GPU, where a bit-exact lookup and checkpoint scale produce BF16 rows for the
+PLE projection/convolution. The existing mmap/CPU decode path remains useful
+for unit tests and debugging, but it is not accepted as a production fallback
+for this profile. Runtime evidence must include bytes read, LRU hits/misses,
+wait time, page faults, staged bytes, and GPU-decoded rows.
+
+### Route-aware native-NVFP4 MoE prefill
+
+The candidate profile sets `FREETOKEN_MOE_PREFILL_SPARSE=1`. Startup accepts
+that setting only with the double-buffered MoE prefill cache and native
+`nvfp4` banks; a missing overlap buffer or a Marlin/b12x/other bank layout is a
+hard error. The verified v0.1 profile does not enable this path.
+
+This implementation is deliberately **not** compact-expert routing. After the
+current layer's top-10 router has produced its IDs, a fixed 512-entry device
+mask is copied to bounded pinned host storage and synchronized once. The host
+derives sorted, coalesced runs of active raw expert IDs. Those raw IDs remain
+the row positions in the existing `[E]` GPU double buffer, and the grouped
+NVFP4 kernel still receives the original IDs and `num_experts=512`. Inactive
+rows may retain stale bytes, but the current routing cannot address them. The
+full double-buffer reservation is unchanged, so this path reduces candidate
+movement only; it does not reduce the MoE cache's GPU-memory budget.
+
+For a bank whose per-expert row is at least 256 KiB, only the coalesced active
+runs are copied. For this checkpoint that covers the large packed gate/up and
+down weight rows. Banks below 256 KiB per expert--including the smaller scale
+and global-scale banks--still move as one whole-layer entry. This avoids the
+CUDA runtime behavior in which mixing small entries into a batched registered-
+memory copy can make the call host-synchronous. CUDA-registered sources use
+direct asynchronous copies when the batched runtime entry point is available;
+LOCKED/PAGEABLE layers copy the same selected raw-ID runs through two 32 MiB
+pinned bounce slabs.
+
+The active set is unavailable until the layer's router completes. Sparse mode
+therefore does not eagerly prefetch the next full expert layer and does not use
+the separate prefill hit-D2D optimization. It also introduces one bounded
+device-to-host synchronization per MoE layer. These are explicit scheduling
+tradeoffs: unit parity and reduced planned bytes do not establish a speedup.
+Only the pending full-checkpoint evidence may determine whether the path meets
+the v0.2 latency gate.
+
+The terminal runtime snapshot exports `q38lab.moe_prefill` with:
+
+- `active_rows`: unique raw expert rows summed over MoE prefill layer calls;
+- `possible_rows`: 512 rows for each corresponding layer call;
+- `bytes_copied`: bytes scheduled by the sparse movement plan, including full
+  copies of every small bank;
+- `full_bytes`: the bytes that full-layer movement would have scheduled; and
+- `row_fraction` / `byte_fraction`: ratios derived independently from the two
+  pairs above.
+
+Because small banks remain whole-layer copies, `byte_fraction` is not expected
+to equal `row_fraction`. These are internal movement-accounting counters, not
+substitutes for profiler or driver PCIe measurements.
+
+### Image-only multimodal path
+
+Transformers `5.16.1` is pinned for `AutoProcessor`/`Qwen3VLProcessor`. The
+unverified candidate implementation maps the Qwen4-Exp 27-layer vision tower,
+patch projection, position interpolation, merger, and its BF16 weights. It
+expands image placeholders,
+validates `image_grid_thw`, and builds three-axis interleaved mRoPE plus rope
+delta. Merged visual embeddings replace placeholder embeddings before the
+hidden state is copied into four gated-residual streams.
+
+Each image is encoded once. The complete merged BF16 embedding is then held in
+pageable CPU memory; only the rows intersecting the active 512-token prefill
+chunk are transferred and scattered. Image requests never enter the shared
+text prefix cache. Request cleanup drops source bytes, processor tensors,
+visual embeddings, image spans, and mRoPE state. Video, audio and MTP remain
+explicitly unsupported.
+
+The architecture review was informed by SGLang's
+[Qwen3.8 integration PR #36497](https://github.com/sgl-project/sglang/pull/36497),
+[PLE NVMe PR #36567](https://github.com/sgl-project/sglang/pull/36567), and
+[SM120 QSA PR #36556](https://github.com/sgl-project/sglang/pull/36556). This
+project does not copy their 96 GB launch envelope, MTP/CUDA Graph configuration,
+or benchmark values, and it makes no performance comparison with them.
 
 ## Reproducible WSL environment
 
@@ -206,6 +329,47 @@ inline-dequant backend (the FlashInfer b12x crossover defaults to 1024).
 not turn the run into W4A4. Preserve the startup compatibility warning in the
 test record.
 
+### Candidate 256K/image launch
+
+Run the extended doctor before attempting the candidate profile:
+
+```bash
+q38lab doctor --profile rtx5090-wsl2-256k-image --json
+q38lab serve --profile rtx5090-wsl2-256k-image
+```
+
+The resolved profile must show all of these values without local overrides:
+
+| Field | Required candidate value |
+|---|---:|
+| `max-seq-len` / `num-tokens` | 262,144 |
+| `max-prefill-length` | 512 |
+| `max-running-requests` / TP | 1 / 1 |
+| `memory-ratio` | 0.89 |
+| cache / graph | naive / 0 |
+| attention backend | `qsa_triton_sm120` |
+| PLE backend | native `io_uring` + `O_DIRECT` |
+| PLE LRU / queue / batch | 4 GiB / 512 / 4,096 pages |
+| selector workspace | at most 128 MiB |
+| QSA full-context cache budget | 6.1875 GiB |
+| MoE prefill movement | route-aware native-NVFP4 raw-ID rows; full `[E]` double buffers |
+| vision | enabled |
+
+`doctor` must prove that the source and checkpoint are on the WSL ext4
+filesystem, aligned direct reads work against a real checkpoint shard,
+`io_uring` is enabled for the current process, the native extension imports,
+and the locked-memory/host/GPU budgets are viable. The startup planner reserves
+QSA cache, selector workspace, vision weights, and runtime headroom before
+sizing the MoE expert cache. Do not relax the budget, enable a pagefile inside
+WSL, or switch to mmap to turn a refusal into an apparent pass.
+
+For a transparent fake-IP DNS environment only, rerun `doctor`, `serve`, and
+the evidence harness with the explicit `Q38LAB_DOH_FALLBACK=1` opt-in; it is
+disabled by default. Doctor reports both that setting and the system resolver's
+soft-cancellation limitation: CPython/libc provides no portable hard cancel for
+an in-progress `getaddrinfo`, so the request deadline-bounds a daemon helper and
+caps potentially stuck lookups at four slots instead.
+
 ## API smoke checks
 
 Wait for the ready log, then check lifecycle and resolved runtime metrics:
@@ -277,6 +441,56 @@ curl -fsS http://127.0.0.1:1919/v1/chat/completions \
   }'
 ```
 
+For the unreleased image candidate, the OpenAI request keeps image and text
+parts structured:
+
+```bash
+HTTPS_IMAGE_URL=https://example.org/chart.png
+curl -fsS http://127.0.0.1:1919/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"model\":\"qwen3.8-flash-next-nvfp4\",
+    \"messages\":[{
+      \"role\":\"user\",
+      \"content\":[
+        {\"type\":\"image_url\",\"image_url\":{\"url\":\"$HTTPS_IMAGE_URL\"}},
+        {\"type\":\"text\",\"text\":\"What is the highest value in this chart?\"}
+      ]
+    }],
+    \"temperature\":0,
+    \"max_tokens\":128
+  }"
+```
+
+The unverified candidate API path also handles `data:image/...;base64,...` in
+unit tests; this is not yet a supported input contract. It permits no more than
+four images, 20 MiB per image and 40 MiB total, and applies one ten-second
+request deadline. It rejects local files, HTTP, credentials in URLs, loopback,
+private/link-local/reserved peers, any hostname with a non-public DNS answer,
+rebinding between validation and connect, unsafe redirect hops, invalid MIME
+types, audio, and video. TLS certificate verification and SNI use the original
+hostname while the TCP connection is pinned to an already audited public IP.
+
+The DoH fallback does not weaken those rules. It is considered only when all
+system DNS answers are non-global (the transparent fake-IP case), never for a
+mixed public/non-public answer set or a numeric literal. It connects directly
+to fixed Cloudflare DoH public IPs `1.1.1.1` and `1.0.0.1` while TLS
+authenticates `cloudflare-dns.com`, follows a bounded CNAME chain, and accepts
+only global target addresses. Every redirect is resolved and audited again.
+
+Exercise data URL, caller-selected public HTTPS, four-image, streaming-image,
+and rejection cases with:
+
+```bash
+q38lab smoke --images --https-image-url "$HTTPS_IMAGE_URL"
+```
+
+This is a candidate test surface, not v0.2 release evidence. The authoritative
+harness owns its image fixtures and must also combine a real image with the
+261,120-input-token boundary. An over-limit request returns OpenAI-style
+`context_length_exceeded` detail with separate rendered-text, expanded-image,
+requested-output, and 262,144-total counts.
+
 For the 1, 128, 2K and 8K boundary cases, count the fully rendered chat prompt
 with the checkpoint tokenizer. Prompt tokens plus requested output tokens must
 not exceed 8,192; an "8K prompt" therefore leaves explicit headroom for chat
@@ -296,6 +510,33 @@ ft ctl --json stats
 ```
 
 ## Measurement record
+
+The released v0.1 profile remains reproducible with:
+
+```bash
+q38lab bench --profile rtx5090-wsl2 \
+  --out results/rtx5090-YYYY-MM-DD
+```
+
+After starting the candidate profile, its fail-closed harness is invoked with
+maintainer-owned deterministic image fixtures:
+
+```bash
+q38lab bench --profile rtx5090-wsl2-256k-image \
+  --image-file "$HOME/q38lab-fixtures/chart.png" \
+  --https-image-url "https://example.org/q38lab-chart.png" \
+  --decode-tokens 1024 \
+  --out results/rtx5090-256k-image-YYYY-MM-DD
+```
+
+For the v0.2 profile, both image arguments are mandatory, the HTTPS URL must be
+public and stable for the run, and `--decode-tokens` may be 256 through 1,024.
+The harness reads the exact clean-checkout launch attestation, independently
+tokenizes all boundaries, and fails rather than creating release-compatible
+evidence when a gate or telemetry cross-check is missing. Its
+`environment.json` records whether `Q38LAB_DOH_FALLBACK` was enabled and that
+system `getaddrinfo` hard cancellation is unavailable; these audit fields do
+not count as a passed image or release gate.
 
 Do not hand-maintain benchmark numbers in this document. The authoritative
 record is the newest reviewed `results/rtx5090-<date>/summary.json`; the English
@@ -318,6 +559,15 @@ but never modified, and zero host paging is not claimed. Portable
 evidence marks them unavailable rather than inventing a value. Evidence remains
 non-releasable while `source.release_compatible` is false.
 
+The v0.2 record additionally requires 8K regression, 32K, 128K, and 261,120
+rendered-input cases; exact 1,024-token completion at the text and real-image
+boundary; Needle-in-a-Haystack at multiple depths; deterministic OCR, object,
+and chart answers; one cold plus three warm PLE measurements; and selector,
+PLE, vision, prefill-chunk, and MoE-prefill telemetry. The server snapshot must
+prove that the selector workspace never exceeded 128 MiB, warm PLE lookups
+produce real cache hits rather than a reused client-side result, and the MoE
+movement counters agree with the raw evidence window.
+
 Use `ft ctl --json stats` for FreeToken's TTFT, throughput, request count and
 VRAM fields. Cross-check process RSS/page faults through `/proc/<pid>/status`
 or `pidstat -r`, GPU memory through `nvidia-smi`, and PCIe traffic through an
@@ -325,10 +575,12 @@ NVIDIA profiler or `nvidia-smi dmon`. Sample throughout the run rather than
 only before and after it. For example, this records framebuffer memory and
 PCIe receive/transmit throughput once per second:
 
-The current control API does not expose the internal MoE cache hit/miss
-counters, so do not report a hit rate for this milestone. Record the resolved
-cache geometry from startup and mark hit rate as unavailable until telemetry is
-added rather than inferring it from PCIe traffic.
+For the candidate profile, `ft ctl --json stats` exposes the last terminal
+`q38lab.moe_prefill` snapshot. Check `0 <= active_rows <= possible_rows`,
+`0 <= bytes_copied <= full_bytes`, and independently recompute both fractions.
+The snapshot describes route-aware prefill movement, not decode-cache hit/miss
+rate; continue to mark an unexported decode hit rate as unavailable rather than
+inferring it from PCIe traffic.
 
 ```bash
 mkdir -p "$HOME/qwen4-exp-metrics"
@@ -338,41 +590,66 @@ nvidia-smi dmon -i 0 -s mt -d 1 -o DT \
 
 ## Acceptance
 
-Do not mark this model supported until all of the following are true on the
-pinned full checkpoint:
+### Recorded v0.1 boundary
 
-- CPU/reference parity, tiny-model prefill/decode parity, weight-map and cache
-  reuse tests pass, followed by `python -m pytest -m 'not slow'` and the GPU
-  QSA/cache tests.
-- Before CUDA graphs are enabled, PLE row staging, request-local token/conv
-  state, and QSA all pass fixed-address capture/replay parity on the target
-  GPU; the initial `--graph 0` run does not satisfy that later optimization
-  milestone by itself.
-- The loader skips `model.visual.*` and `mtp.*`, maps the routed NVFP4 experts
-  to expert offload, and never materializes the full PLE table on the GPU.
-- A real W4A4 expert path consumes the checkpoint's activation-scale contract
-  and passes CPU-oracle plus SM120 prefill/decode parity. Until then, W4A16
-  compatibility measurements are experimental evidence only and this model
-  must not be listed as formally supported.
-- Greedy 1, 128, 2K and 8K-boundary requests pass; thinking on/off, tool calls,
-  streaming and non-streaming agree.
-- Peak VRAM is below 31GiB, WSL RSS below 105GiB, `swapon --show` stays empty,
-  and no Windows pagefile is used as an escape hatch.
-- One hundred sequential requests or a continuous 30-minute run finishes with
-  no crash, OOM or monotonic memory growth.
-- Three cold starts and three warm-ups plus ten measured requests have recorded
-  TTFT, prefill/decode throughput, PCIe traffic, page faults, RSS and VRAM.
+The reviewed run satisfies the first text-only hardware milestone: the pinned
+full checkpoint, 8K, one request, TP=1, naive cache, graph disabled, W4A16
+compatibility, 100/100 sequential requests, and a 30-minute run within the
+recorded resource gates. It does not validate image input or context beyond
+8K. The WSL `swap=0` condition is proven, but a stronger claim that no host
+pagefile existed or was touched is not: the pre-existing Windows pagefile had
+non-zero aggregate system usage. Keep that caveat with every quoted v0.1
+result.
 
-Vision/image support belongs to a later branch. Until its processor, media
-transport, vision prefill and cache semantics exist, media requests are outside
-this integration's supported input contract and no media result is valid.
+### Required before v0.2 release
 
-The recorded run satisfies the first text-only hardware milestone, including
-the 8K and stability resource gates.  It remains experimental rather than a
-formal supported-model claim because W4A4 execution, graph-mode parity, MTP and
-multimodal serving are deliberately outside this result.
+Do not update the support matrix, tag `v0.2.0-alpha.1`, or publish a v0.2
+prerelease until all of the following are true on the pinned full checkpoint:
 
-The WSL `swap=0` condition is proven.  A stronger claim that no host pagefile
-existed or was touched is not proven because the pre-existing Windows pagefile
-had non-zero aggregate system usage; keep that caveat with any published
-benchmark result.
+- CPU oracles cover compressed QSA cache, four-token tails, top-512 at 65,536
+  compressed blocks, chunk continuity, PLE hash/direct-read/LRU/prefetch/GPU
+  decode, vision tower and merger, placeholder expansion, mRoPE, chunk scatter,
+  request cleanup, and media security. Triton/CUDA and vision results match
+  their PyTorch/Transformers references within dtype-appropriate tolerances.
+- `python -m pytest -m 'not slow'`, the native direct-I/O tests, and target-GPU
+  QSA/cache tests have zero failures and do not regress below the reviewed v0.1
+  non-slow count. The native PLE probe samples the first and last row of all
+  128 pinned shards plus eight deterministic bigram/trigram hash hits, and each
+  GPU-decoded result exactly matches an independent safetensors slice. Loader
+  mappings include the visual tensors while still excluding MTP.
+- The 8K regression plus 32K, 128K and 261,120 rendered-input prompts pass. A
+  text request and a request containing a real image each produce exactly
+  1,024 output tokens, proving the total `261,120 + 1,024 = 262,144` boundary.
+  A one-token excess returns `context_length_exceeded` with correct component
+  counts rather than truncating silently.
+- Needle-in-a-Haystack passes at documented depths, and deterministic OCR,
+  object, and chart fixtures return their expected answers. Streaming and
+  non-streaming agree; thinking modes, tools, images, and tools plus images all
+  complete normally.
+- HTTPS/data URL, four-image and streaming-image smoke cases pass. Local/HTTP,
+  loopback/private/link-local/reserved endpoints, DNS rebinding, unsafe
+  redirects, over-size payloads, timeouts, bad MIME, audio, and video all fail
+  with the expected client-classifiable errors.
+- Client-observed TTFT for 261K is at most 15 minutes. An exact 256--1,024-token
+  steady completion reaches at least 5 tok/s and ends for `length`, not EOS or
+  an error.
+- Peak VRAM is below 31 GiB, WSL RSS below 105 GiB, and WSL swap remains zero.
+  The Windows pagefile is recorded and no claim of completely absent host
+  paging is made.
+- All 100 mixed short text/image sequential requests succeed, followed by at
+  least 30 minutes of continuing alternating text/image requests with no crash,
+  OOM, stale media state, or monotonic resource growth.
+- At least one cold and three warm PLE measurements record real storage I/O,
+  LRU hits/misses, wait time and page faults. Evidence also records selector
+  workspace peak, image tokens, vision latency, prefill chunk count/timing,
+  route-aware MoE active/possible rows and copied/full bytes, RSS, VRAM, and
+  PCIe availability, with JSON-to-raw-log cross-checks. Whole-layer small-bank
+  copies must remain represented in the byte counters.
+- The English README benchmark table is regenerated from the reviewed
+  `summary.json`; the evidence archive, SBOM and checksums are regenerated from
+  the same clean commit. No wheel, container, or model weight is released.
+
+CUDA Graph, radix cache, video, audio, MTP, TP>1, concurrent requests, native
+W4A4 parity, and contexts beyond 262,144 remain outside this candidate. Graph
+mode may only be considered after separate fixed-address QSA/PLE capture and
+replay parity on the target stack.

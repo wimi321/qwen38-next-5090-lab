@@ -19,7 +19,10 @@ fastest implementation.
 
 ![Qwen3.8 Next 5090 Lab architecture](docs/assets/q38lab-architecture.svg)
 
-## Verified alpha contract
+The diagram shows the unreleased v0.2 candidate. The verified v0.1 path omits
+the vision branch and uses mmap/CPU PLE decoding as described below.
+
+## Verified v0.1 contract
 
 | Area | `v0.1.0-alpha.1` contract |
 |---|---|
@@ -36,17 +39,70 @@ packed NVFP4 weights but does not consume the checkpoint's activation-scale
 contract; measurements here therefore describe W4A16 compatibility, not W4A4
 quality or numerical parity.
 
-## Why it fits
+## v0.2 candidate: 256K plus images
 
-- **PLE stays sparse.** The approximately 51 GB FP8 PLE table is read-only
-  safetensors mmap. Only matched rows are copied and decoded to FP32 on the CPU,
-  scaled, converted into pinned BF16 staging, and then transferred to the GPU.
+The current development branch contains the `0.2.0a1` source candidate for
+`v0.2.0-alpha.1`. It is **not a released or hardware-validated support claim**.
+The verified support matrix remains the v0.1 table above until one evidence run
+passes every v0.2 gate on the pinned full checkpoint.
+
+| Candidate area | Unverified `v0.2.0-alpha.1` target (hardware harness pending) |
+|---|---|
+| Context accounting | 262,144 total tokens, including rendered text, expanded image tokens, and output |
+| Boundary proof | Exactly 261,120 input tokens plus 1,024 generated tokens, once for text and once with a real image |
+| Hardware / scheduling | One RTX 5090 (32 GB), WSL2, TP=1, one running request, 512-token prefill chunks |
+| Cache / graphs | Naive cache, radix prefix reuse off, CUDA graph off |
+| Images | Structured OpenAI `image_url`; HTTPS or base64 data URL; up to four images |
+| Still excluded | Video, audio, MTP, radix cache, TP>1, multi-request scheduling, and context beyond 262,144 |
+
+The candidate profile is:
+
+```bash
+q38lab doctor --profile rtx5090-wsl2-256k-image
+q38lab serve --profile rtx5090-wsl2-256k-image
+q38lab smoke --images
+```
+
+Do not use this section as evidence that the commands have passed the full
+model gates. Release requires the exact text and image boundary requests,
+Needle-in-a-Haystack and deterministic image cases, 100/100 mixed sequential
+requests, a 30-minute soak, TTFT at or below 15 minutes, steady decode at or
+above 5 tok/s, peak VRAM below 31 GiB, WSL RSS below 105 GiB, and WSL swap at
+zero. No v0.2 performance number is published before those raw records exist.
+
+## Execution paths
+
+- **PLE stays sparse.** The verified v0.1 path keeps the approximately 51 GB
+  FP8 table in a read-only safetensors mmap and decodes only matched rows on the
+  CPU. The v0.2 candidate instead requires native Linux `io_uring` plus
+  `O_DIRECT`, a globally bounded 4 GiB native LRU, 4 KiB-aligned reads, queue
+  depth 512, and batches of at most 4,096 pages. Double-buffered pinned FP8 rows
+  are transferred and decoded/scaled to BF16 on the GPU; the mmap path remains
+  only a test/debug fallback for this profile.
 - **QSA has its own cache path.** Twelve sparse-attention layers select from
-  four-token blocks and keep main K/V plus index-key state; the other 36 layers
-  use gated delta recurrence.
+  four-token blocks; the v0.2 candidate stores one persistent index key per
+  four tokens plus a request-local tail ring and mRoPE coordinates. Its full
+  256K main K/V and compressed-index budget is 6.1875 GiB. The SM120 selector
+  uses a bounded 128 MiB FP32 workspace and top-512 kernel, with the Torch
+  oracle and original Triton path retained as correctness fallbacks.
 - **Experts span the memory hierarchy.** The 512 routed experts per layer use
   top-10 routing, pageable CPU layers, pinned host banks, PCIe transfers, and a
-  GPU expert cache. The shared expert remains part of every layer.
+  GPU expert cache. The shared expert remains part of every layer. The v0.2
+  candidate additionally enables route-aware native-NVFP4 prefill movement:
+  after the current layer's router runs, a bounded 512-entry mask identifies
+  the selected raw expert IDs. Coalesced selected rows are copied for banks
+  whose per-expert row is at least 256 KiB; smaller banks are copied as one
+  whole-layer entry so the batched CUDA copy remains asynchronous. Raw IDs and
+  the full `[E]` double-buffer layout are preserved--there is no expert-ID
+  compaction and no reduction in the reserved GPU buffer size. Registered
+  banks use direct DMA when available, while LOCKED/PAGEABLE layers use the
+  fixed pair of 32 MiB pinned bounce slabs.
+- **Images enter before residual replication.** The candidate loads the 27-layer
+  vision tower, expands image placeholders with the pinned Transformers
+  processor, constructs three-axis interleaved mRoPE, and injects merged visual
+  embeddings before copying the four gated-residual streams. Each image is
+  encoded once; its CPU-resident BF16 embedding is sliced and transferred only
+  where a 512-token prefill chunk intersects the image span.
 - **Evidence is a release artifact.** Environment, resolved configuration,
   request timings, RSS/VRAM/page-fault/PCIe samples, tests, and checksums are
   stored together. README figures are generated from the recorded summary.
@@ -112,10 +168,33 @@ unauthenticated non-loopback bind unless the caller supplies
 `--unsafe-allow-non-loopback`. That flag adds no authentication or TLS; do not
 expose this development server directly to a network.
 
-Check it with the bundled smoke suite:
+The unreleased 256K/image candidate uses a separate profile and refuses to
+start if native `io_uring`/`O_DIRECT` or the memory budget is unavailable:
 
 ```bash
-q38lab smoke
+q38lab serve --profile rtx5090-wsl2-256k-image
+```
+
+That profile resolves to `max-seq-len=num-tokens=262144`,
+`max-prefill-length=512`, `max-running-requests=1`, `qsa_triton_sm120`, naive
+cache, graph disabled, native PLE streaming, vision loading, and route-aware
+native-NVFP4 MoE prefill. The sparse MoE path requires the existing
+double-buffered prefill cache and refuses any non-native NVFP4 bank layout. It
+deliberately waits for the current layer's routing decision instead of eagerly
+prefetching the next full expert layer, and it disables the separate prefill
+hit-D2D path. Those tradeoffs are why its net performance remains an evidence
+question, not a source-level claim. The profile reserves QSA cache, selector
+workspace, vision weights, and runtime headroom before automatically sizing the
+GPU expert cache; it fails closed if the fixed geometry cannot fit the resolved
+0.89 planning budget. The separate evidence gate, not this arithmetic alone,
+enforces the strict peak-VRAM result below 31 GiB.
+
+Exercise the unverified candidate test surface with a maintainer-selected
+public HTTPS fixture; this smoke command is not release evidence:
+
+```bash
+HTTPS_IMAGE_URL='https://replace-with-your-public-fixture.example/chart.png'
+q38lab smoke --images --https-image-url "$HTTPS_IMAGE_URL"
 ```
 
 Or call it with the OpenAI client:
@@ -133,6 +212,46 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+The v0.2 source candidate contains an unverified image-input path through the
+same API. This example shows only the request shape, not a published validation
+result or a supported input contract:
+
+```python
+response = client.chat.completions.create(
+    model="qwen3.8-flash-next-nvfp4",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.org/chart.png"}},
+            {"type": "text", "text": "What is the chart's highest value?"},
+        ],
+    }],
+    temperature=0,
+    max_tokens=128,
+)
+```
+
+The candidate implementation is limited to HTTPS and base64 image data URLs;
+these limits are not hardware-validation results. It caps a
+request at four images, 20 MiB per image and 40 MiB total, with a ten-second
+fetch deadline. It rejects HTTP/local URLs, loopback, private, link-local or
+reserved addresses, unsafe redirects, DNS rebinding, unsupported MIME types,
+audio, and video. Requests containing images cannot enter the shared text
+prefix cache, and media bytes, visual embeddings, and mRoPE state are released
+with the request.
+
+`Q38LAB_DOH_FALLBACK=1` is an explicit compatibility opt-in only for WSL/TUN
+setups whose transparent fake-IP DNS returns non-global addresses for every
+public host; it is disabled by default. The fallback connects to fixed
+Cloudflare DoH public IPs `1.1.1.1` and `1.0.0.1` while authenticating
+`cloudflare-dns.com` with TLS SNI, and it still rejects every non-global target
+answer. Mixed public/non-public system answers and numeric IP literals never
+use the fallback. `doctor --json` and release evidence record whether the
+opt-in was enabled and that libc `getaddrinfo` has only deadline-bounded,
+four-slot soft cancellation—there is no portable hard cancel for a lookup
+already running in libc. This compatibility path does not make the v0.2
+candidate verified or relax any evidence gate.
+
 For a streaming request, add `stream=True` and iterate over the returned chunks.
 The smoke suite also covers both thinking modes and one schema-constrained tool
 call; model output is not a security boundary, so applications must still
@@ -141,7 +260,8 @@ validate tool names and arguments.
 ## Reproduce the evidence
 
 ```bash
-q38lab bench --out results/rtx5090-YYYY-MM-DD
+q38lab bench --profile rtx5090-wsl2 \
+  --out results/rtx5090-YYYY-MM-DD
 ```
 
 This is the authoritative release harness, not a quick microbenchmark. It
@@ -182,18 +302,59 @@ decode measurement.
 See [the full procedure and caveats](docs/qwen4-exp.md) before quoting any
 result.
 
+The v0.2 harness is profile-aware and additionally records bounded selector
+workspace use, PLE bytes/cache/wait/page-fault telemetry, image-token and vision
+latency, per-chunk prefill timing, and route-aware MoE prefill counters. The
+`q38lab.moe_prefill` snapshot reports unique active rows summed over layer
+calls, the corresponding 512-row opportunities, bytes actually scheduled for
+copy, and the hypothetical full-bank bytes. Because sub-256-KiB banks move as
+whole-layer entries, its byte fraction is intentionally distinct from its row
+fraction; these are movement-accounting counters, not invented hardware PCIe
+measurements. The launch attestation also carries a native PLE checkpoint
+probe: every one of the 128 shard boundaries plus eight deterministic
+bigram/trigram hash rows must match independent safetensors slices after GPU
+FP8 decode. A v0.2 evidence directory is not
+release-compatible unless it contains both 261,120 + 1,024 boundary proofs and
+passes every resource, throughput, mixed-request, and soak gate. Until such a
+reviewed directory exists, the generated benchmark block above intentionally
+remains the v0.1 result.
+
+The candidate evidence entry point requires both a deterministic local image
+and a stable public HTTPS fixture:
+
+```bash
+q38lab bench --profile rtx5090-wsl2-256k-image \
+  --image-file "$HOME/q38lab-fixtures/chart.png" \
+  --https-image-url "https://example.org/q38lab-chart.png" \
+  --decode-tokens 1024 \
+  --out results/rtx5090-256k-image-YYYY-MM-DD
+```
+
+Both image arguments are mandatory for this profile. The 30-minute soak keeps
+alternating text and image requests so image-only leaks cannot hide behind a
+later text-only plateau. The decode budget may be
+256–1,024 tokens; the harness rejects a missing gate, dirty launch attestation,
+or telemetry mismatch instead of emitting release-compatible evidence. When a
+transparent fake-IP environment requires the DoH opt-in, use the same
+`Q38LAB_DOH_FALLBACK=1` setting for `doctor`, `serve`, and `bench`; its value and
+the system-resolver soft-cancellation limitation are preserved in the evidence.
+
 ## Project status
 
-This alpha is intentionally narrow. The next milestones are:
+The verified v0.1 alpha is intentionally narrow. The unreleased v0.2 source
+contains the 256K/image candidate paths described above, but they remain
+unverified and outside the support matrix until the full hardware gate passes.
+Later milestones are:
 
 1. End-to-end reference parity and a native SM120 W4A4 activation path.
-2. PLE telemetry/hot-row caching and verified CUDA graph capture/replay.
-3. Image support with a processor, media transport, vision prefill, mRoPE, and
-   safe cache semantics.
+2. PLE hot-row optimization and verified QSA/PLE CUDA graph capture/replay.
+3. Video/audio evaluation, MTP, radix-cache semantics, and contexts beyond the
+   single-request 262,144-token candidate.
 
-Media is rejected today. A multimodal checkpoint does not make this server
-multimodal: the online request layer, vision tower, placeholder expansion, and
-media-aware cache behavior must all be implemented and tested first.
+The v0.1 profile continues to reject media. Source code alone also does not make
+the v0.2 profile supported: the online image path, vision tower, placeholder
+expansion, mRoPE, chunk scatter, cleanup, and security controls must pass the
+recorded full-checkpoint gates before the support matrix changes.
 
 ## Provenance, contributing, and citation
 
@@ -201,6 +362,15 @@ This downstream preserves the full FreeToken history and is based on audited
 upstream commit `9ef3651309fe4058672f2cc92069238dea06be1b`. See
 [MODIFICATIONS.md](MODIFICATIONS.md) for the downstream changes and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for retained attribution.
+The v0.2 SM120 top-512 specialization is an Apache-2.0 adaptation from
+[`yhfgyyf/sglang-qwen38-flash-next-sm120`](https://github.com/yhfgyyf/sglang-qwen38-flash-next-sm120)
+at exact source commit `30edf3503961a471b25150aa890f8166031b5738`.
+The design review also references SGLang's
+[Qwen3.8 integration PR #36497](https://github.com/sgl-project/sglang/pull/36497),
+[PLE NVMe PR #36567](https://github.com/sgl-project/sglang/pull/36567), and
+[SM120 QSA PR #36556](https://github.com/sgl-project/sglang/pull/36556).
+Those projects and results do not endorse this downstream, and their 96 GB,
+MTP, or CUDA Graph settings and measurements are not results of this project.
 
 Contributions must be understood and tested by a human maintainer; model weights,
 private logs, fabricated benchmarks, and unreviewed agent-only submissions are

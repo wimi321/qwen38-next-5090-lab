@@ -37,7 +37,9 @@
         "torch": {"type": ["string", "null"]},
         "torch_cuda": {"type": ["string", "null"]},
         "triton": {"type": ["string", "null"]},
-        "cuda_runtime_probe": {"type": "boolean"}
+        "cuda_runtime_probe": {"type": "boolean"},
+        "media_doh_fallback_enabled": {"type": "boolean"},
+        "media_system_dns_hard_cancel_supported": {"type": "boolean"}
       }
     }
   }

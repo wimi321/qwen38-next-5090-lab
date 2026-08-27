@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -17,6 +18,115 @@ import evidence  # noqa: E402
 
 
 RUNTIME_COMMIT = "1" * 40
+
+
+def ple_probe_report() -> dict[str, object]:
+    digest = "a" * 64
+    shards = []
+    records = []
+    for index in range(128):
+        start = index * 10
+        end = start + 10
+        tensor_name = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            f"ngram_embedding.shard_{index}.weight"
+        )
+        shards.append({
+            "index": index,
+            "tensor_name": tensor_name,
+            "file_name": f"model-{index + 1:05d}-of-00206.safetensors",
+            "shape": [10, 2],
+            "dtype": "F8_E4M3",
+            "global_start": start,
+            "global_end": end,
+        })
+        for label, row in (("first", start), ("last", end - 1)):
+            summary = {"sha256": digest, "shape": [2], "dtype": "float32", "numel": 2}
+            records.append({
+                "kind": "boundary",
+                "label": f"shard-{index}-{label}",
+                "tensor_name": tensor_name,
+                "tensor_shape": [10, 2],
+                "global_row": row,
+                "shard_index": index,
+                "shard_row": row - start,
+                "storage_dtype": "F8_E4M3",
+                "ground_truth": dict(summary),
+                "auxiliary_bank": dict(summary),
+                "match": True,
+            })
+    for index in range(8):
+        shard_index = index
+        tensor_name = shards[shard_index]["tensor_name"]
+        summary = {"sha256": digest, "shape": [2], "dtype": "float32", "numel": 2}
+        records.append({
+            "kind": "hash",
+            "label": f"hash-{index}",
+            "tensor_name": tensor_name,
+            "tensor_shape": [10, 2],
+            "global_row": shard_index * 10 + 3,
+            "shard_index": shard_index,
+            "shard_row": 3,
+            "storage_dtype": "F8_E4M3",
+            "ground_truth": dict(summary),
+            "auxiliary_bank": dict(summary),
+            "match": True,
+            "hash_token_position": index,
+            "hash_head": 0 if index < 4 else 8,
+        })
+    unique_rows = {int(record["global_row"]) for record in records}
+    return {
+        "schema_version": "1.0",
+        "status": "pass",
+        "release_qualified": True,
+        "checkpoint": {
+            "model_dir_basename": "qwen38-flash-next-nvfp4-7b71922",
+            "config_sha256": "b" * 64,
+            "index_sha256": "c" * 64,
+        },
+        "runtime": {
+            "gpu_name": "NVIDIA GeForce RTX 5090",
+            "compute_capability": "12.0",
+            "wsl2": True,
+            "backend": "io_uring_odirect",
+            "device": "cuda",
+            "gpu_fp8_decode_attested": True,
+        },
+        "loader_mapping": {
+            "checkpoint_layer_id": 1,
+            "normal_state_dict_action": "skip",
+            "normal_state_dict_mapped_name": None,
+            "auxiliary_bank": "ShardedSafetensorsMmapRowBank",
+            "scale_tensor_name": "scale",
+            "scale_shape": [1],
+            "scale_dtype": "F32",
+            "shards": shards,
+        },
+        "coverage": {
+            "sample_count": len(records),
+            "unique_row_count": len(unique_rows),
+            "shard_count": 128,
+            "all_shard_first_rows": True,
+            "all_shard_last_rows": True,
+            "global_first_row": True,
+            "global_last_row": True,
+            "hash_sample_count": 8,
+            "hash_fixture_token_count": 8,
+            "hash_fixture_tokens_sha256": "d" * 64,
+            "bigram_and_trigram_heads": True,
+        },
+        "io": {
+            "storage_bytes": 4096,
+            "cache_hit_pages": 0,
+            "cache_miss_pages": 1,
+            "submission_batches": 1,
+            "submitted_sqes": 1,
+            "gpu_decoded_rows": len(unique_rows),
+            "mapped_bytes": 0,
+            "payload_bytes_read": len(unique_rows) * 2,
+        },
+        "records": records,
+    }
 
 
 def write_release_bundle(directory: Path) -> None:
@@ -42,6 +152,8 @@ def write_release_bundle(directory: Path) -> None:
         "torch_cuda": "13.0",
         "triton": "3.6.0",
         "cuda_runtime_probe": True,
+        "media_doh_fallback_enabled": False,
+        "media_system_dns_hard_cancel_supported": False,
     })
     evidence.write_json(directory / "environment.json", environment)
 
@@ -272,6 +384,395 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.EvidenceError, "below 31 GiB"):
             evidence.validate_directory(self.directory, release=True)
 
+    def test_v02_summary_contract_requires_256k_images_and_runtime_telemetry(self) -> None:
+        write_release_bundle(self.directory)
+        summary = evidence.read_json(self.directory / "summary.json")
+        summary["execution"] = dict(evidence.EXPECTED_EXECUTION_V02)
+        summary["gates"]["prompt_cases"] = [
+            {
+                "content_prompt_tokens": target - 12,
+                "rendered_prompt_tokens": target,
+                "completion_tokens": 8,
+                "ttft_p50_ms": 10.0,
+                "ttft_p95_ms": 10.0,
+                "total_p50_ms": 20.0,
+                "total_p95_ms": 20.0,
+            }
+            for target in evidence.V02_PROMPT_TARGETS
+        ]
+        summary["gates"]["steady_decode"]["decode_tokens_per_second"] = 5.0
+        summary["gates"]["api"] = {key: True for key in evidence.V02_REQUIRED_API_GATES}
+        summary["gates"]["boundary"] = {
+            "input_tokens": 261120, "output_tokens": 1024, "total_tokens": 262144,
+            "text_completed": True, "image_completed": True,
+            "image_tokens": 64, "text_tokens": 261056,
+        }
+        summary["gates"]["long_context_ttft_ms"] = 900000
+        summary["gates"]["niah"] = {
+            "attempted": 4, "succeeded": 4,
+            "depths": list(evidence.V02_NIAH_DEPTHS),
+        }
+        summary["gates"]["vision_quality"] = {
+            "ocr": True, "object": True, "chart": True,
+        }
+        summary["telemetry"] = {
+            "selector": {
+                "workspace_peak_bytes": 128 * 1024**2,
+                "native_calls": 1,
+                "fallback_calls": 0,
+                "errors": 0,
+            },
+            "ple": {"cold_runs": 1, "warm_runs": 3, "bytes_read": 1,
+                    "cache_hits": 1, "cache_misses": 1, "wait_ms": 1, "page_faults": 0},
+            "vision": {"image_tokens": 64, "latency_ms": 1},
+            "prefill_chunks": {"count": 512, "total_ms": 1},
+            "moe_prefill": {
+                "active_rows": 1024,
+                "possible_rows": 4096,
+                "bytes_copied": 4000,
+                "full_bytes": 10000,
+                "row_fraction": 0.25,
+                "byte_fraction": 0.4,
+            },
+        }
+        evidence._validate_summary(summary, release=True)
+
+        summary["telemetry"]["ple"]["warm_runs"] = 2
+        with self.assertRaisesRegex(evidence.EvidenceError, "one cold and three warm"):
+            evidence._validate_summary(summary, release=True)
+        summary["telemetry"]["ple"]["warm_runs"] = 3
+        summary["telemetry"]["selector"]["fallback_calls"] = 1
+        with self.assertRaisesRegex(evidence.EvidenceError, "zero fast-topk fallbacks"):
+            evidence._validate_summary(summary, release=True)
+        summary["telemetry"]["selector"]["fallback_calls"] = 0
+        summary["telemetry"]["moe_prefill"]["active_rows"] = 4097
+        with self.assertRaisesRegex(evidence.EvidenceError, "cannot exceed possible_rows"):
+            evidence._validate_summary(summary, release=True)
+        summary["telemetry"]["moe_prefill"]["active_rows"] = 1024
+        summary["telemetry"]["moe_prefill"]["row_fraction"] = 0.5
+        with self.assertRaisesRegex(evidence.EvidenceError, "does not match"):
+            evidence._validate_summary(summary, release=True)
+
+    def test_moe_prefill_telemetry_contract_rejects_invalid_counts_and_ratios(self) -> None:
+        telemetry = {
+            "active_rows": 128,
+            "possible_rows": 512,
+            "bytes_copied": 400,
+            "full_bytes": 1000,
+            "row_fraction": 0.25,
+            "byte_fraction": 0.4,
+        }
+        self.assertIs(
+            evidence.validate_moe_prefill_telemetry(telemetry), telemetry
+        )
+
+        mutations = (
+            ("active_rows", 128.0, "non-negative integer"),
+            ("possible_rows", True, "non-negative integer"),
+            ("bytes_copied", -1, "non-negative integer"),
+            ("active_rows", 513, "cannot exceed possible_rows"),
+            ("bytes_copied", 1001, "cannot exceed full_bytes"),
+            ("row_fraction", 1.01, r"\[0, 1\]"),
+            ("byte_fraction", float("nan"), r"\[0, 1\]"),
+            ("row_fraction", 0.3, "does not match"),
+            ("byte_fraction", 0.5, "does not match"),
+        )
+        for key, value, message in mutations:
+            with self.subTest(key=key, value=value):
+                candidate = dict(telemetry)
+                candidate[key] = value
+                with self.assertRaisesRegex(evidence.EvidenceError, message):
+                    evidence.validate_moe_prefill_telemetry(candidate)
+
+        zero = {
+            "active_rows": 0,
+            "possible_rows": 0,
+            "bytes_copied": 0,
+            "full_bytes": 0,
+            "row_fraction": 0.0,
+            "byte_fraction": 0.0,
+        }
+        evidence.validate_moe_prefill_telemetry(zero)
+        zero["row_fraction"] = 0.000001
+        with self.assertRaisesRegex(evidence.EvidenceError, "does not match"):
+            evidence.validate_moe_prefill_telemetry(zero)
+
+    def test_v02_summary_rejects_slow_decode_and_long_ttft(self) -> None:
+        write_release_bundle(self.directory)
+        summary = evidence.read_json(self.directory / "summary.json")
+        summary["execution"] = dict(evidence.EXPECTED_EXECUTION_V02)
+        summary["gates"]["prompt_cases"] = [
+            {"rendered_prompt_tokens": target, "content_prompt_tokens": target - 12}
+            for target in evidence.V02_PROMPT_TARGETS
+        ]
+        summary["gates"]["api"] = {key: True for key in evidence.V02_REQUIRED_API_GATES}
+        summary["gates"]["boundary"] = {
+            "input_tokens": 261120, "output_tokens": 1024, "total_tokens": 262144,
+            "text_completed": True, "image_completed": True,
+            "image_tokens": 1, "text_tokens": 261119,
+        }
+        summary["gates"]["long_context_ttft_ms"] = 1
+        summary["gates"]["niah"] = {
+            "attempted": 4, "succeeded": 4,
+            "depths": list(evidence.V02_NIAH_DEPTHS),
+        }
+        summary["gates"]["vision_quality"] = {
+            "ocr": True, "object": True, "chart": True,
+        }
+        summary["gates"]["steady_decode"]["decode_tokens_per_second"] = 4.999
+        summary["telemetry"] = {
+            "selector": {
+                "workspace_peak_bytes": 128 * 1024**2,
+                "native_calls": 1,
+                "fallback_calls": 0,
+                "errors": 0,
+            },
+            "ple": {"cold_runs": 1, "warm_runs": 3, "bytes_read": 1,
+                    "cache_hits": 1, "cache_misses": 1, "wait_ms": 1, "page_faults": 0},
+            "vision": {"image_tokens": 1, "latency_ms": 1},
+            "prefill_chunks": {"count": 512, "total_ms": 1},
+            "moe_prefill": {
+                "active_rows": 1024,
+                "possible_rows": 4096,
+                "bytes_copied": 4000,
+                "full_bytes": 10000,
+                "row_fraction": 0.25,
+                "byte_fraction": 0.4,
+            },
+        }
+        with self.assertRaisesRegex(evidence.EvidenceError, "at least 5 tok/s"):
+            evidence._validate_summary(summary, release=True)
+
+    def test_v02_release_crosschecks_raw_image_boundary_and_telemetry(self) -> None:
+        write_release_bundle(self.directory)
+        config = evidence.read_json(self.directory / "resolved-config.json")
+        config["profile"] = evidence.PROFILE_V02
+        config["settings"] = dict(evidence.EXPECTED_SETTINGS_V02)
+        evidence.write_json(self.directory / "resolved-config.json", config)
+
+        rows = [
+            json.loads(line)
+            for line in (self.directory / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        rows = [row for row in rows if not row["case"].startswith("prompt-")]
+        for index, row in enumerate(item for item in rows if item["case"] == "stability"):
+            row["proof"] = {"image": bool(index % 2)}
+        for index, row in enumerate(item for item in rows if item["case"] == "soak"):
+            row["proof"] = {"image": bool(index % 2)}
+
+        template = dict(rows[0])
+        def add(case: str, iteration: int = 0, *, stream: bool = False,
+                status: int = 200, prompt: int = 10, completion: int = 1,
+                proof: dict | None = None, warmup: bool = False,
+                started: float = 1.0) -> None:
+            item = dict(template)
+            item.update({
+                "case": case, "iteration": iteration, "warmup": warmup, "stream": stream,
+                "success": True, "http_status": status, "prompt_tokens": prompt,
+                "completion_tokens": completion, "content_tokens": prompt - 12,
+                "ttft_ms": 1.0 if stream else None, "total_ms": 10.0,
+                "started_elapsed_s": started, "finished_elapsed_s": started + 0.01,
+                "proof": dict(proof or {}),
+            })
+            rows.append(item)
+
+        digest = "d" * 64
+        add("image-data-url", proof={"image_count": 1})
+        add("image-https", proof={"https": True})
+        add("image-four", proof={"image_count": 4})
+        add("image-stream-parity", 0, proof={"text_sha256": digest})
+        add("image-stream-parity", 1, stream=True, proof={"text_sha256": digest})
+        add("image-security-rejections", status=400, proof={"attempted": 4, "passed": 4})
+        add("context-length-rejection", status=400, prompt=261120,
+            proof={"error_code": "context_length_exceeded"})
+        for kind in ("ocr", "object", "chart"):
+            add(f"image-{kind}-quality", proof={
+                "answer_match": True,
+                "fixture_sha256": "c" * 64,
+                "answer_sha256": "d" * 64,
+            })
+        add("image-thinking", proof={
+            "reasoning_present": True,
+            "visible_text_present": True,
+            "answer_match": True,
+            "fixture_sha256": "c" * 64,
+        })
+        add("image-tool-call", proof={
+            "tool_name": "report_access_code",
+            "answer_match": True,
+            "arguments_sha256": "e" * 64,
+            "fixture_sha256": "c" * 64,
+        })
+        add("ple-cold", proof={"phase": "cold"}, started=0.5)
+        for iteration in (1, 2, 3):
+            add(
+                "ple-warm", iteration, proof={"phase": "warm"},
+                warmup=True, started=0.5 + iteration * 0.02,
+            )
+        for target, depth in zip(evidence.V02_PROMPT_TARGETS, evidence.V02_NIAH_DEPTHS):
+            add(f"prompt-{target}", stream=True, prompt=target, proof={
+                "needle_depth": depth,
+                "needle_found": True,
+                "expected_code_sha256": "f" * 64,
+                "answer_sha256": "a" * 64,
+            })
+        add("boundary-text", stream=True, prompt=261120, completion=1024,
+            proof={"finish_reason": "length"})
+        add("boundary-image", stream=True, prompt=261120, completion=1024,
+            proof={
+                "finish_reason": "length", "image_count": 1,
+                "image_tokens": 64, "text_tokens": 261056,
+                "runtime_image_tokens_delta": 64,
+            })
+        (self.directory / "requests.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+        )
+        with (self.directory / "latency.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = ["case", "iteration", "prompt_tokens", "completion_tokens", "ttft_ms", "total_ms"]
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows({key: row[key] for key in fields} for row in rows if not row["warmup"])
+
+        samples = []
+        for index, phase in enumerate(
+            ("baseline", "cold", "warm-1", "warm-2", "warm-3", "final")
+        ):
+            samples.append({
+                "phase": phase,
+                "selector": {
+                    "workspace_peak_bytes": 128 * 1024**2,
+                    "native_calls": index,
+                    "fallback_calls": 0,
+                    "errors": 0,
+                },
+                "ple": {
+                    "bytes_read": 0 if index == 0 else (100 if index < 5 else 500),
+                    "cache_hits": max(0, min(index - 1, 3)),
+                    "cache_misses": 0 if index == 0 else (1 if index < 5 else 5),
+                    "wait_ms": index, "page_faults": 0,
+                },
+                "vision": {"image_tokens": 64 if index == 5 else max(1, index),
+                           "latency_ms": max(1, index)},
+                "prefill_chunks": {"count": 512 if phase == "final" else index, "total_ms": max(1, index)},
+                "moe_prefill": {
+                    "active_rows": index * 100,
+                    "possible_rows": index * 512,
+                    "bytes_copied": index * 400,
+                    "full_bytes": index * 1000,
+                    "row_fraction": 0.0 if index == 0 else 100 / 512,
+                    "byte_fraction": 0.0 if index == 0 else 0.4,
+                },
+            })
+        evidence.write_json(self.directory / evidence.V02_RUNTIME_TELEMETRY_FILE,
+                            {"schema_version": "1.0", "samples": samples})
+
+        summary = evidence.read_json(self.directory / "summary.json")
+        summary["execution"] = dict(evidence.EXPECTED_EXECUTION_V02)
+        summary["gates"]["api"] = {key: True for key in evidence.V02_REQUIRED_API_GATES}
+        summary["gates"]["prompt_cases"] = [{
+            "content_prompt_tokens": target - 12, "rendered_prompt_tokens": target,
+            "completion_tokens": 1, "ttft_p50_ms": 1.0, "ttft_p95_ms": 1.0,
+            "total_p50_ms": 10.0, "total_p95_ms": 10.0,
+        } for target in evidence.V02_PROMPT_TARGETS]
+        summary["gates"]["boundary"] = {
+            "input_tokens": 261120, "output_tokens": 1024, "total_tokens": 262144,
+            "text_completed": True, "image_completed": True,
+            "image_tokens": 64, "text_tokens": 261056,
+        }
+        summary["gates"]["long_context_ttft_ms"] = 1.0
+        summary["gates"]["niah"] = {
+            "attempted": 4, "succeeded": 4,
+            "depths": list(evidence.V02_NIAH_DEPTHS),
+        }
+        summary["gates"]["vision_quality"] = {
+            "ocr": True, "object": True, "chart": True,
+        }
+        summary["telemetry"] = {
+            "selector": {
+                "workspace_peak_bytes": 128 * 1024**2,
+                "native_calls": 5,
+                "fallback_calls": 0,
+                "errors": 0,
+            },
+            "ple": {"cold_runs": 1, "warm_runs": 3, "bytes_read": 500.0,
+                    "cache_hits": 3.0, "cache_misses": 5.0, "wait_ms": 5.0, "page_faults": 0.0},
+            "vision": {"image_tokens": 64, "latency_ms": 5.0},
+            "prefill_chunks": {"count": 512, "total_ms": 5.0},
+            "moe_prefill": {
+                "active_rows": 500,
+                "possible_rows": 2560,
+                "bytes_copied": 2000,
+                "full_bytes": 5000,
+                "row_fraction": round(100 / 512, 6),
+                "byte_fraction": 0.4,
+            },
+        }
+        summary["verification"]["ple_checkpoint_rows"] = True
+        summary["resources"]["acceptance_window_start_elapsed_s"] = 0.5
+        evidence.write_json(
+            self.directory / evidence.V02_PLE_CHECKPOINT_PROBE_FILE,
+            ple_probe_report(),
+        )
+        evidence.write_json(self.directory / "summary.json", summary)
+        evidence.write_checksums(self.directory)
+        evidence.validate_directory(self.directory, release=True)
+
+        boundary_image = next(
+            row for row in rows if row["case"] == "boundary-image"
+        )
+        boundary_image["proof"]["runtime_image_tokens_delta"] = 63
+        (self.directory / "requests.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        evidence.write_checksums(self.directory)
+        with self.assertRaisesRegex(evidence.EvidenceError, "token accounting"):
+            evidence.validate_directory(self.directory, release=True)
+        boundary_image["proof"]["runtime_image_tokens_delta"] = 64
+
+        samples[2]["ple"]["bytes_read"] = 101
+        evidence.write_json(
+            self.directory / evidence.V02_RUNTIME_TELEMETRY_FILE,
+            {"schema_version": "1.0", "samples": samples},
+        )
+        (self.directory / "requests.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        evidence.write_checksums(self.directory)
+        with self.assertRaisesRegex(evidence.EvidenceError, "each raw PLE warm"):
+            evidence.validate_directory(self.directory, release=True)
+        samples[2]["ple"]["bytes_read"] = 100
+        evidence.write_json(
+            self.directory / evidence.V02_RUNTIME_TELEMETRY_FILE,
+            {"schema_version": "1.0", "samples": samples},
+        )
+
+        samples[2]["moe_prefill"]["full_bytes"] = 1000.0
+        evidence.write_json(
+            self.directory / evidence.V02_RUNTIME_TELEMETRY_FILE,
+            {"schema_version": "1.0", "samples": samples},
+        )
+        evidence.write_checksums(self.directory)
+        with self.assertRaisesRegex(evidence.EvidenceError, "non-negative integer"):
+            evidence.validate_directory(self.directory, release=True)
+        samples[2]["moe_prefill"]["full_bytes"] = 2000
+        evidence.write_json(
+            self.directory / evidence.V02_RUNTIME_TELEMETRY_FILE,
+            {"schema_version": "1.0", "samples": samples},
+        )
+
+        for row in rows:
+            if row["case"] == "soak":
+                row["proof"] = {"image": False}
+        (self.directory / "requests.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        evidence.write_checksums(self.directory)
+        with self.assertRaisesRegex(evidence.EvidenceError, "soak must continuously mix"):
+            evidence.validate_directory(self.directory, release=True)
+
     def test_release_commit_is_exact_and_expected_commit_is_bound(self) -> None:
         write_release_bundle(self.directory)
         evidence.validate_directory(
@@ -491,6 +992,27 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn(f"{evidence.BEGIN_MARKER}\ngenerated\n{evidence.END_MARKER}", updated)
         with self.assertRaisesRegex(evidence.EvidenceError, "exactly one"):
             evidence.update_marked_text("no markers", "generated")
+
+    def test_release_input_is_bound_to_requested_profile(self) -> None:
+        root = Path(self.temporary.name) / "selection"
+        old = root / "rtx5090-2026-01-01"
+        new = root / "rtx5090-2026-08-27"
+        old.mkdir(parents=True)
+        new.mkdir()
+
+        def validate(directory, **_kwargs):
+            profile = evidence.PROFILE_V01 if directory == old else evidence.PROFILE_V02
+            return {"execution": {"profile": profile}}
+
+        with mock.patch.object(evidence, "validate_directory", side_effect=validate):
+            assert evidence.find_release_input(
+                root, expected_profile=evidence.PROFILE_V01
+            ) == old
+            assert evidence.find_release_input(
+                root, expected_profile=evidence.PROFILE_V02
+            ) == new
+            with self.assertRaisesRegex(evidence.EvidenceError, "unsupported requested"):
+                evidence.find_release_input(root, expected_profile="future-profile")
 
     def test_runtime_to_tag_binding_allows_only_evidence_and_docs(self) -> None:
         repo = Path(self.temporary.name) / "git-binding"

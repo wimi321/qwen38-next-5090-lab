@@ -39,6 +39,8 @@ REQUIRED_FILES = (
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_ONLY_ALLOWED_FILES = set(REQUIRED_FILES) | {"SHA256SUMS"}
+V02_RUNTIME_TELEMETRY_FILE = "runtime-telemetry.json"
+V02_PLE_CHECKPOINT_PROBE_FILE = "ple-checkpoint-probe.json"
 RUNTIME_PATHS = (
     "python",
     "profiles",
@@ -85,6 +87,51 @@ EXPECTED_EXECUTION = {
     "text_only": True,
     "tp_size": 1,
 }
+PROFILE_V01 = "rtx5090-wsl2"
+PROFILE_V02 = "rtx5090-wsl2-256k-image"
+EXPECTED_SETTINGS_V02 = {
+    **EXPECTED_SETTINGS,
+    "max_seq_len": 262144,
+    "max_prefill_length": 512,
+    "num_tokens": 262144,
+    "attention_backend": "qsa_triton_sm120",
+    "moe_prefill_sparse": True,
+    "qsa_require_native_topk": True,
+    "ple_io_backend": "io_uring_odirect",
+    "ple_require_native_io_uring": True,
+    "ple_cache_bytes": 4 * 1024**3,
+    "ple_queue_depth": 512,
+    "ple_max_batch_pages": 4096,
+    "ple_staging_buffers": 2,
+    "vision_enabled": True,
+    "gpu_memory_envelope_bytes": 31 * 1024**3,
+    "gpu_runtime_reserve_bytes": 512 * 1024**2,
+}
+EXPECTED_EXECUTION_V02 = {
+    "profile": PROFILE_V02,
+    "attention_backend": "qsa_triton_sm120",
+    "cache_type": "naive",
+    "context_tokens": 262144,
+    "cuda_graph": False,
+    "quantization": "W4A16 compatibility",
+    "text_only": False,
+    "image_input": True,
+    "tp_size": 1,
+}
+V02_PROMPT_TARGETS = (8176, 32768, 131072, 261120)
+V02_NIAH_DEPTHS = (0.10, 0.35, 0.65, 0.90)
+V02_REQUIRED_API_GATES = {
+    "stream_nonstream_match", "thinking_none", "thinking_high", "tool_call",
+    "image_data_url", "image_https", "image_four", "image_stream_nonstream_match",
+    "image_security_rejections", "context_length_rejection",
+    "image_ocr", "image_object", "image_chart", "image_thinking",
+    "image_tool_call",
+}
+MOE_PREFILL_COUNTER_FIELDS = (
+    "active_rows", "possible_rows", "bytes_copied", "full_bytes",
+)
+MOE_PREFILL_FRACTION_FIELDS = ("row_fraction", "byte_fraction")
+MOE_PREFILL_FRACTION_TOLERANCE = 1e-6
 PRIVATE_PATTERNS = (
     re.compile(r"(?i)[a-z]:[\\/]users[\\/][^\\/\s]+"),
     re.compile(r"/home/[^/\s]+"),
@@ -109,6 +156,141 @@ def read_json(path: Path) -> dict[str, Any]:
         raise EvidenceError(f"{path}: cannot read JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise EvidenceError(f"{path}: top level must be an object")
+    return value
+
+
+def validate_ple_checkpoint_probe(value: dict[str, Any]) -> dict[str, Any]:
+    """Validate the sanitized native PLE row/loader parity attestation."""
+
+    if value.get("schema_version") != SCHEMA_VERSION:
+        raise EvidenceError("PLE checkpoint probe schema_version is invalid")
+    if value.get("status") != "pass" or value.get("release_qualified") is not True:
+        raise EvidenceError("PLE checkpoint probe is not release-qualified")
+    checkpoint = value.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        raise EvidenceError("PLE checkpoint probe checkpoint metadata is missing")
+    if checkpoint.get("model_dir_basename") != "qwen38-flash-next-nvfp4-7b71922":
+        raise EvidenceError("PLE checkpoint probe model basename is incorrect")
+    for key in ("config_sha256", "index_sha256"):
+        if not SHA256_RE.fullmatch(str(checkpoint.get(key, ""))):
+            raise EvidenceError(f"PLE checkpoint probe {key} is not SHA-256")
+
+    runtime = value.get("runtime")
+    if not isinstance(runtime, dict) or (
+        runtime.get("backend") != "io_uring_odirect"
+        or not str(runtime.get("device", "")).startswith("cuda")
+        or runtime.get("compute_capability") != "12.0"
+        or runtime.get("wsl2") is not True
+        or runtime.get("gpu_fp8_decode_attested") is not True
+        or "RTX 5090" not in str(runtime.get("gpu_name", ""))
+    ):
+        raise EvidenceError("PLE checkpoint probe runtime contract is incomplete")
+
+    mapping = value.get("loader_mapping")
+    coverage = value.get("coverage")
+    records = value.get("records")
+    io = value.get("io")
+    if not all(isinstance(item, dict) for item in (mapping, coverage, io)):
+        raise EvidenceError("PLE checkpoint probe mapping/coverage/I/O is missing")
+    if not isinstance(records, list) or not records:
+        raise EvidenceError("PLE checkpoint probe has no sampled row records")
+    if (
+        mapping.get("normal_state_dict_action") != "skip"
+        or mapping.get("normal_state_dict_mapped_name") is not None
+        or mapping.get("auxiliary_bank") != "ShardedSafetensorsMmapRowBank"
+    ):
+        raise EvidenceError("PLE checkpoint probe does not prove auxiliary loader routing")
+    shards = mapping.get("shards")
+    if not isinstance(shards, list) or len(shards) != 128:
+        raise EvidenceError("PLE checkpoint probe must cover all 128 PLE shards")
+    shard_rows: set[int] = set()
+    tensor_by_index: dict[int, str] = {}
+    previous_end = 0
+    for index, shard in enumerate(shards):
+        if not isinstance(shard, dict) or shard.get("index") != index:
+            raise EvidenceError("PLE checkpoint probe shard indices are not contiguous")
+        shape = shard.get("shape")
+        start, end = shard.get("global_start"), shard.get("global_end")
+        tensor_name = shard.get("tensor_name")
+        if (
+            not isinstance(shape, list)
+            or len(shape) != 2
+            or not all(isinstance(item, int) and item > 0 for item in shape)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start != previous_end
+            or end != start + shape[0]
+            or not isinstance(tensor_name, str)
+            or f".shard_{index}.weight" not in tensor_name
+            or not str(shard.get("dtype", "")).startswith("F8_")
+        ):
+            raise EvidenceError("PLE checkpoint probe shard geometry is invalid")
+        shard_rows.update((start, end - 1))
+        tensor_by_index[index] = tensor_name
+        previous_end = end
+
+    if (
+        coverage.get("shard_count") != 128
+        or coverage.get("sample_count") != len(records)
+        or coverage.get("hash_sample_count") != 8
+        or coverage.get("all_shard_first_rows") is not True
+        or coverage.get("all_shard_last_rows") is not True
+        or coverage.get("global_first_row") is not True
+        or coverage.get("global_last_row") is not True
+        or coverage.get("bigram_and_trigram_heads") is not True
+        or not SHA256_RE.fullmatch(
+            str(coverage.get("hash_fixture_tokens_sha256", ""))
+        )
+    ):
+        raise EvidenceError("PLE checkpoint probe coverage contract is incomplete")
+
+    observed_rows: set[int] = set()
+    hash_records = 0
+    hash_heads: set[int] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise EvidenceError("PLE checkpoint probe row record must be an object")
+        shard_index = record.get("shard_index")
+        global_row = record.get("global_row")
+        ground = record.get("ground_truth")
+        observed = record.get("auxiliary_bank")
+        if (
+            not isinstance(shard_index, int)
+            or shard_index not in tensor_by_index
+            or record.get("tensor_name") != tensor_by_index[shard_index]
+            or not isinstance(global_row, int)
+            or global_row < 0
+            or record.get("match") is not True
+            or not isinstance(ground, dict)
+            or not isinstance(observed, dict)
+            or not SHA256_RE.fullmatch(str(ground.get("sha256", "")))
+            or ground.get("sha256") != observed.get("sha256")
+            or ground.get("shape") != observed.get("shape")
+            or ground.get("dtype") != observed.get("dtype")
+            or ground.get("numel") != observed.get("numel")
+        ):
+            raise EvidenceError("PLE checkpoint probe row parity record is invalid")
+        observed_rows.add(global_row)
+        if record.get("kind") == "hash":
+            hash_records += 1
+            head = record.get("hash_head")
+            if not isinstance(head, int) or head < 0:
+                raise EvidenceError("PLE checkpoint probe hash head is invalid")
+            hash_heads.add(head)
+    if not shard_rows <= observed_rows or hash_records != 8 or len(hash_heads) < 2:
+        raise EvidenceError("PLE checkpoint probe misses shard boundaries or hash heads")
+    if coverage.get("unique_row_count") != len(observed_rows):
+        raise EvidenceError("PLE checkpoint probe unique-row count is inconsistent")
+    if (
+        io.get("mapped_bytes") != 0
+        or not isinstance(io.get("storage_bytes"), int)
+        or io["storage_bytes"] <= 0
+        or not isinstance(io.get("submitted_sqes"), int)
+        or io["submitted_sqes"] <= 0
+        or not isinstance(io.get("gpu_decoded_rows"), int)
+        or io["gpu_decoded_rows"] < len(observed_rows)
+    ):
+        raise EvidenceError("PLE checkpoint probe does not prove native GPU row decoding")
     return value
 
 
@@ -241,6 +423,95 @@ def _required(mapping: dict[str, Any], path: str, expected: type | tuple[type, .
     return current
 
 
+def validate_moe_prefill_telemetry(
+    value: Any, *, source: str = "MoE prefill telemetry"
+) -> dict[str, Any]:
+    """Validate the published sparse-prefill counter and ratio contract."""
+
+    if not isinstance(value, dict):
+        raise EvidenceError(f"{source} must be an object")
+    required = set(MOE_PREFILL_COUNTER_FIELDS + MOE_PREFILL_FRACTION_FIELDS)
+    if set(value) != required:
+        raise EvidenceError(f"{source} fields must be exactly {sorted(required)}")
+
+    for key in MOE_PREFILL_COUNTER_FIELDS:
+        item = value[key]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise EvidenceError(f"{source}.{key} must be a non-negative integer")
+    for key in MOE_PREFILL_FRACTION_FIELDS:
+        item = value[key]
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or not 0 <= item <= 1
+        ):
+            raise EvidenceError(f"{source}.{key} must be a finite number in [0, 1]")
+
+    active_rows = value["active_rows"]
+    possible_rows = value["possible_rows"]
+    bytes_copied = value["bytes_copied"]
+    full_bytes = value["full_bytes"]
+    if active_rows > possible_rows:
+        raise EvidenceError(f"{source}.active_rows cannot exceed possible_rows")
+    if bytes_copied > full_bytes:
+        raise EvidenceError(f"{source}.bytes_copied cannot exceed full_bytes")
+
+    for numerator_key, denominator_key, fraction_key in (
+        ("active_rows", "possible_rows", "row_fraction"),
+        ("bytes_copied", "full_bytes", "byte_fraction"),
+    ):
+        numerator = value[numerator_key]
+        denominator = value[denominator_key]
+        fraction = float(value[fraction_key])
+        if denominator == 0:
+            consistent = fraction == 0.0
+        else:
+            consistent = math.isclose(
+                fraction,
+                numerator / denominator,
+                rel_tol=0.0,
+                abs_tol=MOE_PREFILL_FRACTION_TOLERANCE,
+            )
+        if not consistent:
+            raise EvidenceError(
+                f"{source}.{fraction_key} does not match "
+                f"{numerator_key} / {denominator_key}"
+            )
+    return value
+
+
+def _validate_v02_boundary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise EvidenceError("256K boundary must be an object")
+    required = {
+        "input_tokens", "output_tokens", "total_tokens", "text_completed",
+        "image_completed", "image_tokens", "text_tokens",
+    }
+    if set(value) != required:
+        raise EvidenceError("256K boundary image/text accounting is incomplete")
+    image_tokens = value.get("image_tokens")
+    text_tokens = value.get("text_tokens")
+    if (
+        value.get("input_tokens") != 261120
+        or value.get("output_tokens") != 1024
+        or value.get("total_tokens") != 262144
+        or value.get("text_completed") is not True
+        or value.get("image_completed") is not True
+        or isinstance(image_tokens, bool)
+        or not isinstance(image_tokens, int)
+        or image_tokens <= 0
+        or isinstance(text_tokens, bool)
+        or not isinstance(text_tokens, int)
+        or text_tokens <= 0
+        or image_tokens + text_tokens != 261120
+    ):
+        raise EvidenceError(
+            "256K boundary must prove text and image 261120+1024 with exact image-token accounting"
+        )
+    return value
+
+
 def _validate_summary(
     summary: dict[str, Any], *, release: bool, expected_commit: str | None = None
 ) -> None:
@@ -301,8 +572,15 @@ def _validate_summary(
     runtime_tree = _required(summary, "source.runtime_tree_sha256", str)
     if not SHA256_RE.fullmatch(runtime_tree):
         raise EvidenceError("release evidence runtime_tree_sha256 must be 64 lowercase hex")
-    if summary["execution"] != EXPECTED_EXECUTION:
-        raise EvidenceError("release execution contract does not match the v0.1 preview")
+    profile = str(summary.get("execution", {}).get("profile") or PROFILE_V01)
+    if profile == PROFILE_V01:
+        expected_execution = EXPECTED_EXECUTION
+    elif profile == PROFILE_V02:
+        expected_execution = EXPECTED_EXECUTION_V02
+    else:
+        raise EvidenceError(f"unsupported release evidence profile: {profile}")
+    if summary["execution"] != expected_execution:
+        raise EvidenceError(f"release execution contract does not match {profile}")
     _required(summary, "gates.steady_decode.requested_tokens", int)
     _required(summary, "gates.steady_decode.finish_reason", str)
     _required(summary, "gates.steady_decode.http_status", int)
@@ -314,19 +592,23 @@ def _validate_summary(
     if pytest_gate["passed"] < 1454 or pytest_gate["failed"] != 0:
         raise EvidenceError("pytest release gate requires >=1454 passed and zero failed")
     targets = {int(case.get("rendered_prompt_tokens", -1)) for case in prompt_cases}
-    if not {13, 128, 2048, 8176}.issubset(targets):
-        raise EvidenceError("prompt gates must include rendered lengths 13, 128, 2048, and 8176")
-    one_token_cases = [
-        case for case in prompt_cases
-        if case.get("content_prompt_tokens") == 1
-        and case.get("rendered_prompt_tokens") == 13
-    ]
-    if len(one_token_cases) != 1:
-        raise EvidenceError("prompt gates must include content=1/rendered=13 exactly once")
+    if profile == PROFILE_V01:
+        if not {13, 128, 2048, 8176}.issubset(targets):
+            raise EvidenceError("prompt gates must include rendered lengths 13, 128, 2048, and 8176")
+        one_token_cases = [
+            case for case in prompt_cases
+            if case.get("content_prompt_tokens") == 1
+            and case.get("rendered_prompt_tokens") == 13
+        ]
+        if len(one_token_cases) != 1:
+            raise EvidenceError("prompt gates must include content=1/rendered=13 exactly once")
+    elif not set(V02_PROMPT_TARGETS).issubset(targets):
+        raise EvidenceError("256K prompt gates must include 8K, 32K, 128K, and 261120")
     gates = summary["gates"]
     steady = gates["steady_decode"]
-    if not 256 <= int(steady.get("requested_tokens", 0)) <= 512:
-        raise EvidenceError("steady decode requested_tokens must be in [256, 512]")
+    decode_ceiling = 1024 if profile == PROFILE_V02 else 512
+    if not 256 <= int(steady.get("requested_tokens", 0)) <= decode_ceiling:
+        raise EvidenceError(f"steady decode requested_tokens must be in [256, {decode_ceiling}]")
     if steady["observed_tokens"] != steady["requested_tokens"]:
         raise EvidenceError("steady decode gate requires the exact requested token budget")
     if steady.get("finish_reason") != "length":
@@ -335,6 +617,78 @@ def _validate_summary(
         raise EvidenceError("steady decode gate requires HTTP 200")
     if not all(gates["api"].values()):
         raise EvidenceError("all stream/thinking/tool API gates must pass")
+    if profile == PROFILE_V02:
+        if set(gates["api"]) != V02_REQUIRED_API_GATES:
+            raise EvidenceError("256K image API gate set is incomplete or unexpected")
+        if steady.get("decode_tokens_per_second", 0) < 5:
+            raise EvidenceError("256K steady decode must be at least 5 tok/s")
+        boundary = _validate_v02_boundary(
+            _required(summary, "gates.boundary", dict)
+        )
+        if _finite_float(_required(summary, "gates.long_context_ttft_ms", (int, float)), "long_context_ttft_ms") > 900000:
+            raise EvidenceError("261K TTFT must be <=15 minutes")
+        if _required(summary, "gates.niah", dict) != {
+            "attempted": 4,
+            "succeeded": 4,
+            "depths": list(V02_NIAH_DEPTHS),
+        }:
+            raise EvidenceError("NIAH must pass all four long-context depths")
+        if _required(summary, "gates.vision_quality", dict) != {
+            "ocr": True,
+            "object": True,
+            "chart": True,
+        }:
+            raise EvidenceError("vision quality must pass OCR, object, and chart fixtures")
+        ple = _required(summary, "telemetry.ple", dict)
+        selector = _required(summary, "telemetry.selector", dict)
+        vision = _required(summary, "telemetry.vision", dict)
+        chunks = _required(summary, "telemetry.prefill_chunks", dict)
+        validate_moe_prefill_telemetry(
+            _required(summary, "telemetry.moe_prefill", dict),
+            source="summary telemetry.moe_prefill",
+        )
+        if ple.get("cold_runs") != 1 or ple.get("warm_runs") != 3:
+            raise EvidenceError("PLE telemetry must contain one cold and three warm runs")
+        for key in (
+            "bytes_read", "cache_hits", "cache_misses", "wait_ms", "page_faults"
+        ):
+            if (
+                not isinstance(ple.get(key), (int, float))
+                or isinstance(ple.get(key), bool)
+                or ple[key] < 0
+            ):
+                raise EvidenceError(f"PLE telemetry {key} must be a non-negative number")
+        workspace = selector.get("workspace_peak_bytes")
+        if not isinstance(workspace, int) or not 0 < workspace <= 128 * 1024**2:
+            raise EvidenceError("selector telemetry must stay within the 128MiB workspace bound")
+        native_calls = selector.get("native_calls")
+        if (
+            isinstance(native_calls, bool)
+            or not isinstance(native_calls, int)
+            or native_calls <= 0
+        ):
+            raise EvidenceError(
+                "selector telemetry must prove at least one native fast-topk call"
+            )
+        for key, label in (
+            ("fallback_calls", "fast-topk fallbacks"),
+            ("errors", "native fast-topk errors"),
+        ):
+            value = selector.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                raise EvidenceError(f"selector telemetry must prove zero {label}")
+        if not isinstance(vision.get("image_tokens"), int) or vision["image_tokens"] <= 0:
+            raise EvidenceError("vision telemetry must report positive image tokens")
+        if vision["image_tokens"] < boundary["image_tokens"]:
+            raise EvidenceError(
+                "vision telemetry cannot contain fewer tokens than the boundary image request"
+            )
+        if not isinstance(vision.get("latency_ms"), (int, float)) or vision["latency_ms"] <= 0:
+            raise EvidenceError("vision telemetry must report positive latency")
+        if not isinstance(chunks.get("count"), int) or chunks["count"] < 512:
+            raise EvidenceError("prefill chunk telemetry must report the 256K chunk sequence")
+        if not isinstance(chunks.get("total_ms"), (int, float)) or chunks["total_ms"] <= 0:
+            raise EvidenceError("prefill chunk telemetry must report positive elapsed time")
     stability = gates["stability"]
     if stability["attempted"] < 100 or stability["succeeded"] != stability["attempted"]:
         raise EvidenceError("stability gate requires at least 100/100 successful requests")
@@ -541,13 +895,112 @@ def _crosscheck_release_raw(
 ) -> None:
     """Recompute every objective gate from raw records and reject drift."""
 
+    profile = str(config.get("profile") or "")
+    summary_profile = str(summary.get("execution", {}).get("profile") or PROFILE_V01)
+    if profile != summary_profile:
+        raise EvidenceError("resolved config and summary release profiles disagree")
     settings = config.get("settings")
-    if settings != EXPECTED_SETTINGS:
-        raise EvidenceError("resolved-config.json does not match the v0.1 preview profile")
-    if config.get("profile") != "rtx5090-wsl2":
-        raise EvidenceError("resolved-config.json profile must be rtx5090-wsl2")
+    expected_settings = EXPECTED_SETTINGS_V02 if profile == PROFILE_V02 else EXPECTED_SETTINGS
+    if settings != expected_settings:
+        raise EvidenceError(f"resolved-config.json does not match profile {profile}")
+    if profile not in {PROFILE_V01, PROFILE_V02}:
+        raise EvidenceError(f"resolved-config.json profile is unsupported: {profile}")
     if config.get("served_model_name") != "qwen3.8-flash-next-nvfp4":
         raise EvidenceError("resolved-config.json served model name is incorrect")
+    if profile == PROFILE_V02:
+        raw_telemetry = read_json(directory / V02_RUNTIME_TELEMETRY_FILE)
+        samples = raw_telemetry.get("samples")
+        if not isinstance(samples, list) or len(samples) != 6:
+            raise EvidenceError("runtime telemetry must contain baseline, cold, three warm, and final samples")
+        expected_phases = ["baseline", "cold", "warm-1", "warm-2", "warm-3", "final"]
+        if [item.get("phase") for item in samples if isinstance(item, dict)] != expected_phases:
+            raise EvidenceError("runtime telemetry phases are incomplete or out of order")
+        for number, item in enumerate(samples, 1):
+            if not isinstance(item, dict):
+                raise EvidenceError(f"runtime telemetry sample {number} must be an object")
+            validate_moe_prefill_telemetry(
+                item.get("moe_prefill"),
+                source=f"runtime telemetry sample {number}.moe_prefill",
+            )
+            for group, keys in {
+                "selector": (
+                    "workspace_peak_bytes", "native_calls", "fallback_calls", "errors"
+                ),
+                "ple": ("bytes_read", "cache_hits", "cache_misses", "wait_ms", "page_faults"),
+                "vision": ("image_tokens", "latency_ms"),
+                "prefill_chunks": ("count", "total_ms"),
+                "moe_prefill": (
+                    "active_rows", "possible_rows", "bytes_copied", "full_bytes",
+                    "row_fraction", "byte_fraction",
+                ),
+            }.items():
+                if not isinstance(item.get(group), dict):
+                    raise EvidenceError(f"runtime telemetry sample {number} missing {group}")
+                for key in keys:
+                    value = item[group].get(key)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                        raise EvidenceError(f"runtime telemetry {group}.{key} must be non-negative")
+                    if group == "selector" and not isinstance(value, int):
+                        raise EvidenceError(
+                            f"runtime telemetry selector.{key} must be an integer"
+                        )
+        cold_read = samples[1]["ple"]["bytes_read"] - samples[0]["ple"]["bytes_read"]
+        cold_miss = samples[1]["ple"]["cache_misses"] - samples[0]["ple"]["cache_misses"]
+        if cold_read <= 0 or cold_miss <= 0:
+            raise EvidenceError("raw PLE telemetry does not prove the cold read")
+        for index in range(2, 5):
+            previous = samples[index - 1]["ple"]
+            current = samples[index]["ple"]
+            if (
+                current["cache_hits"] - previous["cache_hits"] <= 0
+                or current["bytes_read"] != previous["bytes_read"]
+                or current["cache_misses"] != previous["cache_misses"]
+            ):
+                raise EvidenceError(
+                    "each raw PLE warm sample must add hits without another read or miss"
+                )
+        for key in ("workspace_peak_bytes", "native_calls", "fallback_calls", "errors"):
+            values = [sample["selector"][key] for sample in samples]
+            if any(left > right for left, right in zip(values, values[1:])):
+                raise EvidenceError(f"raw selector telemetry {key} must be monotonic")
+        final = samples[-1]
+        if final["selector"]["native_calls"] <= 0:
+            raise EvidenceError("raw selector telemetry does not prove a native fast-topk call")
+        if final["selector"]["fallback_calls"] != 0 or final["selector"]["errors"] != 0:
+            raise EvidenceError("raw selector telemetry contains fallback or error activity")
+        expected_telemetry = {
+            "selector": {
+                key: int(final["selector"][key])
+                for key in (
+                    "workspace_peak_bytes", "native_calls", "fallback_calls", "errors"
+                )
+            },
+            "ple": {"cold_runs": 1, "warm_runs": 3, **{
+                key: round(float(final["ple"][key]), 3)
+                for key in ("bytes_read", "cache_hits", "cache_misses", "wait_ms", "page_faults")
+            }},
+            "vision": {
+                "image_tokens": int(final["vision"]["image_tokens"]),
+                "latency_ms": round(float(final["vision"]["latency_ms"]), 3),
+            },
+            "prefill_chunks": {
+                "count": int(final["prefill_chunks"]["count"]),
+                "total_ms": round(float(final["prefill_chunks"]["total_ms"]), 3),
+            },
+            "moe_prefill": {
+                key: (
+                    int(final["moe_prefill"][key])
+                    if key in ("active_rows", "possible_rows", "bytes_copied", "full_bytes")
+                    else round(float(final["moe_prefill"][key]), 6)
+                )
+                for key in (
+                    "active_rows", "possible_rows", "bytes_copied", "full_bytes",
+                    "row_fraction", "byte_fraction",
+                )
+            },
+        }
+        if summary.get("telemetry") != expected_telemetry:
+            raise EvidenceError("summary runtime telemetry does not match raw /v1/stats samples")
 
     pytest_text = (directory / "pytest.txt").read_text(encoding="utf-8")
     pytest_counts = _parse_pytest_counts(pytest_text)
@@ -562,7 +1015,8 @@ def _crosscheck_release_raw(
         if key in keys_seen:
             raise EvidenceError(f"requests.jsonl:{number}: duplicate case/iteration {key}")
         keys_seen.add(key)
-        if item["http_status"] != 200 and item["success"]:
+        expected_rejection = item["case"] in {"image-security-rejections", "context-length-rejection"}
+        if item["http_status"] != 200 and item["success"] and not expected_rejection:
             raise EvidenceError(f"requests.jsonl:{number}: non-200 request cannot be successful")
 
     measured_requests = [item for item in requests if not item["warmup"]]
@@ -640,30 +1094,139 @@ def _crosscheck_release_raw(
         and all(isinstance(value, str) and SHA256_RE.fullmatch(value) for value in tool_hashes)
         and len(set(tool_hashes)) == 1
     )
-    recomputed_api = {
+    recomputed_api: dict[str, bool] = {
         "stream_nonstream_match": parity_ok,
         "thinking_none": thinking_none_ok,
         "thinking_high": thinking_high_ok,
         "tool_call": tool_ok,
     }
+    if profile == PROFILE_V02:
+        def successful(case: str, *, count: int = 1) -> list[dict[str, Any]]:
+            rows = [item for item in requests if item["case"] == case and not item["warmup"]]
+            if len(rows) != count or not all(row["success"] for row in rows):
+                return []
+            return rows
+
+        data_rows = successful("image-data-url")
+        https_rows = successful("image-https")
+        four_rows = successful("image-four")
+        image_pair = api_pair("image-stream-parity")
+        image_hashes = [row["proof"].get("text_sha256") for row in image_pair]
+        rejects = successful("image-security-rejections", count=1)
+        context_reject = successful("context-length-rejection", count=1)
+        quality_rows = {
+            kind: successful(f"image-{kind}-quality", count=1)
+            for kind in ("ocr", "object", "chart")
+        }
+        image_thinking = successful("image-thinking", count=1)
+        image_tool = successful("image-tool-call", count=1)
+        recomputed_api.update({
+            "image_data_url": bool(data_rows and data_rows[0]["proof"].get("image_count") == 1),
+            "image_https": bool(https_rows and https_rows[0]["proof"].get("https") is True),
+            "image_four": bool(four_rows and four_rows[0]["proof"].get("image_count") == 4),
+            "image_stream_nonstream_match": bool(
+                image_pair and len(set(image_hashes)) == 1
+                and all(isinstance(value, str) and SHA256_RE.fullmatch(value) for value in image_hashes)
+            ),
+            "image_security_rejections": bool(
+                rejects and rejects[0]["proof"].get("passed") == rejects[0]["proof"].get("attempted")
+                and int(rejects[0]["proof"].get("attempted", 0)) >= 4
+            ),
+            "context_length_rejection": bool(
+                context_reject and context_reject[0]["proof"].get("error_code") == "context_length_exceeded"
+            ),
+            "image_ocr": bool(
+                quality_rows["ocr"]
+                and quality_rows["ocr"][0]["proof"].get("answer_match") is True
+            ),
+            "image_object": bool(
+                quality_rows["object"]
+                and quality_rows["object"][0]["proof"].get("answer_match") is True
+            ),
+            "image_chart": bool(
+                quality_rows["chart"]
+                and quality_rows["chart"][0]["proof"].get("answer_match") is True
+            ),
+            "image_thinking": bool(
+                image_thinking
+                and image_thinking[0]["proof"].get("reasoning_present") is True
+                and image_thinking[0]["proof"].get("visible_text_present") is True
+                and image_thinking[0]["proof"].get("answer_match") is True
+            ),
+            "image_tool_call": bool(
+                image_tool
+                and image_tool[0]["proof"].get("tool_name") == "report_access_code"
+                and image_tool[0]["proof"].get("answer_match") is True
+                and isinstance(image_tool[0]["proof"].get("arguments_sha256"), str)
+                and SHA256_RE.fullmatch(image_tool[0]["proof"]["arguments_sha256"])
+            ),
+        })
     if recomputed_api != summary["gates"]["api"] or not all(recomputed_api.values()):
         raise EvidenceError("summary API gates do not match successful raw request pairs")
 
+    if profile == PROFILE_V02:
+        cold_rows = [item for item in requests if item["case"] == "ple-cold"]
+        warm_rows = sorted(
+            (item for item in requests if item["case"] == "ple-warm"),
+            key=lambda item: item["iteration"],
+        )
+        if not (
+            len(cold_rows) == 1
+            and cold_rows[0]["iteration"] == 0
+            and cold_rows[0]["warmup"] is False
+            and cold_rows[0]["success"] is True
+            and cold_rows[0]["http_status"] == 200
+            and cold_rows[0]["proof"].get("phase") == "cold"
+            and len(warm_rows) == 3
+            and [item["iteration"] for item in warm_rows] == [1, 2, 3]
+            and all(
+                item["warmup"] is True
+                and item["success"] is True
+                and item["http_status"] == 200
+                and item["proof"].get("phase") == "warm"
+                for item in warm_rows
+            )
+        ):
+            raise EvidenceError(
+                "raw PLE probe must contain one successful cold and three successful warm requests"
+            )
+
     prompt_cases: list[dict[str, Any]] = []
-    for target in (13, 128, 2048, 8176):
+    niah_depths: list[float] = []
+    targets = V02_PROMPT_TARGETS if profile == PROFILE_V02 else (13, 128, 2048, 8176)
+    for target in targets:
         case = f"prompt-{target}"
         warmups = [item for item in requests if item["case"] == case and item["warmup"]]
         measured = [item for item in requests if item["case"] == case and not item["warmup"]]
-        if len(warmups) < 3 or len(measured) < 10:
-            raise EvidenceError(f"{case} requires at least 3 warmups and 10 measurements")
+        minimum_warmups, minimum_measured = ((0, 1) if profile == PROFILE_V02 else (3, 10))
+        if len(warmups) < minimum_warmups or len(measured) < minimum_measured:
+            raise EvidenceError(
+                f"{case} requires at least {minimum_warmups} warmups and {minimum_measured} measurements"
+            )
         if not all(
             item["success"] and item["http_status"] == 200
             and item["prompt_tokens"] == target and item["stream"]
             for item in warmups + measured
         ):
             raise EvidenceError(f"{case} raw requests do not prove the target")
-        if target == 13 and any(item.get("content_tokens") != 1 for item in warmups + measured):
+        if profile == PROFILE_V01 and target == 13 and any(item.get("content_tokens") != 1 for item in warmups + measured):
             raise EvidenceError("prompt-13 must prove one content token and 13 rendered tokens")
+        if profile == PROFILE_V02:
+            expected_depth = V02_NIAH_DEPTHS[V02_PROMPT_TARGETS.index(target)]
+            if any(
+                item["proof"].get("needle_found") is not True
+                or not _close(
+                    _finite_float(item["proof"].get("needle_depth"), f"{case}.needle_depth"),
+                    expected_depth,
+                )
+                or not isinstance(item["proof"].get("expected_code_sha256"), str)
+                or not SHA256_RE.fullmatch(item["proof"]["expected_code_sha256"])
+                or not isinstance(item["proof"].get("answer_sha256"), str)
+                or not SHA256_RE.fullmatch(item["proof"]["answer_sha256"])
+                for item in measured
+            ):
+                raise EvidenceError(f"{case} does not prove its NIAH depth and answer")
+            niah_depths.append(expected_depth)
         completion = [int(item["completion_tokens"]) for item in measured]
         content_lengths = [int(item["content_tokens"]) for item in measured]
         if len(set(content_lengths)) != 1:
@@ -681,13 +1244,30 @@ def _crosscheck_release_raw(
         })
     if prompt_cases != summary["gates"]["prompt_cases"]:
         raise EvidenceError("summary prompt cases do not match raw request measurements")
+    if profile == PROFILE_V02:
+        expected_niah = {
+            "attempted": len(V02_NIAH_DEPTHS),
+            "succeeded": len(V02_NIAH_DEPTHS),
+            "depths": list(V02_NIAH_DEPTHS),
+        }
+        if niah_depths != list(V02_NIAH_DEPTHS) or summary["gates"].get("niah") != expected_niah:
+            raise EvidenceError("NIAH summary does not match raw prompt depths")
+        expected_quality = {
+            kind: recomputed_api[f"image_{kind}"]
+            for kind in ("ocr", "object", "chart")
+        }
+        if summary["gates"].get("vision_quality") != expected_quality or not all(
+            expected_quality.values()
+        ):
+            raise EvidenceError("vision-quality summary does not match raw fixtures")
 
     decode = [item for item in requests if item["case"] == "steady-decode" and not item["warmup"]]
     if len(decode) != 1 or not decode[0]["success"] or not decode[0]["stream"]:
         raise EvidenceError("raw evidence must contain one successful steady-decode stream")
     steady_summary = summary["gates"]["steady_decode"]
-    if not 256 <= int(steady_summary.get("requested_tokens", 0)) <= 512:
-        raise EvidenceError("steady decode requested_tokens must be in [256, 512]")
+    decode_ceiling = 1024 if profile == PROFILE_V02 else 512
+    if not 256 <= int(steady_summary.get("requested_tokens", 0)) <= decode_ceiling:
+        raise EvidenceError(f"steady decode requested_tokens must be in [256, {decode_ceiling}]")
     if decode[0]["completion_tokens"] != steady_summary.get("observed_tokens"):
         raise EvidenceError("steady decode summary does not match the raw request")
     if decode[0]["http_status"] != steady_summary.get("http_status"):
@@ -697,8 +1277,8 @@ def _crosscheck_release_raw(
     raw_requested = decode[0]["proof"].get("requested_tokens")
     if isinstance(raw_requested, bool) or not isinstance(raw_requested, int):
         raise EvidenceError("steady decode raw request must prove an integer requested_tokens")
-    if not 256 <= raw_requested <= 512:
-        raise EvidenceError("steady decode raw requested_tokens must be in [256, 512]")
+    if not 256 <= raw_requested <= decode_ceiling:
+        raise EvidenceError(f"steady decode raw requested_tokens must be in [256, {decode_ceiling}]")
     if raw_requested != steady_summary["requested_tokens"]:
         raise EvidenceError("steady decode raw requested_tokens do not match the summary")
     if decode[0]["proof"].get("finish_reason") != "length":
@@ -711,6 +1291,41 @@ def _crosscheck_release_raw(
     decode_tps = round((decode[0]["completion_tokens"] - 1) / (decode_time_ms / 1000), 3)
     if not _close(float(steady_summary.get("decode_tokens_per_second", -1)), decode_tps):
         raise EvidenceError("steady decode throughput does not match the raw request")
+    if profile == PROFILE_V02 and decode_tps < 5:
+        raise EvidenceError("256K raw steady decode must be at least 5 tok/s")
+
+    if profile == PROFILE_V02:
+        boundary_rows = {
+            case: [item for item in requests if item["case"] == case and not item["warmup"]]
+            for case in ("boundary-text", "boundary-image")
+        }
+        for case, rows in boundary_rows.items():
+            if not (
+                len(rows) == 1 and rows[0]["success"] and rows[0]["http_status"] == 200
+                and rows[0]["prompt_tokens"] == 261120
+                and rows[0]["completion_tokens"] == 1024
+                and rows[0]["proof"].get("finish_reason") == "length"
+            ):
+                raise EvidenceError(f"{case} does not prove 261120 input + 1024 output")
+        boundary_summary = _validate_v02_boundary(
+            summary["gates"].get("boundary")
+        )
+        image_proof = boundary_rows["boundary-image"][0]["proof"]
+        if (
+            image_proof.get("image_count") != 1
+            or image_proof.get("image_tokens") != boundary_summary["image_tokens"]
+            or image_proof.get("text_tokens") != boundary_summary["text_tokens"]
+            or image_proof.get("runtime_image_tokens_delta")
+            != boundary_summary["image_tokens"]
+        ):
+            raise EvidenceError(
+                "boundary image raw proof does not match processor/runtime token accounting"
+            )
+        long_ttft = max(float(rows[0]["ttft_ms"]) for rows in boundary_rows.values())
+        if not _close(float(summary["gates"].get("long_context_ttft_ms", -1)), long_ttft):
+            raise EvidenceError("261K TTFT summary does not match raw requests")
+        if long_ttft > 900000:
+            raise EvidenceError("261K raw TTFT exceeds 15 minutes")
 
     stability = [item for item in requests if item["case"] == "stability" and not item["warmup"]]
     succeeded = sum(bool(item["success"] and item["http_status"] == 200) for item in stability)
@@ -719,10 +1334,18 @@ def _crosscheck_release_raw(
         raise EvidenceError("stability summary does not match raw requests")
     if len(stability) < 100 or succeeded != len(stability):
         raise EvidenceError("raw stability gate requires at least 100/100 successes")
+    if profile == PROFILE_V02:
+        image_flags = {item["proof"].get("image") for item in stability}
+        if image_flags != {False, True}:
+            raise EvidenceError("256K stability must mix short text and image requests")
 
     soak = [item for item in requests if item["case"] == "soak" and not item["warmup"]]
     if len(soak) < 61 or not all(item["success"] and item["http_status"] == 200 for item in soak):
         raise EvidenceError("soak must contain periodic successful generations")
+    if profile == PROFILE_V02:
+        image_flags = {item["proof"].get("image") for item in soak}
+        if image_flags != {False, True}:
+            raise EvidenceError("256K soak must continuously mix text and image requests")
     soak = sorted(soak, key=lambda item: float(item["started_elapsed_s"]))
     soak_start = float(soak[0]["started_elapsed_s"])
     soak_end = float(soak[-1]["finished_elapsed_s"])
@@ -758,10 +1381,7 @@ def _crosscheck_release_raw(
         resource_summary.get("acceptance_window_end_elapsed_s"),
         "summary.resources.acceptance_window_end_elapsed_s",
     )
-    first_api_start = min(
-        float(item["started_elapsed_s"])
-        for item in requests if item["case"] == "stream-parity"
-    )
+    first_api_start = min(float(item["started_elapsed_s"]) for item in requests)
     if acceptance_start > first_api_start or first_api_start - acceptance_start > 1.0:
         raise EvidenceError("acceptance window must start with the initial API gates")
     if not _close(acceptance_end, soak_end):
@@ -870,7 +1490,11 @@ def validate_directory(
             path.relative_to(directory).as_posix()
             for path in directory.rglob("*") if path.is_file()
         }
-        if relative_files != RELEASE_ONLY_ALLOWED_FILES:
+        allowed = RELEASE_ONLY_ALLOWED_FILES | {
+            V02_RUNTIME_TELEMETRY_FILE,
+            V02_PLE_CHECKPOINT_PROBE_FILE,
+        }
+        if not RELEASE_ONLY_ALLOWED_FILES.issubset(relative_files) or not relative_files.issubset(allowed):
             raise EvidenceError(
                 "release evidence contains missing/unexpected files: "
                 f"expected={sorted(RELEASE_ONLY_ALLOWED_FILES)}, got={sorted(relative_files)}"
@@ -894,6 +1518,19 @@ def validate_directory(
         assert_sanitized(value, name)
     _validate_summary(summary, release=release, expected_commit=expected_commit)
     if release:
+        expected_files = set(RELEASE_ONLY_ALLOWED_FILES)
+        if config.get("profile") == PROFILE_V02:
+            expected_files.add(V02_RUNTIME_TELEMETRY_FILE)
+            expected_files.add(V02_PLE_CHECKPOINT_PROBE_FILE)
+        relative_files = {
+            path.relative_to(directory).as_posix()
+            for path in directory.rglob("*") if path.is_file()
+        }
+        if relative_files != expected_files:
+            raise EvidenceError(
+                f"release evidence file set does not match profile {config.get('profile')}: "
+                f"expected={sorted(expected_files)}, got={sorted(relative_files)}"
+            )
         hardware = environment.get("hardware") or {}
         software = environment.get("software") or {}
         if not isinstance(hardware, dict) or not isinstance(software, dict):
@@ -931,15 +1568,30 @@ def validate_directory(
             raise EvidenceError("release Triton must be 3.6.0")
         if software.get("cuda_runtime_probe") is not True:
             raise EvidenceError("release CUDA tensor runtime probe must pass on SM120")
+        if config.get("profile") == PROFILE_V02:
+            if type(software.get("media_doh_fallback_enabled")) is not bool:
+                raise EvidenceError(
+                    "v0.2 release environment must record whether the pinned DoH fallback was enabled"
+                )
+            if type(software.get("media_system_dns_hard_cancel_supported")) is not bool:
+                raise EvidenceError(
+                    "v0.2 release environment must record the system DNS cancellation capability"
+                )
         verification = summary.get("verification") or {}
-        if verification != {
+        expected_verification = {
             "checkpoint_full_sha256": True,
             "checkpoint_shape": True,
             "server_profile": True,
             "launch_attestation": True,
             "runtime_clean_tree": True,
             "server_port_owner": True,
-        }:
+        }
+        if config.get("profile") == PROFILE_V02:
+            expected_verification["ple_checkpoint_rows"] = True
+            validate_ple_checkpoint_probe(
+                read_json(directory / V02_PLE_CHECKPOINT_PROBE_FILE)
+            )
+        if verification != expected_verification:
             raise EvidenceError("checkpoint/runtime/server launch verification is incomplete")
         if summary.get("gates", {}).get("memory_leak_detected") is not False:
             raise EvidenceError("release evidence reports a monotonic memory leak")
@@ -985,11 +1637,27 @@ def render_markdown(summary: dict[str, Any], environment: dict[str, Any]) -> str
         f"| WSL swap | {resources['wsl_swap_kib'] / 1024:.0f} MiB |",
         f"| 8176 rendered-token TTFT (p50 / p95) | {ttft_p50:.1f} / {ttft_p95:.1f} ms |",
         f"| 8176 effective prefill (p50) | {effective_prefill:.1f} tok/s |",
-        f"| 256-token steady decode | {decode_tps:.1f} tok/s |",
+        f"| {gates.get('steady_decode', {}).get('requested_tokens', 256)}-token steady decode | {decode_tps:.1f} tok/s |",
         f"| Sequential requests | {gates['stability']['succeeded']}/{gates['stability']['attempted']} |",
         f"| Continuous run | {gates['continuous_run_seconds'] / 60:.1f} min |",
         f"| Tests | {gates['pytest']['passed']} passed, {gates['pytest']['failed']} failed |",
     ]
+    if summary.get("execution", {}).get("profile") == PROFILE_V02:
+        telemetry = summary.get("telemetry", {})
+        ple = telemetry.get("ple", {})
+        vision = telemetry.get("vision", {})
+        chunks = telemetry.get("prefill_chunks", {})
+        moe_prefill = telemetry.get("moe_prefill", {})
+        lines.extend([
+            f"| 261K boundary TTFT | {float(gates.get('long_context_ttft_ms') or 0):.1f} ms |",
+            "| 261120 input + 1024 output (text / image) | passed / passed |",
+            f"| Selector workspace peak | {int(telemetry.get('selector', {}).get('workspace_peak_bytes') or 0) / 1024**2:.1f} MiB |",
+            f"| PLE storage read / cache hits | {int(ple.get('bytes_read') or 0)} B / {int(ple.get('cache_hits') or 0)} |",
+            f"| Vision tokens / latency | {int(vision.get('image_tokens') or 0)} / {float(vision.get('latency_ms') or 0):.1f} ms |",
+            f"| Prefill chunks / total time | {int(chunks.get('count') or 0)} / {float(chunks.get('total_ms') or 0):.1f} ms |",
+            f"| Sparse MoE active rows | {int(moe_prefill.get('active_rows') or 0)} / {int(moe_prefill.get('possible_rows') or 0)} |",
+            f"| Sparse MoE PCIe bytes | {int(moe_prefill.get('bytes_copied') or 0)} / {int(moe_prefill.get('full_bytes') or 0)} |",
+        ])
     return "\n".join(lines)
 
 
@@ -1004,10 +1672,13 @@ def update_marked_text(text: str, generated: str) -> str:
 def find_release_input(
     root: Path,
     *,
+    expected_profile: str | None = None,
     expected_commit: str | None = None,
     tag_commit: str | None = None,
     repo_root: Path | None = None,
 ) -> Path:
+    if expected_profile not in {None, PROFILE_V01, PROFILE_V02}:
+        raise EvidenceError(f"unsupported requested release profile: {expected_profile}")
     candidates: list[Path] = []
     failures: list[str] = []
     for directory in sorted(root.glob("rtx5090-*"), reverse=True):
@@ -1019,13 +1690,21 @@ def find_release_input(
             failures.append(f"{directory.name}: evidence directory escapes results root")
             continue
         try:
-            validate_directory(
+            summary = validate_directory(
                 directory,
                 release=True,
                 expected_commit=expected_commit,
                 tag_commit=tag_commit,
                 repo_root=repo_root,
             )
+            actual_profile = str(
+                summary.get("execution", {}).get("profile") or PROFILE_V01
+            )
+            if expected_profile is not None and actual_profile != expected_profile:
+                raise EvidenceError(
+                    f"evidence profile {actual_profile} does not match requested "
+                    f"release profile {expected_profile}"
+                )
         except EvidenceError as exc:
             failures.append(f"{directory.name}: {exc}")
         else:
@@ -1055,6 +1734,7 @@ def _command(args: argparse.Namespace) -> int:
     elif args.command == "release-input":
         directory = find_release_input(
             Path(args.root),
+            expected_profile=args.profile,
             expected_commit=args.expected_commit,
             tag_commit=args.tag_commit,
             repo_root=Path(args.repo_root) if args.repo_root else None,
@@ -1098,6 +1778,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("validate-example", help="validate the tracked synthetic example")
     release = commands.add_parser("release-input", help="select the newest release-eligible bundle")
     release.add_argument("--root", default="results")
+    release.add_argument("--profile", choices=(PROFILE_V01, PROFILE_V02), required=True)
     release.add_argument("--print-path", action="store_true")
     release.add_argument("--expected-commit")
     release.add_argument("--tag-commit")

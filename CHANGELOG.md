@@ -7,7 +7,77 @@ before the audited base remains available in Git; see
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0-alpha.1] - Unreleased
+## [0.2.0-alpha.1] - Unreleased candidate
+
+This entry describes source currently under validation. It is not a support
+claim and no `v0.2.0-alpha.1` tag or release should be created until the full
+RTX 5090 evidence gates below pass.
+
+### Added
+
+- Candidate `rtx5090-wsl2-256k-image` profile with a 262,144-token total
+  context budget, 512-token prefill chunks, TP=1, one running request, naive
+  cache, graph disabled, and fail-closed memory planning.
+- Compressed QSA index-key persistence at one row per four tokens, request-local
+  tail state and mRoPE positions, and a 6.1875 GiB full-context QSA cache budget.
+- `qsa_triton_sm120` with a bounded 128 MiB FP32 score workspace and an
+  Apache-2.0 top-512 CUDA specialization adapted from
+  `yhfgyyf/sglang-qwen38-flash-next-sm120` at commit
+  `30edf3503961a471b25150aa890f8166031b5738`; Torch and Triton correctness
+  fallbacks remain available to v0.1/debug paths, while the v0.2 profile
+  requires the native kernel and fails closed on any fallback.
+- Native Linux `io_uring` + `O_DIRECT` PLE reads with 4 KiB alignment, queue
+  depth 512, batches up to 4,096 pages, one globally bounded 4 GiB native LRU,
+  next-chunk prefetch, and double-buffered pinned FP8 staging for GPU
+  decode/scale to BF16.
+- Route-aware native-NVFP4 MoE prefill movement for the candidate profile. A
+  bounded expert mask discovers selected raw IDs after each layer's router;
+  coalesced active rows move for banks with per-expert rows of at least 256 KiB,
+  while smaller banks still move as one whole-layer entry. The implementation
+  preserves raw IDs and full `[E]` GPU double buffers, uses direct registered
+  copies or the fixed 64 MiB bounce allocation according to host residency, and
+  exports active/possible-row plus copied/full-byte telemetry. This is a data-
+  movement candidate, not a validated performance claim.
+- Opt-in Qwen4-Exp image tower and weight mapping, pinned Transformers processor,
+  placeholder expansion, `image_grid_thw`, three-axis interleaved mRoPE, and
+  visual embedding injection before four-stream residual replication.
+- Per-chunk visual embedding scatter from a CPU-resident BF16 plan, with image
+  requests excluded from shared text prefix reuse and all media state released
+  at request completion.
+- OpenAI structured `image_url` input for HTTPS and base64 data URLs, bounded at
+  four images, 20 MiB each, 40 MiB total, and a ten-second deadline. Local/HTTP,
+  loopback/private/link-local/reserved endpoints, rebinding, unsafe redirects,
+  invalid MIME types, audio, and video fail with explicit client errors.
+- v0.2 evidence schemas and gates for 32K/128K/261,120 prompts, exact text and
+  image `261,120 input + 1,024 output` boundaries,
+  selector/PLE/vision/chunk/MoE-prefill telemetry, mixed-request stability/soak,
+  cold/warm PLE measurements, and a native all-shard-boundary plus deterministic
+  hash-row parity probe against independent safetensors slices.
+
+### Changed
+
+- `q38lab doctor` now reports candidate QSA, PLE, vision, MoE, disk, ext4,
+  `O_DIRECT`, `io_uring`, and locked-memory budget details for the new profile.
+- Context overflow errors account separately for rendered text tokens, expanded
+  image tokens, requested output, and the 262,144 total limit.
+- Release attribution records the SGLang Qwen3.8 integration, PLE NVMe, and
+  SM120 QSA design references without importing their 96 GB, MTP, CUDA Graph,
+  or performance claims.
+
+### Pending release gates
+
+- Full-checkpoint text and real-image requests must each complete exactly
+  261,120 input plus 1,024 output tokens; 8K regression, 32K, and 128K must pass.
+- 261K TTFT must be at most 15 minutes and 256--1,024-token steady decode at
+  least 5 tok/s, with peak VRAM below 31 GiB, WSL RSS below 105 GiB, and WSL
+  swap at zero.
+- Needle-in-a-Haystack, deterministic OCR/object/chart cases, streaming versus
+  non-streaming, thinking, tools plus images, 100/100 mixed sequential requests,
+  and a 30-minute leak-free soak must pass.
+- All README performance fields must be generated from reviewed v0.2 evidence.
+  Until then the public support matrix and benchmark summary remain v0.1 only.
+
+## [0.1.0-alpha.1] - 2026-08-27
 
 ### Added
 

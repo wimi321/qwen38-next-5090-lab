@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
-  <title id="title">Qwen3.8 Next 5090 Lab text-only execution architecture</title>
-  <desc id="desc">A local OpenAI-compatible request enters the FreeToken downstream text tower. Four residual streams pass through 36 gated delta network layers and 12 query-selective attention layers. The PLE table is memory mapped, selected FP8 rows are decoded on the CPU, converted into pinned BF16 staging, and transferred to the GPU. Routed NVFP4 experts use a heterogeneous CPU, host memory, PCIe, and GPU cache path.</desc>
+  <title id="title">Qwen3.8 Next 5090 Lab v0.2 candidate architecture</title>
+  <desc id="desc">An unreleased and not yet hardware-validated 256K image candidate. Structured text and image requests enter the tokenizer and Qwen vision tower. Visual embeddings are injected before four residual streams pass through 36 gated delta network layers and 12 query-selective attention layers. QSA keeps one index key per four tokens and uses a bounded SM120 top-512 selector. Sparse PLE rows stream from NVMe through native io_uring and O_DIRECT into a bounded host LRU, double-buffered pinned FP8 staging, and GPU BF16 decode. Routed NVFP4 experts use heterogeneous CPU, host memory, PCIe, and GPU cache paths; candidate prefill preserves raw expert IDs, moves active rows for large banks, and copies small banks whole.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1020"/>
@@ -33,7 +33,7 @@
 
   <rect width="1200" height="760" rx="24" fill="url(#bg)"/>
   <text class="title" x="48" y="52">Qwen3.8 Next 5090 Lab</text>
-  <text class="subtitle" x="48" y="78">Verified alpha path · text only · TP=1 · max-running=1 · 8K · naive cache · graph=0 · W4A16 compatibility</text>
+  <text class="subtitle" x="48" y="78">v0.2 source candidate · NOT hardware validated · 262,144 total tokens · images · TP=1 · max-running=1 · graph=0</text>
 
   <rect class="box" x="48" y="118" width="220" height="105" fill="#172554"/>
   <text class="label" x="70" y="151">Local client</text>
@@ -42,25 +42,26 @@
 
   <rect class="box" x="322" y="118" width="250" height="105" fill="#1e293b"/>
   <text class="label" x="344" y="151">Tokenizer + scheduler</text>
-  <text class="body" x="344" y="178">Text payloads only</text>
-  <text class="small" x="344" y="202">One running request</text>
+  <text class="body" x="344" y="178">Text + validated image bytes</text>
+  <text class="small" x="344" y="202">processor · mRoPE · 512-token chunks</text>
 
   <rect class="box" x="626" y="102" width="526" height="137" fill="url(#gpu)"/>
-  <text class="label" x="650" y="135">Qwen4-Exp text tower on RTX 5090</text>
+  <text class="label" x="650" y="135">Qwen4-Exp candidate on RTX 5090</text>
   <rect x="650" y="154" width="155" height="50" rx="10" fill="#312e81" stroke="#c4b5fd"/>
-  <text class="body" x="669" y="177">Embedding</text>
-  <text class="small" x="669" y="195">replicate ×4 streams</text>
+  <text class="body" x="669" y="177">Text embedding</text>
+  <text class="small" x="669" y="195">image placeholders</text>
   <rect x="829" y="154" width="146" height="50" rx="10" fill="#312e81" stroke="#c4b5fd"/>
-  <text class="body" x="848" y="177">48 layers</text>
-  <text class="small" x="848" y="195">gated residual</text>
+  <text class="body" x="848" y="177">Vision ×27</text>
+  <text class="small" x="848" y="195">patches + merger</text>
   <rect x="999" y="154" width="129" height="50" rx="10" fill="#312e81" stroke="#c4b5fd"/>
-  <text class="body" x="1018" y="177">Mixer</text>
-  <text class="small" x="1018" y="195">LM head</text>
+  <text class="body" x="1018" y="177">Inject image</text>
+  <text class="small" x="1018" y="195">then replicate ×4</text>
 
   <path class="arrow" d="M268 170 H322"/>
   <path class="arrow" d="M572 170 H626"/>
-  <path class="arrow" d="M805 179 H829"/>
+  <path class="arrow" d="M805 179 H999"/>
   <path class="arrow" d="M975 179 H999"/>
+  <path class="dashed" d="M572 188 C650 250 847 250 902 204"/>
 
   <rect class="box" x="48" y="284" width="526" height="202" fill="#111827"/>
   <text class="label" x="72" y="317">Layer attention paths</text>
@@ -71,9 +72,9 @@
   <text class="small" x="92" y="435">request-local state pool</text>
   <rect x="314" y="339" width="236" height="112" rx="12" fill="#4c1d95" stroke="#c084fc"/>
   <text class="body" x="334" y="368">12 × QSA</text>
-  <text class="small" x="334" y="393">4-token index blocks</text>
-  <text class="small" x="334" y="414">top-512 blocks (pinned config)</text>
-  <text class="small" x="334" y="435">main K/V + index-key cache</text>
+  <text class="small" x="334" y="393">one index key / 4 tokens</text>
+  <text class="small" x="334" y="414">128 MiB · SM120 top-512</text>
+  <text class="small" x="334" y="435">6.1875 GiB K/V + index cache</text>
 
   <rect class="box" x="626" y="284" width="526" height="202" fill="url(#gpu)"/>
   <text class="label" x="650" y="317">Mixture of Experts</text>
@@ -84,28 +85,28 @@
   <text class="small" x="670" y="435">+ shared expert</text>
   <rect x="868" y="339" width="260" height="112" rx="12" fill="#312e81" stroke="#c4b5fd"/>
   <text class="body" x="888" y="368">Heterogeneous offload</text>
-  <text class="small" x="888" y="393">NVFP4 expert banks in host RAM</text>
-  <text class="small" x="888" y="414">pageable CPU layers + pinned banks</text>
-  <text class="small" x="888" y="435">PCIe → GPU expert LRU cache</text>
+  <text class="small" x="888" y="393">raw-ID active rows · large banks</text>
+  <text class="small" x="888" y="414">small banks copy whole layer</text>
+  <text class="small" x="888" y="435">pinned DMA · 64 MiB bounce</text>
 
   <rect class="box" x="48" y="535" width="1104" height="163" fill="url(#host)"/>
-  <text class="label" x="72" y="568">PLE auxiliary path · layer 2 (one-indexed)</text>
+  <text class="label" x="72" y="568">Candidate PLE NVMe path · layer 2 (one-indexed)</text>
   <rect x="72" y="592" width="204" height="72" rx="11" fill="#064e3b" stroke="#6ee7b7"/>
-  <text class="body" x="91" y="618">Read-only safetensors mmap</text>
-  <text class="small" x="91" y="641">sparse matched FP8 rows only</text>
+  <text class="body" x="91" y="618">Native direct reads</text>
+  <text class="small" x="91" y="641">io_uring + O_DIRECT · ext4</text>
   <rect x="310" y="592" width="204" height="72" rx="11" fill="#064e3b" stroke="#6ee7b7"/>
-  <text class="body" x="329" y="618">CPU row decode</text>
-  <text class="small" x="329" y="641">FP8 → FP32 + scale</text>
+  <text class="body" x="329" y="618">Bounded native LRU</text>
+  <text class="small" x="329" y="641">4 GiB · next-chunk prefetch</text>
   <rect x="548" y="592" width="204" height="72" rx="11" fill="#064e3b" stroke="#6ee7b7"/>
-  <text class="body" x="567" y="618">Pinned staging</text>
-  <text class="small" x="567" y="641">convert to BF16 on CPU</text>
+  <text class="body" x="567" y="618">Pinned FP8 staging</text>
+  <text class="small" x="567" y="641">double buffered · sparse rows</text>
   <rect x="786" y="592" width="342" height="72" rx="11" fill="#312e81" stroke="#c4b5fd"/>
-  <text class="body" x="805" y="618">GPU PLE projection + convolution</text>
-  <text class="small" x="805" y="641">non-blocking H2D; request-local history/state</text>
+  <text class="body" x="805" y="618">GPU FP8 decode → BF16 + PLE</text>
+  <text class="small" x="805" y="641">projection/convolution · request-local state</text>
   <path class="dashed" d="M276 628 H310"/>
   <path class="dashed" d="M514 628 H548"/>
   <path class="dashed" d="M752 628 H786"/>
   <path class="dashed" d="M957 592 C957 528 891 518 891 486"/>
 
-  <text class="small" x="48" y="731">The full ~51 GB PLE table remains file-backed; only requested rows are staged. Vision tower and MTP weights are not loaded.</text>
+  <text class="small" x="48" y="731">Candidate only: the full ~51 GB PLE table stays file-backed; images bypass shared prefix cache; video, audio, MTP and radix cache remain disabled.</text>
 </svg>

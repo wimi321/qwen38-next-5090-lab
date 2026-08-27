@@ -18,7 +18,10 @@ gated residual 和异构 MoE offload。
 
 ![Qwen3.8 Next 5090 Lab 架构](docs/assets/q38lab-architecture.svg)
 
-## 已验证的 alpha 边界
+架构图展示的是未发布的 v0.2 候选路径；已验证的 v0.1 不含 vision 分支，并使用
+下文说明的 mmap/CPU PLE 解码。
+
+## 已验证的 v0.1 边界
 
 | 项目 | `v0.1.0-alpha.1` 承诺范围 |
 |---|---|
@@ -34,16 +37,61 @@ checkpoint 声明 routed expert 使用 W4A4 方案。本 alpha 保留 packed NVF
 权重，但没有消费 checkpoint 的 activation-scale 契约，所以当前结果只能称为
 W4A16 compatibility，不能继承 W4A4 的质量结论，也不能声称与其数值等价。
 
-## 为什么能放进这台机器
+## v0.2 候选版：256K 与图片
 
-- **PLE 只读取命中的行。** 约 51 GB FP8 PLE 表以只读 safetensors mmap
-  形式存在。CPU 只复制命中行，以 FP32 解码并应用 scale，然后转换为 pinned
-  BF16 staging，最后传到 GPU。项目没有把整个 PLE 表搬进 GPU。
-- **QSA 使用独立缓存。** 12 个稀疏注意力层在 4-token block 上选择，保存主
-  K/V 和 index-key 状态；其余 36 层运行 gated delta recurrence。
+当前开发分支包含 `v0.2.0-alpha.1`（代码版本 `0.2.0a1`）的源码候选版，
+但这**不是已经发布或完成硬件验证的支持声明**。在固定完整 checkpoint 的一次
+证据运行通过全部 v0.2 门槛之前，已验证支持矩阵仍以上面的 v0.1 表格为准。
+
+| 候选项目 | `v0.2.0-alpha.1` 未验证目标（硬件 harness 待完成） |
+|---|---|
+| 上下文计数 | 总计 262,144 token，包括渲染后的文本、展开后的图片 token 与输出 |
+| 边界证明 | 文本和含真实图片的请求各完成一次准确的 261,120 输入 + 1,024 输出 |
+| 硬件 / 调度 | 单张 RTX 5090（32 GB）、WSL2、TP=1、同时一个请求、512-token prefill chunk |
+| Cache / graph | naive cache；关闭 radix prefix reuse 和 CUDA graph |
+| 图片 | OpenAI 结构化 `image_url`；HTTPS 或 base64 data URL；最多 4 张 |
+| 仍不支持 | 视频、音频、MTP、radix cache、TP>1、多请求调度及超过 262,144 token |
+
+候选 profile 的入口为：
+
+```bash
+q38lab doctor --profile rtx5090-wsl2-256k-image
+q38lab serve --profile rtx5090-wsl2-256k-image
+q38lab smoke --images
+```
+
+这些命令存在不等于已通过整模门槛。发布前必须完成准确的文本/图片边界请求、
+Needle-in-a-Haystack 和确定答案图片用例、100/100 次文本/图片混合顺序请求、
+至少 30 分钟 soak，并满足 TTFT 不超过 15 分钟、稳态 decode 不低于 5 tok/s、
+峰值显存低于 31 GiB、WSL RSS 低于 105 GiB、WSL swap 为 0。没有这些原始
+记录前，不发布任何 v0.2 性能数字。
+
+## 执行路径
+
+- **PLE 只读取命中的行。** 已验证 v0.1 使用只读 safetensors mmap，在 CPU
+  解码命中行。v0.2 候选 profile 则强制要求 Linux 原生 `io_uring` +
+  `O_DIRECT`、全局有界的 4 GiB 原生 LRU、4 KiB 对齐读取、queue depth 512，
+  每批最多 4,096 页；双缓冲 pinned FP8 行传到 GPU 后解码、缩放为 BF16。
+  mmap 在该 profile 中仅为单测/debug fallback。
+- **QSA 使用独立缓存。** v0.2 候选版为每 4 token 持久保存一个 index key，
+  并保留请求级尾部 ring 和真实 mRoPE 坐标。完整 256K 的 12 层主 K/V 与压缩
+  索引预算为 6.1875 GiB；SM120 selector 使用最大 128 MiB 的 FP32 workspace
+  和 top-512 kernel，同时保留 Torch oracle 与原 Triton 路径作为正确性 fallback。
 - **专家权重跨越多级内存。** 每层 512 个 routed experts 采用 top-10，结合
   pageable CPU layers、pinned host banks、PCIe 传输和 GPU expert cache；
-  shared expert 仍在每层参与计算。
+  shared expert 仍在每层参与计算。v0.2 候选 profile 还启用 route-aware 的
+  native-NVFP4 prefill 搬运：当前层 router 完成后，用固定 512 项的 mask 找出
+  命中的 raw expert ID。单个 expert 行不小于 256 KiB 的大 bank 只搬运按 ID
+  合并后的命中连续段；更小的 bank 仍作为一个整层条目搬运，以保证 CUDA
+  batched copy 保持异步。该路径保留 raw ID 和完整 `[E]` 双缓冲布局，不做
+  expert-ID 压紧，也不会减少为 GPU buffer 预留的空间。已注册的 pinned bank
+  在可用时直接 DMA；LOCKED/PAGEABLE 层经过两个固定的 32 MiB pinned bounce
+  slab。
+- **图片在四路 residual 复制前注入。** 候选版加载 27 层 vision tower，用固定
+  Transformers `5.16.1` processor 展开 placeholder，构建三轴 interleaved
+  mRoPE；合并后的视觉 embedding 在四路 gated-residual stream 复制前写入。
+  每张图片只编码一次，完整 BF16 embedding 暂存在 pageable CPU；每个
+  512-token prefill chunk 只传输与当前图片 span 相交的部分。
 - **性能数字有原始证据。** environment、最终解析配置、请求时间、RSS、VRAM、
   page fault、PCIe 采样、测试结果和 checksum 一起保存；README 的数字由
   `summary.json` 生成。
@@ -102,10 +150,30 @@ CLI 参数 > `Q38LAB_*` 环境变量 > profile 默认值。
 拒绝把无鉴权服务绑定到非 loopback 地址。`--unsafe-allow-non-loopback` 只表示
 风险确认，不会增加鉴权或 TLS；不要把此开发服务直接暴露到网络。
 
-运行完整 API 冒烟测试：
+未发布的 256K/图片候选版使用独立 profile；原生 `io_uring`/`O_DIRECT` 或内存
+预算不满足时会拒绝启动：
 
 ```bash
-q38lab smoke
+q38lab serve --profile rtx5090-wsl2-256k-image
+```
+
+该 profile 解析为 `max-seq-len=num-tokens=262144`、
+`max-prefill-length=512`、`max-running-requests=1`、`qsa_triton_sm120`、
+naive cache、graph 关闭、原生 PLE streaming、vision 加载，以及 route-aware
+native-NVFP4 MoE prefill。稀疏 MoE 路径要求已有的双缓冲 prefill cache，并会
+拒绝任何非 native NVFP4 的 bank 布局。它有意等待当前层的 routing 结果，不再
+提前搬运下一层完整 expert bank，同时关闭独立的 prefill hit-D2D 路径；因此
+净性能必须由 evidence 回答，不能从源码直接宣称。预算器先为 QSA cache、
+selector workspace、vision 权重与运行余量预留显存，再自动定容 GPU expert
+cache；固定几何无法装进解析后的 0.89 预算时会直接失败。严格低于 31 GiB 的
+峰值由后续 evidence gate 实测，不由这项预算算术单独证明。
+
+使用维护者选定的公开 HTTPS fixture 检查未验证的候选接口；这条 smoke 命令
+不构成发布证据：
+
+```bash
+HTTPS_IMAGE_URL='https://replace-with-your-public-fixture.example/chart.png'
+q38lab smoke --images --https-image-url "$HTTPS_IMAGE_URL"
 ```
 
 也可以用 OpenAI Python 客户端调用：
@@ -123,6 +191,41 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+v0.2 源码候选版包含通过同一 API 传入图片的未验证路径。下面只展示请求格式，
+不代表已经发布的验收结果或已支持的输入契约：
+
+```python
+response = client.chat.completions.create(
+    model="qwen3.8-flash-next-nvfp4",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.org/chart.png"}},
+            {"type": "text", "text": "图表里的最高值是多少？"},
+        ],
+    }],
+    temperature=0,
+    max_tokens=128,
+)
+```
+
+候选实现只处理 HTTPS 和 base64 图片 data URL；这些限制本身不是硬件验收结果。
+每个请求最多 4 张、单张不超过 20 MiB、
+总计不超过 40 MiB，抓取总超时 10 秒。HTTP/本地文件、loopback、private、
+link-local 或 reserved 地址、不安全重定向、DNS rebinding、不支持的 MIME、
+音频和视频都会被拒绝。含图片的请求不会进入共享文本 prefix cache；请求释放时
+同步清理媒体字节、视觉 embedding 和 mRoPE 状态。
+
+`Q38LAB_DOH_FALLBACK=1` 只用于 WSL/TUN 的透明 fake-IP DNS 把所有公网域名都
+解析为 non-global 地址的环境，默认关闭。显式开启后，fallback 连接固定的
+Cloudflare DoH 公网 IP `1.1.1.1` 和 `1.0.0.1`，同时用
+`cloudflare-dns.com` 做 TLS SNI 与证书校验；DoH 返回的目标地址仍必须全部是
+global。公网/non-global 混合答案和数字 IP 字面量永远不会走 fallback。
+`doctor --json` 与发布证据会记录是否开启该选项，
+也会记录 libc `getaddrinfo` 只有受 deadline 和四个槽位约束的软取消：已经进入
+libc 的查询没有可移植的硬取消机制。这个兼容路径不会把 v0.2 候选版变成已验证
+支持，也不会降低任何证据门槛。
+
 流式调用只需加入 `stream=True` 并迭代 chunks。`q38lab smoke` 还覆盖两种
 thinking 模式和一次带 schema 的工具调用。模型输出不是安全边界；应用仍必须
 校验工具名和参数。
@@ -130,7 +233,8 @@ thinking 模式和一次带 schema 的工具调用。模型输出不是安全边
 ## 复现实测证据
 
 ```bash
-q38lab bench --out results/rtx5090-YYYY-MM-DD
+q38lab bench --profile rtx5090-wsl2 \
+  --out results/rtx5090-YYYY-MM-DD
 ```
 
 这是唯一的正式 release harness，不是快速 microbenchmark。它会重新 hash 完整
@@ -140,6 +244,37 @@ checkpoint，运行非 slow 测试，验证 prompt/API 门槛与 100 个顺序�
 
 不能脱离相邻的 environment 和 resolved-config 记录单独比较数字。TTFT 从客户端
 观测；“effective prefill”包含固定请求开销与 CPU staging，不是纯 kernel benchmark。
+
+v0.2 harness 按 profile 记录 selector workspace 上限、PLE 读取量/cache/wait/
+page-fault、图片 token、vision latency、各 prefill chunk timing，以及
+route-aware MoE prefill 计数。`q38lab.moe_prefill` snapshot 会给出各层调用中
+命中的唯一 expert 行总数、对应的 512 行机会数、实际计划复制的字节，以及假设
+所有 bank 都整层复制时的字节数。由于小于 256 KiB 的 bank 仍整层搬运，byte
+fraction 与 row fraction 本来就可能不同；这些是搬运记账计数，不是虚构的硬件
+PCIe 实测值。启动证明还会携带真实 PLE checkpoint 探针：128 个 shard 的全部
+边界行以及 8 个确定性 bigram/trigram hash 行，必须在 GPU FP8 解码后与独立
+safetensors slice 精确一致。
+只有同时包含
+两次 261,120 + 1,024 边界证明，并通过资源、吞吐、混合顺序请求和 soak 门槛的
+证据目录才可发布。正式审阅记录出现以前，英文 README 的 generated benchmark
+区块会有意保留 v0.1 结果。
+
+候选 profile 必须使用维护者持有的确定性本地图片和稳定的公开 HTTPS fixture：
+
+```bash
+q38lab bench --profile rtx5090-wsl2-256k-image \
+  --image-file "$HOME/q38lab-fixtures/chart.png" \
+  --https-image-url "https://example.org/q38lab-chart.png" \
+  --decode-tokens 1024 \
+  --out results/rtx5090-256k-image-YYYY-MM-DD
+```
+
+两个图片参数都是必填项；30 分钟 soak 会持续交替文本/图片请求，避免图片专属
+泄漏在后续纯文本平台期中被掩盖；`--decode-tokens` 可取 256–1,024。harness 会核对
+干净 commit 的启动证明、独立计算所有边界 token，并在门槛或 telemetry
+cross-check 缺失时拒绝生成可发布证据。若透明 fake-IP 环境必须开启 DoH
+fallback，应给 `doctor`、`serve` 和 `bench` 使用相同的
+`Q38LAB_DOH_FALLBACK=1`；证据会保留该 opt-in 值与系统 resolver 的软取消局限。
 
 本次硬件记录包括：非 slow 测试 1,530 passed / 9 skipped / 11 deselected；
 峰值显存 31,668 MiB（30.926 GiB）；WSL 峰值 RSS 72.234 GiB；100/100
@@ -156,15 +291,17 @@ p50 为 1,122.6 tok/s；另行测得 256-token 稳态 decode 为 14.014 tok/s。
 
 ## 项目状态
 
-alpha 有意保持小范围，后续里程碑依次为：
+已验证的 v0.1 alpha 有意保持小范围。未发布的 v0.2 源码包含上述 256K/图片
+候选路径，但在完整硬件门槛通过之前仍未验证，也不进入支持矩阵。更后续的
+里程碑包括：
 
 1. 完整 reference parity 与原生 SM120 W4A4 activation path。
-2. PLE telemetry / hot-row cache，以及经过实机验证的 CUDA graph capture/replay。
-3. 图片处理器、媒体传输、vision prefill、mRoPE 和安全 cache 语义。
+2. PLE hot-row 优化，以及经过验证的 QSA/PLE CUDA graph capture/replay。
+3. 视频/音频评估、MTP、radix-cache 语义和超过单请求 262,144 token 的上下文。
 
-目前媒体输入会被拒绝。checkpoint 本身是多模态，并不意味着在线服务已经支持
-多模态；processor、vision tower、placeholder expansion 和 media-aware cache
-必须全部实现并验证后才能这样宣称。
+v0.1 profile 仍拒绝媒体。源码中存在候选实现也不等于 v0.2 已获得支持：在线
+图片管线、vision tower、placeholder expansion、mRoPE、chunk scatter、资源
+清理与安全控制必须通过固定整模证据门槛，支持矩阵才会更新。
 
 ## 来源、贡献与引用
 
@@ -172,6 +309,15 @@ alpha 有意保持小范围，后续里程碑依次为：
 `9ef3651309fe4058672f2cc92069238dea06be1b`。下游变更见
 [MODIFICATIONS.md](MODIFICATIONS.md)，保留的第三方归属见
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+v0.2 SM120 top-512 specialization 是对
+[`yhfgyyf/sglang-qwen38-flash-next-sm120`](https://github.com/yhfgyyf/sglang-qwen38-flash-next-sm120)
+准确 commit `30edf3503961a471b25150aa890f8166031b5738` 的 Apache-2.0 改编。
+设计审阅还参考了 SGLang 的
+[Qwen3.8 集成 PR #36497](https://github.com/sgl-project/sglang/pull/36497)、
+[PLE NVMe PR #36567](https://github.com/sgl-project/sglang/pull/36567) 和
+[SM120 QSA PR #36556](https://github.com/sgl-project/sglang/pull/36556)。
+这些项目和结果不为本下游背书；其 96 GB、MTP、CUDA Graph 参数与性能数字
+也不是本项目结果。
 
 每项贡献都必须由人类维护者理解并实测。项目不接受模型权重、隐私日志、编造的
 benchmark 或无人复核的纯 agent 提交。提交 issue 或 PR 前请阅读

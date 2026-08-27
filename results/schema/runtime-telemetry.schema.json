@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wimi321/qwen38-next-5090-lab/results/schema/runtime-telemetry.schema.json",
+  "title": "Sanitized v0.2 runtime telemetry snapshots",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "samples"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "samples": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        {"$ref": "#/$defs/baseline"}, {"$ref": "#/$defs/cold"},
+        {"$ref": "#/$defs/warm1"}, {"$ref": "#/$defs/warm2"},
+        {"$ref": "#/$defs/warm3"}, {"$ref": "#/$defs/final"}
+      ]
+    }
+  },
+  "$defs": {
+    "counterGroup": {
+      "type": "object",
+      "additionalProperties": {"type": "number", "minimum": 0}
+    },
+    "selectorGroup": {
+      "type": "object",
+      "required": ["workspace_peak_bytes", "native_calls", "fallback_calls", "errors"],
+      "properties": {
+        "workspace_peak_bytes": {"type": "integer", "minimum": 0, "maximum": 134217728},
+        "native_calls": {"type": "integer", "minimum": 0},
+        "fallback_calls": {"type": "integer", "minimum": 0},
+        "errors": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "moePrefillGroup": {
+      "type": "object",
+      "required": ["active_rows", "possible_rows", "bytes_copied", "full_bytes", "row_fraction", "byte_fraction"],
+      "properties": {
+        "active_rows": {"type": "integer", "minimum": 0},
+        "possible_rows": {"type": "integer", "minimum": 0},
+        "bytes_copied": {"type": "integer", "minimum": 0},
+        "full_bytes": {"type": "integer", "minimum": 0},
+        "row_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "byte_fraction": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "sample": {
+      "type": "object",
+      "required": ["phase", "selector", "ple", "vision", "prefill_chunks", "moe_prefill"],
+      "properties": {
+        "phase": {"type": "string"},
+        "selector": {"$ref": "#/$defs/selectorGroup"},
+        "ple": {"$ref": "#/$defs/counterGroup"},
+        "vision": {"$ref": "#/$defs/counterGroup"},
+        "prefill_chunks": {"$ref": "#/$defs/counterGroup"},
+        "moe_prefill": {"$ref": "#/$defs/moePrefillGroup"}
+      }
+    },
+    "baseline": {"allOf": [{"$ref": "#/$defs/sample"}, {"properties": {"phase": {"const": "baseline"}}}]},
+    "cold": {"allOf": [{"$ref": "#/$defs/sample"}, {"properties": {"phase": {"const": "cold"}}}]},
+    "warm1": {"allOf": [{"$ref": "#/$defs/sample"}, {"properties": {"phase": {"const": "warm-1"}}}]},
+    "warm2": {"allOf": [{"$ref": "#/$defs/sample"}, {"properties": {"phase": {"const": "warm-2"}}}]},
+    "warm3": {"allOf": [{"$ref": "#/$defs/sample"}, {"properties": {"phase": {"const": "warm-3"}}}]},
+    "final": {"allOf": [{"$ref": "#/$defs/sample"}, {"properties": {"phase": {"const": "final"}}}]}
+  }
+}

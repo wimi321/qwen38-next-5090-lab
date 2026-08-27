@@ -7,7 +7,7 @@
   "required": ["schema_version", "profile", "served_model_name", "model_basename", "settings"],
   "properties": {
     "schema_version": {"const": "1.0"},
-    "profile": {"const": "rtx5090-wsl2"},
+    "profile": {"enum": ["rtx5090-wsl2", "rtx5090-wsl2-256k-image"]},
     "served_model_name": {"type": "string"},
     "model_basename": {"type": "string"},
     "settings": {
@@ -18,18 +18,47 @@
         "port": {"const": 1919},
         "tp_size": {"const": 1},
         "max_running_requests": {"const": 1},
-        "max_seq_len": {"const": 8192},
-        "max_prefill_length": {"const": 8192},
-        "num_tokens": {"const": 8192},
+        "max_seq_len": {"enum": [8192, 262144]},
+        "max_prefill_length": {"enum": [512, 8192]},
+        "num_tokens": {"enum": [8192, 262144]},
         "memory_ratio": {"const": 0.89},
         "cache_type": {"const": "naive"},
-        "attention_backend": {"const": "qsa_triton"},
+        "attention_backend": {"enum": ["qsa_triton", "qsa_triton_sm120"]},
         "cuda_graph": {"const": false},
         "moe_backend": {"const": "offload"},
         "moe_cache_auto": {"const": true},
+        "moe_prefill_sparse": {"const": true},
         "moe_cpu_layers": {"type": "null"},
-        "nvfp4_backend": {"const": "auto"}
+        "nvfp4_backend": {"const": "auto"},
+        "qsa_require_native_topk": {"const": true},
+        "ple_io_backend": {"const": "io_uring_odirect"},
+        "ple_require_native_io_uring": {"const": true},
+        "ple_cache_bytes": {"const": 4294967296},
+        "ple_queue_depth": {"const": 512},
+        "ple_max_batch_pages": {"const": 4096},
+        "ple_staging_buffers": {"const": 2},
+        "vision_enabled": {"const": true},
+        "gpu_memory_envelope_bytes": {"const": 33285996544},
+        "gpu_runtime_reserve_bytes": {"const": 536870912}
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"profile": {"const": "rtx5090-wsl2-256k-image"}}},
+      "then": {
+        "properties": {"settings": {
+          "required": ["moe_prefill_sparse", "ple_io_backend", "ple_require_native_io_uring", "ple_cache_bytes", "ple_queue_depth", "ple_max_batch_pages", "ple_staging_buffers", "qsa_require_native_topk", "vision_enabled", "gpu_memory_envelope_bytes", "gpu_runtime_reserve_bytes"],
+          "properties": {
+            "max_seq_len": {"const": 262144}, "max_prefill_length": {"const": 512},
+            "num_tokens": {"const": 262144}, "attention_backend": {"const": "qsa_triton_sm120"}
+          }
+        }}
+      },
+      "else": {"properties": {"settings": {"properties": {
+        "max_seq_len": {"const": 8192}, "max_prefill_length": {"const": 8192},
+        "num_tokens": {"const": 8192}, "attention_backend": {"const": "qsa_triton"}
+      }}}}
+    }
+  ]
 }

@@ -33,7 +33,9 @@ jobs:
           PYTHONPATH=python python -m pytest -q tests/q38lab
       - name: Validate source package metadata
         run: |
-          python -c 'import ast,pathlib,tomllib; p=tomllib.loads(pathlib.Path("pyproject.toml").read_text()); tree=ast.parse(pathlib.Path("python/freetoken/version.py").read_text()); version=tree.body[0].value.value; assert p["project"]["name"] == "qwen38-next-5090-lab"; assert version == "0.1.0a1"; assert p["project"]["scripts"]["q38lab"] == "q38lab.cli:main"; assert p["project"]["urls"]["Upstream"] == "https://github.com/FlashML-org/FreeToken"'
+          python -c 'import ast,pathlib,tomllib; p=tomllib.loads(pathlib.Path("pyproject.toml").read_text()); tree=ast.parse(pathlib.Path("python/freetoken/version.py").read_text()); version=tree.body[0].value.value; assert p["project"]["name"] == "qwen38-next-5090-lab"; assert version == "0.2.0a1"; assert p["project"]["scripts"]["q38lab"] == "q38lab.cli:main"; assert p["project"]["urls"]["Upstream"] == "https://github.com/FlashML-org/FreeToken"'
+          python -m pip install --disable-pip-version-check 'uv==0.12.6'
+          uv lock --check
       - name: Check evidence schemas and source SBOM generation
         run: |
           python scripts/release/schema_check.py
@@ -58,16 +60,28 @@ jobs:
             'torch>=2.11,<2.12'
           python -m pip install --disable-pip-version-check \
             'pytest>=8,<9' 'einops>=0.8,<1' 'numpy>=2,<2.5' \
-            'safetensors>=0.6,<1' 'transformers>=5.5,<6' \
+            'safetensors>=0.6,<1' 'transformers==5.16.1' \
             'huggingface_hub>=1.5,<2' 'tqdm>=4.66,<5' 'msgpack>=1.1,<2' \
-            'pyzmq>=27,<28' 'triton==3.6.0'
+            'pyzmq>=27,<28' 'triton==3.6.0' 'pillow==12.3.0' \
+            'fastapi>=0.115,<1' 'apache-tvm-ffi==0.1.13.post3'
       - name: Run QSA, PLE, gated-residual, and loader CPU tests
         run: |
           python -m pytest -q \
             tests/kernels/test_qsa_reference.py \
             tests/kernels/test_qsa_vectorized.py \
             tests/kernels/test_qsa_torch_backend.py \
+            tests/kernels/test_qsa_sm120.py \
             tests/kvcache/test_qsa_pool.py \
             tests/models/test_qwen4_exp_ple.py \
+            tests/models/test_qwen4_exp_ple_io.py \
+            tests/release/test_ple_checkpoint_probe.py \
             tests/models/test_qwen4_exp_hyperconnection.py \
-            tests/models/test_qwen4_exp_weight.py
+            tests/models/test_qwen4_exp_weight.py \
+            tests/models/test_qwen4_exp_mrope.py \
+            tests/models/test_qwen4_exp_vision.py \
+            tests/server/test_image_media.py \
+            tests/server/test_message_wire.py \
+            tests/server/test_runtime_telemetry.py \
+            tests/scheduler/test_multimodal_chunks.py \
+            tests/scheduler/test_runtime_telemetry.py \
+            tests/tokenizer/test_image_processor.py

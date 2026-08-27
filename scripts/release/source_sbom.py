@@ -87,7 +87,7 @@ def build_document(name: str, version: str, root: Path = ROOT) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", default="qwen38-next-5090-lab")
-    parser.add_argument("--version", default="0.1.0a1")
+    parser.add_argument("--version", default="0.2.0a1")
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     target = Path(args.output)
