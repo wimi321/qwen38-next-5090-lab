@@ -10,6 +10,7 @@ disabled until the new QSA kernels have passed capture/replay on target hardware
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
@@ -24,8 +25,10 @@ from freetoken.kernel.qsa_vectorized import (
 )
 from freetoken.kernel.qsa_triton import (
     can_use_qsa_attention_triton,
+    can_use_qsa_selection_sm120,
     can_use_qsa_selection_triton,
     qsa_paged_gqa_attention_triton,
+    qsa_select_token_indices_sm120,
     qsa_select_token_indices_triton,
 )
 from freetoken.utils import init_logger
@@ -38,6 +41,27 @@ if TYPE_CHECKING:
 
 _PREFILL_QUERY_CHUNK = 32
 logger = init_logger(__name__)
+
+
+def _assert_qsa_selection_has_visible_tokens(valid: torch.Tensor) -> None:
+    """Fail closed if any query row has no selected causal token.
+
+    An empty row makes the Triton softmax subtract ``-inf`` from ``-inf`` and
+    poisons every head with NaNs.  ``torch._assert_async`` keeps the invariant
+    check on the CUDA stream: the healthy path does not synchronize or alter
+    attention values, while an internal selector/addressing regression aborts
+    the worker instead of returning corrupt token logits.  On CPU it raises
+    synchronously, which gives focused tests a cheap seam for the same guard.
+    """
+
+    if valid.ndim < 2:
+        raise ValueError(
+            f"QSA valid mask must include query and selection axes, got {valid.shape}"
+        )
+    torch._assert_async(
+        valid.any(dim=-1).all(),
+        "QSA selector returned an empty visible-token row; aborting before attention",
+    )
 
 
 @dataclass
@@ -61,6 +85,8 @@ class QSATritonBackend(BaseAttnBackend):
     # Metadata and tensors are fixed-shape, but the new kernels have not yet
     # passed capture/replay on the target GPU. Do not advertise an unverified path.
     supports_cuda_graph = False
+    requires_compressed_index = False
+    prefill_query_chunk = _PREFILL_QUERY_CHUNK
 
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.qsa_pool import QSAKVCache
@@ -81,6 +107,24 @@ class QSATritonBackend(BaseAttnBackend):
                 "qsa_triton requires QSAKVCache, got "
                 f"{type(self.kvcache).__name__}; QSA must not route through BSA"
             )
+        if self.kvcache.uses_compressed_index != self.requires_compressed_index:
+            expected = "compressed" if self.requires_compressed_index else "raw"
+            raise TypeError(
+                f"{type(self).__name__} requires the {expected} QSA index layout"
+            )
+        require_native_raw = os.environ.get(
+            "FREETOKEN_QSA_REQUIRE_NATIVE_TOPK", "0"
+        ).strip().lower()
+        if require_native_raw not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError(
+                "FREETOKEN_QSA_REQUIRE_NATIVE_TOPK must be a boolean value"
+            )
+        self.require_native_topk = require_native_raw in {"1", "true", "yes", "on"}
+        if self.require_native_topk and not self.requires_compressed_index:
+            raise ValueError(
+                "native SM120 QSA fast-topk can only be required by the "
+                "qsa_triton_sm120 backend"
+            )
         self.device = self.kvcache.device
         self.sm_scale = (
             config.attn_sm_scale
@@ -90,7 +134,7 @@ class QSATritonBackend(BaseAttnBackend):
         self.capture_bs: List[int] = []
         self._rows_buf: torch.Tensor | None = None
         self._kv_lens_buf: torch.Tensor | None = None
-        self._logged_dispatch: set[tuple[bool, bool]] = set()
+        self._logged_dispatch: set[tuple[str, str]] = set()
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = getattr(batch, "padded_reqs", batch.reqs)
@@ -139,8 +183,8 @@ class QSATritonBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         # q/index_q arrive batched: [B,Q,H,D]. page_rows has a fixed padded
         # logical width; length masks make every trailing row inert.
-        index_rows = self.kvcache.index_k_cache(layer_id)
         if pooled_index_key is None:
+            index_rows = self.kvcache.index_k_cache(layer_id)
             raw = index_rows[page_rows.to(torch.long)]
             pooled_index_key = qsa_pool_index_keys_vectorized(
                 raw,
@@ -154,7 +198,35 @@ class QSATritonBackend(BaseAttnBackend):
         use_triton_selection = can_use_qsa_selection_triton(
             index_q, pooled_index_key, **selection_kwargs
         )
-        if use_triton_selection:
+        use_sm120_selection = (
+            self.requires_compressed_index
+            and can_use_qsa_selection_sm120(
+                index_q, pooled_index_key, **selection_kwargs
+            )
+        )
+        if self.require_native_topk and not use_sm120_selection:
+            self.kvcache.record_selector_dispatch("error")
+            raise RuntimeError(
+                "the active release profile requires native SM120 QSA fast-topk, "
+                "but this selector geometry cannot use qsa_triton_sm120"
+            )
+        if use_sm120_selection:
+            selection_impl = "sm120-radix"
+            score_workspace = self.kvcache.selector_score_workspace(
+                index_q.shape[0] * index_q.shape[1], pooled_index_key.shape[1]
+            )
+            logical, valid = qsa_select_token_indices_sm120(
+                index_q,
+                pooled_index_key,
+                query_positions,
+                kv_lens,
+                score_workspace=score_workspace,
+                require_native_topk=self.require_native_topk,
+                selector_telemetry=self.kvcache.record_selector_dispatch,
+                **selection_kwargs,
+            )
+        elif use_triton_selection:
+            selection_impl = "triton"
             logical, valid = qsa_select_token_indices_triton(
                 index_q,
                 pooled_index_key,
@@ -163,6 +235,7 @@ class QSATritonBackend(BaseAttnBackend):
                 **selection_kwargs,
             )
         else:
+            selection_impl = "torch"
             logical, valid = qsa_select_token_indices_vectorized(
                 index_q,
                 pooled_index_key,
@@ -170,20 +243,21 @@ class QSATritonBackend(BaseAttnBackend):
                 kv_lens,
                 **selection_kwargs,
             )
+        _assert_qsa_selection_has_visible_tokens(valid)
         key_rows, value_rows = self._flat_kv(layer_id)
         attention_args = (q, key_rows, value_rows, page_rows, logical, valid)
         use_triton_attention = can_use_qsa_attention_triton(q, key_rows, logical)
-        dispatch = (use_triton_selection, use_triton_attention)
+        attention_impl = "triton" if use_triton_attention else "torch"
+        dispatch = (selection_impl, attention_impl)
         if dispatch not in self._logged_dispatch:
             self._logged_dispatch.add(dispatch)
             message = (
                 "QSA dispatch: selection="
-                f"{'triton' if use_triton_selection else 'torch'}, attention="
-                f"{'triton' if use_triton_attention else 'torch'}, "
+                f"{selection_impl}, attention={attention_impl}, "
                 f"dtype={q.dtype}, q_shape={tuple(q.shape)}, "
                 f"index_shape={tuple(index_q.shape)}"
             )
-            if all(dispatch):
+            if selection_impl != "torch" and use_triton_attention:
                 logger.info_rank0(message)
             else:
                 logger.warning_rank0(message + "; benchmark results include a fallback path")
@@ -229,12 +303,26 @@ class QSATritonBackend(BaseAttnBackend):
             )
 
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        self.kvcache.store_index_k(index_k, batch.out_loc, layer_id)
+        if self.requires_compressed_index:
+            self._update_compressed_index(
+                index_k,
+                layer_id,
+                batch,
+                md,
+                index_key_transform,
+            )
+        else:
+            self.kvcache.store_index_k(index_k, batch.out_loc, layer_id)
 
         if md.is_decode:
             if md.rows is None or md.kv_lens is None:
                 self._snapshot_eager_decode(batch, md)
             batch_size = md.rows.shape[0]
+            pooled = (
+                self._gather_decode_compressed_keys(md, layer_id)
+                if self.requires_compressed_index
+                else None
+            )
             return self._run_vectorized(
                 q.view(batch_size, 1, q.shape[-2], q.shape[-1]),
                 index_q.view(batch_size, 1, index_q.shape[-2], index_q.shape[-1]),
@@ -243,6 +331,7 @@ class QSATritonBackend(BaseAttnBackend):
                 md.kv_lens,
                 layer_id,
                 index_key_transform,
+                pooled_index_key=pooled,
             ).view_as(q)
 
         # Prefill/extend is eager. One loop per request and bounded query chunk,
@@ -253,22 +342,37 @@ class QSATritonBackend(BaseAttnBackend):
         reqs = getattr(batch, "padded_reqs", batch.reqs)
         qo = md.qo_indptr_cpu.tolist()
         ratio = self.group.indexer_compress_ratio
-        index_rows = self.kvcache.index_k_cache(layer_id)
+        index_rows = (
+            None
+            if self.requires_compressed_index
+            else self.kvcache.index_k_cache(layer_id)
+        )
         for req_idx, req in enumerate(reqs):
             begin, end = qo[req_idx], qo[req_idx + 1]
             if begin == end:
                 continue
             padded_width = ((int(req.device_len) + ratio - 1) // ratio) * ratio
             rows = page_table[req.table_idx, :padded_width].view(1, -1)
-            raw = index_rows[rows.to(torch.long)]
-            pooled = qsa_pool_index_keys_vectorized(
-                raw,
-                compress_ratio=ratio,
-                key_transform=index_key_transform,
-            )
+            if self.requires_compressed_index:
+                complete_blocks = int(req.device_len) // ratio
+                compressed_locs = (
+                    rows[:, : complete_blocks * ratio : ratio].to(torch.long)
+                    // ratio
+                )
+                pooled = self.kvcache.compressed_index_k_cache(layer_id)[
+                    compressed_locs
+                ]
+            else:
+                assert index_rows is not None
+                raw = index_rows[rows.to(torch.long)]
+                pooled = qsa_pool_index_keys_vectorized(
+                    raw,
+                    compress_ratio=ratio,
+                    key_transform=index_key_transform,
+                )
             kv_lens = torch.tensor([req.device_len], dtype=torch.long, device=self.device)
-            for chunk_start in range(begin, end, _PREFILL_QUERY_CHUNK):
-                chunk_end = min(chunk_start + _PREFILL_QUERY_CHUNK, end)
+            for chunk_start in range(begin, end, self.prefill_query_chunk):
+                chunk_end = min(chunk_start + self.prefill_query_chunk, end)
                 sl = slice(chunk_start, chunk_end)
                 output[sl] = self._run_vectorized(
                     q[sl].unsqueeze(0),
@@ -281,6 +385,163 @@ class QSATritonBackend(BaseAttnBackend):
                     pooled_index_key=pooled,
                 ).squeeze(0)
         return output
+
+    @staticmethod
+    def _batch_rope_positions(batch: Batch) -> torch.Tensor:
+        positions = getattr(batch, "mrope_positions", None)
+        if positions is None:
+            positions = batch.positions
+        if positions.ndim not in (1, 2):
+            raise ValueError(
+                f"QSA positions must be [tokens] or [3,tokens], got {tuple(positions.shape)}"
+            )
+        if positions.ndim == 2 and positions.shape[0] != 3:
+            raise ValueError(
+                f"QSA mRoPE positions must be [3,tokens], got {tuple(positions.shape)}"
+            )
+        return positions
+
+    def _update_compressed_index(
+        self,
+        index_k: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        md: QSATritonMetadata,
+        index_key_transform: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> None:
+        """Write completed groups and retain only the request's incomplete tail."""
+        ratio = self.group.indexer_compress_ratio
+        if ratio != self.kvcache.index_compress_ratio:
+            raise RuntimeError("QSA backend/pool compression ratios do not agree")
+        if index_k.ndim == 3 and index_k.shape[-2] == 1:
+            index_k = index_k.squeeze(-2)
+        if index_k.ndim != 2:
+            raise ValueError(f"QSA raw index keys must be rank 2, got {index_k.shape}")
+
+        page_table = get_global_ctx().page_table
+        rope_positions = self._batch_rope_positions(batch)
+        reqs = getattr(batch, "padded_reqs", batch.reqs)
+        qo = md.qo_indptr_cpu.tolist()
+        pending_keys = self.kvcache.pending_index_k_cache(layer_id)
+        pending_positions = self.kvcache.pending_index_positions(layer_id)
+        offsets = torch.arange(ratio, dtype=torch.long, device=self.device)
+
+        for req_idx, req in enumerate(reqs):
+            begin, end = qo[req_idx], qo[req_idx + 1]
+            if begin == end:
+                continue
+            start = int(req.device_len) - int(req.extend_len)
+            stop = int(req.device_len)
+            if stop - start != end - begin:
+                raise ValueError(
+                    "QSA packed query span does not match request extend length: "
+                    f"packed={end - begin}, logical={stop - start}"
+                )
+            table_idx = int(req.table_idx)
+            current = index_k[begin:end]
+            current_rope = (
+                rope_positions[:, begin:end]
+                if rope_positions.ndim == 2
+                else rope_positions[begin:end]
+            )
+
+            first_group = (start // ratio) * ratio
+            last_group = stop - ratio
+            if first_group <= last_group:
+                group_starts = torch.arange(
+                    first_group,
+                    last_group + 1,
+                    ratio,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                group_tokens = group_starts[:, None] + offsets[None, :]
+                current_mask = group_tokens >= start
+                current_locs = (group_tokens - start).clamp_min(0)
+                current_group_keys = current.index_select(
+                    0, current_locs.reshape(-1)
+                ).view(group_tokens.shape[0], ratio, -1)
+                ring_locs = table_idx * ratio + torch.remainder(group_tokens, ratio)
+                prior_group_keys = pending_keys[ring_locs]
+                groups = torch.where(
+                    current_mask[..., None], current_group_keys, prior_group_keys
+                )
+                pooled = groups.float().mean(dim=1).to(index_k.dtype)
+
+                start_current_mask = group_starts >= start
+                start_current_locs = (group_starts - start).clamp_min(0)
+                prior_start_locs = table_idx * ratio + torch.remainder(
+                    group_starts, ratio
+                )
+                if rope_positions.ndim == 2:
+                    current_starts = current_rope.index_select(
+                        1, start_current_locs
+                    )
+                    prior_starts = pending_positions[
+                        prior_start_locs
+                    ].transpose(0, 1)
+                    transform_positions = torch.where(
+                        start_current_mask.unsqueeze(0),
+                        current_starts,
+                        prior_starts,
+                    )
+                else:
+                    current_starts = current_rope.index_select(
+                        0, start_current_locs
+                    )
+                    prior_starts = pending_positions[prior_start_locs, 0]
+                    transform_positions = torch.where(
+                        start_current_mask, current_starts, prior_starts
+                    )
+
+                transformed = index_key_transform(pooled, transform_positions)
+                if transformed.shape != pooled.shape:
+                    raise ValueError(
+                        "QSA compressed key transform must preserve shape, got "
+                        f"{tuple(transformed.shape)} != {tuple(pooled.shape)}"
+                    )
+                full_locs = page_table[table_idx].index_select(0, group_starts)
+                compressed_locs = full_locs.to(torch.long) // ratio
+                self.kvcache.store_compressed_index_k(
+                    transformed, compressed_locs, layer_id
+                )
+
+            pending_count = stop % ratio
+            if pending_count:
+                pending_start = max(start, stop - pending_count)
+                local_start = pending_start - start
+                logical = torch.arange(
+                    pending_start,
+                    stop,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                ring_locs = table_idx * ratio + torch.remainder(logical, ratio)
+                self.kvcache.store_pending_index_k(
+                    current[local_start:], ring_locs, layer_id
+                )
+                pending_rope = (
+                    current_rope[:, local_start:]
+                    if current_rope.ndim == 2
+                    else current_rope[local_start:]
+                )
+                self.kvcache.store_pending_positions(
+                    pending_rope, ring_locs, layer_id
+                )
+
+    def _gather_decode_compressed_keys(
+        self, md: QSATritonMetadata, layer_id: int
+    ) -> torch.Tensor:
+        assert md.rows is not None and md.kv_lens is not None
+        ratio = self.group.indexer_compress_ratio
+        max_blocks = max(
+            (int(length) // ratio for length in md.kv_len_cpu.tolist()),
+            default=0,
+        )
+        compressed_locs = (
+            md.rows[:, : max_blocks * ratio : ratio].to(torch.long) // ratio
+        )
+        return self.kvcache.compressed_index_k_cache(layer_id)[compressed_locs]
 
     def _snapshot_eager_decode(self, batch: Batch, md: QSATritonMetadata) -> None:
         if getattr(batch, "active_table_idx", None) is not None:
@@ -346,4 +607,13 @@ class QSATritonBackend(BaseAttnBackend):
         self._kv_lens_buf = None
 
 
-__all__ = ["QSATritonBackend", "QSATritonMetadata"]
+class QSASM120Backend(QSATritonBackend):
+    """Native-256K QSA: compressed index cache plus bounded SM120 top-512."""
+
+    requires_compressed_index = True
+    # 512 query rows x 65,536 compressed blocks x fp32 = exactly
+    # the pool-owned 128 MiB selector arena.
+    prefill_query_chunk = 512
+
+
+__all__ = ["QSASM120Backend", "QSATritonBackend", "QSATritonMetadata"]

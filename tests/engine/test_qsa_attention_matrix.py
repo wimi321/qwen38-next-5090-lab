@@ -50,13 +50,46 @@ def _config(**overrides):
 
 def test_qsa_backend_has_an_exclusive_capability():
     fast = attention_backend_info("qsa_triton")
+    sm120 = attention_backend_info("qsa_triton_sm120")
     oracle = attention_backend_info("qsa_torch")
-    assert fast.supported_types == oracle.supported_types == frozenset({AttnType.QSA})
+    assert (
+        fast.supported_types
+        == sm120.supported_types
+        == oracle.supported_types
+        == frozenset({AttnType.QSA})
+    )
     assert AttnType.BSA not in fast.supported_types
+    assert sm120.requires_sm120 is True
+    assert sm120.page_sizes == (4,)
     # Fixed-shape metadata exists, but QSA capture/replay is not target-hardware
     # validated yet, so whole-model graph capture must remain disabled.
     assert fast.supports_cuda_graph is False
     assert oracle.supports_cuda_graph is False
+
+
+def test_explicit_sm120_backend_pins_four_token_pages_and_256k_capacity(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setattr("freetoken.engine.engine.is_sm120_family", lambda: True)
+    config = _config(
+        attention_backend="qsa_triton_sm120",
+        page_size=1,
+        num_token_override=262_144,
+    )
+    _adjust_config(config)
+    assert config.page_size == 4
+    assert config.num_page_override == 65_536
+    assert config.cuda_graph_bs == []
+    assert config.cuda_graph_max_bs == 0
+
+
+def test_explicit_sm120_backend_rejects_non_consumer_blackwell(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setattr("freetoken.engine.engine.is_sm120_family", lambda: False)
+    config = _config(attention_backend="qsa_triton_sm120")
+    with pytest.raises(RuntimeError, match="compute capability 12.x"):
+        _adjust_config(config)
 
 
 def test_auto_selects_triton_qsa_backend_but_disables_model_graphs():

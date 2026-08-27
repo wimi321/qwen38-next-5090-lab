@@ -38,6 +38,50 @@ def net_cache_budget_bytes(
     return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
+def planned_gpu_peak_bytes(
+    *, total_bytes: int, baseline_free: int, memory_ratio: float
+) -> int:
+    """Conservative startup peak implied by the ratio-managed allocation plan.
+
+    Existing WDDM/display allocations are retained and the engine may consume at
+    most ``memory_ratio`` of the free bytes observed before model loading.  A
+    model's runtime reserve is already deducted inside that managed region.
+    """
+
+    if not 0 <= baseline_free <= total_bytes:
+        raise ValueError("baseline GPU free bytes must be within device capacity")
+    if not 0 < memory_ratio < 1:
+        raise ValueError("memory_ratio must be strictly between zero and one")
+    return total_bytes - baseline_free + int(memory_ratio * baseline_free)
+
+
+def enforce_gpu_memory_envelope(
+    *,
+    total_bytes: int,
+    baseline_free: int,
+    memory_ratio: float,
+    envelope_bytes: int,
+    runtime_reserve_bytes: int = 0,
+) -> int:
+    """Fail before weights load when a profile's absolute VRAM ceiling cannot fit."""
+
+    peak = planned_gpu_peak_bytes(
+        total_bytes=total_bytes,
+        baseline_free=baseline_free,
+        memory_ratio=memory_ratio,
+    )
+    if envelope_bytes > 0 and peak >= envelope_bytes:
+        used = total_bytes - baseline_free
+        raise MemoryError(
+            "GPU startup budget exceeds the configured envelope: "
+            f"current_used={used} B, baseline_free={baseline_free} B, "
+            f"ratio_managed={int(memory_ratio * baseline_free)} B, "
+            f"runtime_reserve={runtime_reserve_bytes} B, "
+            f"planned_peak={peak} B, envelope={envelope_bytes} B"
+        )
+    return peak
+
+
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:

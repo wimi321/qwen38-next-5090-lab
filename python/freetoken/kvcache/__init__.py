@@ -113,6 +113,14 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
+        qsa_compressed=(
+            "qsa_triton_sm120"
+            in {
+                part.strip()
+                for part in getattr(config, "attention_backend", "").split(",")
+            }
+        ),
+        qsa_num_request_slots=config.max_running_req + 1,
     )
 
 
@@ -123,6 +131,8 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
     num_swa_tokens: int | None = None,
+    qsa_compressed: bool = False,
+    qsa_num_request_slots: int = 0,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -187,6 +197,12 @@ def create_kvcache_pool(
             device=device,
             index_head_dim=spec.index_head_dim,
             layer_ids=spec.layer_ids,
+            index_compress_ratio=(
+                model_config.attention_group_for_layer(spec.layer_ids[0]).indexer_compress_ratio
+                if qsa_compressed
+                else None
+            ),
+            num_request_slots=qsa_num_request_slots,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:

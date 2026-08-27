@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import enforce_gpu_memory_envelope, planned_gpu_peak_bytes
 
 
 def test_moe_priority_fills_experts_up_to_total():
@@ -107,6 +108,32 @@ def test_resolve_auto_applies_ratio_once_and_marlin_cap():
     )
     # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages
     assert size == 8 and pages == 40 and overlap is True
+
+
+def test_absolute_gpu_envelope_accounts_for_existing_wddm_usage():
+    gib = 1024**3
+    planned = planned_gpu_peak_bytes(
+        total_bytes=32 * gib,
+        baseline_free=30 * gib,
+        memory_ratio=0.89,
+    )
+    assert planned == 2 * gib + int(0.89 * 30 * gib)
+    assert enforce_gpu_memory_envelope(
+        total_bytes=32 * gib,
+        baseline_free=30 * gib,
+        memory_ratio=0.89,
+        envelope_bytes=31 * gib,
+        runtime_reserve_bytes=512 * 2**20,
+    ) == planned
+
+    with pytest.raises(MemoryError, match="planned_peak=.*envelope"):
+        enforce_gpu_memory_envelope(
+            total_bytes=32 * gib,
+            baseline_free=4 * gib,
+            memory_ratio=0.89,
+            envelope_bytes=31 * gib,
+            runtime_reserve_bytes=512 * 2**20,
+        )
 
 
 def test_resolve_auto_marlin_caps_slots():
@@ -345,6 +372,48 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         kv_reserve_tokens=0, page_size=16, quant_format="bf16",
     )
     assert with_zero == with_missing == expected_without_reserve
+
+
+def test_engine_auto_moe_reserves_the_full_explicit_256k_kv_geometry(monkeypatch):
+    from freetoken.engine.engine import Engine
+
+    captured = {}
+
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 4, 65_536, False
+
+    monkeypatch.setattr(
+        "freetoken.engine.cache_budget.resolve_moe_cache_auto", fake_resolve
+    )
+    engine = Engine.__new__(Engine)
+    engine._baseline_free = 100_000_000
+    engine._weights_bytes = 10_000_000
+    engine._pool_cls = SimpleNamespace(kv_cost=lambda _config: (100, 128, 4, 0))
+    model_config = SimpleNamespace(
+        moe_auto_runtime_reserve_bytes=0,
+        num_experts=2,
+        num_moe_layers=1,
+        qwen4_args=None,
+        linear_attention_group=lambda: None,
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        num_page_override=65_536,
+        kv_reserve_tokens=8192,
+        memory_ratio=0.89,
+        moe_prefill_overlap=False,
+        max_running_req=1,
+        dtype=torch.bfloat16,
+        tp_info=SimpleNamespace(size=1),
+    )
+    banks = SimpleNamespace(
+        quant_format="bf16",
+        sources={"weight": [torch.zeros(2, 8, dtype=torch.bfloat16)]},
+    )
+    assert engine._resolve_auto_moe_cache_size(config, banks) == (4, 65_536, False)
+    assert captured["kv_reserve_tokens"] == 262_144
+    assert captured["page_size"] == 4
 
 
 def test_engine_rejects_a_negative_model_runtime_reserve():

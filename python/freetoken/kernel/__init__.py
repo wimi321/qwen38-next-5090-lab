@@ -29,11 +29,15 @@ from .qsa_vectorized import (
     qsa_select_token_indices_vectorized,
 )
 from .qsa_triton import (
+    QSA_MAX_SCORE_WORKSPACE_BYTES,
     can_use_qsa_attention_triton,
+    can_use_qsa_selection_sm120,
     can_use_qsa_selection_triton,
     qsa_paged_gqa_attention_triton,
+    qsa_select_token_indices_sm120,
     qsa_select_token_indices_triton,
 )
+from .qsa_fast_topk import QSA_BLOCK_TOPK, qsa_fast_topk
 from .store import store_cache
 from .tensor import test_tensor
 
@@ -52,9 +56,14 @@ __all__ = [
     "qsa_pool_index_keys_vectorized",
     "qsa_select_token_indices_vectorized",
     "can_use_qsa_attention_triton",
+    "can_use_qsa_selection_sm120",
     "can_use_qsa_selection_triton",
+    "QSA_MAX_SCORE_WORKSPACE_BYTES",
     "qsa_paged_gqa_attention_triton",
     "qsa_select_token_indices_triton",
+    "qsa_select_token_indices_sm120",
+    "QSA_BLOCK_TOPK",
+    "qsa_fast_topk",
     "store_cache",
     "test_tensor",
     "init_pynccl",

@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from freetoken.attention.qsa import QSAReferenceBackend
-from freetoken.attention.qsa_triton import QSATritonBackend, QSATritonMetadata
+from freetoken.attention.qsa_triton import (
+    QSASM120Backend,
+    QSATritonBackend,
+    QSATritonMetadata,
+    _assert_qsa_selection_has_visible_tokens,
+)
 from freetoken.kernel.qsa_reference import qsa_rms_norm
 from freetoken.kvcache.qsa_pool import QSAKVCache
 from freetoken.models.config import ModelConfig, QSAAttentionGroupConfig, RotaryConfig
@@ -241,6 +246,142 @@ def test_vectorized_backend_prefill_decode_and_fixed_graph_metadata(monkeypatch)
     backend.prepare_metadata(replay)
     backend.prepare_for_replay(replay)
     assert replay.attn_metadata.rows.data_ptr() == backend._rows_buf.data_ptr()
+
+
+def test_qsa_selection_guard_fails_closed_on_an_empty_query_row():
+    _assert_qsa_selection_has_visible_tokens(
+        torch.tensor([[[True, False], [False, True]]])
+    )
+    with pytest.raises(RuntimeError, match="empty visible-token row"):
+        _assert_qsa_selection_has_visible_tokens(
+            torch.tensor([[[True, False], [False, False]]])
+        )
+
+
+def test_sm120_compressed_index_ring_preserves_mrope_across_chunks(monkeypatch):
+    config = _config()
+    pool = QSAKVCache(
+        num_kv_heads=1,
+        num_layers=1,
+        head_dim=2,
+        num_pages=8,
+        page_size=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        index_head_dim=2,
+        layer_ids=(0,),
+        index_compress_ratio=4,
+        num_request_slots=2,
+        selector_workspace_bytes=4096,
+    )
+    page_table = torch.zeros(1, 16, dtype=torch.int32)
+    page_table[0, :4] = torch.arange(4, 8, dtype=torch.int32)
+    page_table[0, 4:8] = torch.arange(12, 16, dtype=torch.int32)
+    ctx = SimpleNamespace(kv_cache=pool, page_table=page_table)
+    monkeypatch.setattr("freetoken.attention.qsa_triton.get_global_ctx", lambda: ctx)
+    backend = QSASM120Backend(config)
+
+    transformed_positions = []
+
+    def transform(pooled, positions):
+        transformed_positions.append(positions.clone())
+        return pooled
+
+    def update(start, stop, axis_offsets, *, phase="prefill"):
+        req = SimpleNamespace(
+            extend_len=stop - start,
+            device_len=stop,
+            table_idx=0,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            padded_reqs=[req],
+            phase=phase,
+            positions=torch.arange(start, stop, dtype=torch.int32),
+            mrope_positions=torch.stack(
+                [
+                    torch.arange(start + offset, stop + offset, dtype=torch.int64)
+                    for offset in axis_offsets
+                ]
+            ),
+        )
+        backend.prepare_metadata(batch)
+        keys = torch.arange(start, stop, dtype=torch.bfloat16)[:, None].expand(-1, 2)
+        backend._update_compressed_index(
+            keys,
+            0,
+            batch,
+            batch.attn_metadata,
+            transform,
+        )
+
+    # The first forward ends inside group [0..3] and therefore only fills the ring.
+    update(0, 3, (10, 20, 30))
+    assert transformed_positions == []
+    # Decode token 3 completes group zero from the three-token pending ring.
+    update(3, 4, (10, 20, 30), phase="decode")
+    assert torch.equal(
+        transformed_positions[0], torch.tensor([[10], [20], [30]])
+    )
+    assert torch.equal(
+        pool.compressed_index_k_cache(0)[1],
+        torch.full((2,), 1.5, dtype=torch.bfloat16),
+    )
+    # The next decode step (logical position 4) crosses into the following
+    # four-token group and must persist its real mRoPE coordinate as the new
+    # one-token tail.
+    update(4, 5, (10, 20, 30), phase="decode")
+    assert torch.equal(
+        pool.pending_index_k_cache(0)[0],
+        torch.full((2,), 4.0, dtype=torch.bfloat16),
+    )
+    assert torch.equal(pool.pending_index_positions(0)[0], torch.tensor([14, 24, 34]))
+    # Tokens 5..7 complete group one using token 4 from the ring.  Its true
+    # three-axis first-token coordinate must be sent to partial mRoPE.
+    update(5, 8, (10, 20, 30))
+    assert torch.equal(
+        transformed_positions[1], torch.tensor([[14], [24], [34]])
+    )
+    assert torch.equal(
+        pool.compressed_index_k_cache(0)[3],
+        torch.full((2,), 5.5, dtype=torch.bfloat16),
+    )
+
+
+def test_required_sm120_native_selector_rejects_unsupported_geometry(monkeypatch):
+    config = _config()
+    pool = QSAKVCache(
+        num_kv_heads=1,
+        num_layers=1,
+        head_dim=2,
+        num_pages=8,
+        page_size=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        index_head_dim=2,
+        layer_ids=(0,),
+        index_compress_ratio=4,
+        num_request_slots=2,
+        selector_workspace_bytes=4096,
+    )
+    ctx = SimpleNamespace(kv_cache=pool, page_table=torch.zeros(1, 8))
+    monkeypatch.setattr("freetoken.attention.qsa_triton.get_global_ctx", lambda: ctx)
+    monkeypatch.setenv("FREETOKEN_QSA_REQUIRE_NATIVE_TOPK", "1")
+    backend = QSASM120Backend(config)
+
+    with pytest.raises(RuntimeError, match="requires native SM120"):
+        backend._run_vectorized(
+            torch.zeros((1, 1, 2, 2), dtype=torch.bfloat16),
+            torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16),
+            torch.zeros((1, 4), dtype=torch.long),
+            torch.zeros((1, 1), dtype=torch.long),
+            torch.ones((1,), dtype=torch.long),
+            0,
+            lambda pooled, positions: pooled,
+            pooled_index_key=torch.zeros((1, 1, 2), dtype=torch.bfloat16),
+        )
+    assert pool.selector_telemetry()["errors"] == 1
+    assert pool.selector_telemetry()["fallback_calls"] == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -40,6 +40,16 @@ def is_sm100_family() -> bool:
     return _is_arch_family(10)
 
 
+def is_sm120_family() -> bool:
+    """Exactly major 12 (consumer Blackwell).
+
+    SM120 kernels are not binary-compatible with datacenter Blackwell's
+    sm_100a/103a feature set.  Keep this closed-family probe separate from the
+    open-ended ``is_arch_supported`` helpers.
+    """
+    return _is_arch_family(12)
+
+
 def is_sm90_supported() -> bool:
     return is_arch_supported(9, 0)
 

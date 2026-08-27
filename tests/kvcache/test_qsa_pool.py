@@ -7,7 +7,7 @@ import torch
 
 from freetoken.attention import AttnType
 from freetoken.kvcache import create_kvcache_pool, resolve_pool_class
-from freetoken.kvcache.qsa_pool import QSAKVCache
+from freetoken.kvcache.qsa_pool import QSAKVCache, QSA_SELECTOR_WORKSPACE_BYTES
 from freetoken.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
@@ -136,6 +136,109 @@ def test_store_rebuild_and_unit_bytes_cpu():
     pool.rebuild(5)
     assert pool._kv_buffer.shape[2] == 5
     assert pool._index_k_buffer.shape == (2, 10, 4)
+
+
+def test_compressed_pool_uses_one_index_row_per_four_tokens_and_layer_local_ring():
+    config = _model_config()
+    pool = create_kvcache_pool(
+        config,
+        num_pages=3,
+        page_size=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        qsa_compressed=True,
+        qsa_num_request_slots=2,
+    )
+    assert isinstance(pool, QSAKVCache)
+    assert pool.uses_compressed_index is True
+    assert pool._kv_buffer.shape == (2, 2, 3, 4, 1, 8)
+    assert pool._index_k_buffer is None
+    assert pool._compressed_index_k_buffer.shape == (2, 3, 4)
+    assert pool._pending_index_k_buffer.shape == (2, 8, 4)
+    assert pool._pending_position_buffer.shape == (2, 8, 3)
+    # Main K/V is 64 B/token; two 4-wide index layers add 4 B/token.
+    assert pool.unit_bytes() == (68, 0)
+
+    ring_locs = torch.tensor([0, 1], dtype=torch.long)
+    positions_2 = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int64)
+    positions_5 = positions_2 + 100
+    pool.store_pending_positions(positions_2, ring_locs, layer_id=2)
+    pool.store_pending_positions(positions_5, ring_locs, layer_id=5)
+    assert torch.equal(pool.pending_index_positions(2)[:2], positions_2.T)
+    assert torch.equal(pool.pending_index_positions(5)[:2], positions_5.T)
+
+    # Scheduler mRoPE positions are int32; the persistent ring is int64 so the
+    # store path must normalize dtype instead of failing on the first request.
+    pool.store_pending_positions(
+        positions_2.to(torch.int32), ring_locs, layer_id=2
+    )
+    assert torch.equal(pool.pending_index_positions(2)[:2], positions_2.T)
+
+    assert pool.selector_score_workspace(2, 4).shape == (2, 4)
+    assert pool.selector_workspace_peak_bytes == 32
+
+    assert pool.selector_telemetry() == {
+        "workspace_peak_bytes": 32,
+        "native_calls": 0,
+        "fallback_calls": 0,
+        "errors": 0,
+    }
+    pool.record_selector_dispatch("native")
+    pool.record_selector_dispatch("fallback")
+    pool.record_selector_dispatch("error")
+    assert pool.selector_telemetry() == {
+        "workspace_peak_bytes": 32,
+        "native_calls": 1,
+        "fallback_calls": 1,
+        "errors": 1,
+    }
+    with pytest.raises(ValueError, match="unknown QSA selector"):
+        pool.record_selector_dispatch("unknown")
+    with pytest.raises(MemoryError, match="bounded"):
+        pool.selector_score_workspace(513, 65_536)
+    assert pool.selector_workspace_peak_bytes == 32
+
+    pool.rebuild(5)
+    assert pool._compressed_index_k_buffer.shape == (2, 5, 4)
+
+
+def test_qwen_256k_compressed_qsa_memory_accounting_is_exact():
+    group = QSAAttentionGroupConfig(
+        name="qsa",
+        layer_ids=tuple(range(12)),
+        num_kv_heads=2,
+        head_dim=256,
+        rotary_config=RotaryConfig(
+            head_dim=256,
+            rotary_dim=64,
+            max_position=262_144,
+            base=10_000_000,
+            scaling=None,
+        ),
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    runtime = SimpleNamespace(
+        model_config=SimpleNamespace(attention_groups=(group,)),
+        dtype=torch.bfloat16,
+        page_size=4,
+        max_running_req=1,
+        attention_backend="qsa_triton_sm120",
+        tp_info=SimpleNamespace(size=1),
+    )
+    per_page, fixed, page_tokens, minimum = QSAKVCache.kv_cost(runtime)
+    assert page_tokens == 4
+    assert minimum == 0
+    assert per_page == 25_344 * 4
+    ring_rows = (runtime.max_running_req + 1) * group.indexer_compress_ratio
+    expected_fixed = QSA_SELECTOR_WORKSPACE_BYTES + ring_rows * 12 * (
+        128 * torch.bfloat16.itemsize + 3 * torch.int64.itemsize
+    )
+    assert fixed == expected_fixed == 134_244_608
+    assert per_page // page_tokens * 262_144 == int(6.1875 * 2**30)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

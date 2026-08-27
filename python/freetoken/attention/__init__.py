@@ -28,6 +28,7 @@ class BackendInfo:
     requires_flashinfer: bool = False
     requires_sgl_kernel: bool = False
     requires_sm100: bool = False
+    requires_sm120: bool = False
     # Allowed page sizes (None -> any). Config-time resolution coerces to the last
     # entry when the resolved page_size is not in the list.
     page_sizes: tuple[int, ...] | None = None
@@ -151,6 +152,25 @@ def create_qsa_triton_backend(config: ModelConfig):
     from .qsa_triton import QSATritonBackend
 
     return QSATritonBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "qsa_triton_sm120",
+    BackendInfo(
+        supported_types=frozenset({AttnType.QSA}),
+        hybrid_linear_ok=True,
+        requires_sm120=True,
+        # The compressed index cache maps a completed four-token group to
+        # physical_slot // 4.  Page alignment makes that mapping stable across
+        # allocation, free, and reuse without a second ownership table.
+        page_sizes=(4,),
+        supports_cuda_graph=False,
+    ),
+)
+def create_qsa_triton_sm120_backend(config: ModelConfig):
+    from .qsa_triton import QSASM120Backend
+
+    return QSASM120Backend(config)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(

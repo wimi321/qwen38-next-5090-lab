@@ -14,16 +14,22 @@ vectorized Torch fallback is selected by the backend for unsupported shapes.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import triton
 import triton.language as tl
+
+from .qsa_fast_topk import QSA_BLOCK_TOPK, qsa_fast_topk
 
 
 # The first hardware milestone is 8K: 8192 / four-token microblocks == 2048.
 # Larger contexts deliberately fall back until the selector is hierarchically
 # tiled; a one-program bitonic top-k beyond this width has poor occupancy.
 _MAX_SELECTOR_BLOCKS = 2048
+_MAX_SM120_SELECTOR_BLOCKS = 65536
 _MAX_SELECTED_WIDTH = 4096
+QSA_MAX_SCORE_WORKSPACE_BYTES = 128 * 2**20
 
 
 @triton.jit
@@ -36,24 +42,18 @@ def _qsa_index_score_kernel(
     num_blocks,
     index_heads: tl.constexpr,
     index_dim: tl.constexpr,
+    block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_d: tl.constexpr,
-    block_h: tl.constexpr,
 ):
     block_pid = tl.program_id(0)
-    bq_pid = tl.program_id(1)
-    batch_idx = bq_pid // query_len
+    query_pid = tl.program_id(1)
+    batch_idx = tl.program_id(2)
 
     d = tl.arange(0, block_d)
-    h = tl.arange(0, block_h)
+    query = query_pid * block_m + tl.arange(0, block_m)
     block = block_pid * block_n + tl.arange(0, block_n)
-
-    q_offsets = bq_pid * index_heads * index_dim + h[:, None] * index_dim + d[None, :]
-    q = tl.load(
-        index_query_ptr + q_offsets,
-        mask=(h[:, None] < index_heads) & (d[None, :] < index_dim),
-        other=0.0,
-    ).to(tl.float32)
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.float32)
     key_offsets = (
         batch_idx * num_blocks * index_dim
         + d[:, None] * 1
@@ -63,16 +63,33 @@ def _qsa_index_score_kernel(
         pooled_key_ptr + key_offsets,
         mask=(d[:, None] < index_dim) & (block[None, :] < num_blocks),
         other=0.0,
-    ).to(tl.float32)
+    )
 
-    # Pad the released four index heads to a tensor-core friendly 16 rows.  The
-    # masked rows are zero, so their post-ReLU contribution is exactly zero.
-    per_head = tl.dot(q, key, input_precision="ieee")
-    scores = tl.sum(tl.maximum(per_head, 0.0), axis=0) * index_scale
+    # One program scores a matrix tile of query rows.  Keeping M > 1 is
+    # essential at 65,536 blocks: the original one-query program would launch
+    # over a million CTAs per 512-token prefill chunk.  Heads are independent
+    # MQA dot products followed by ReLU and a reduction over heads.
+    for head in tl.static_range(0, index_heads):
+        q_offsets = (
+            (batch_idx * query_len + query[:, None]) * index_heads * index_dim
+            + head * index_dim
+            + d[None, :]
+        )
+        q = tl.load(
+            index_query_ptr + q_offsets,
+            mask=(query[:, None] < query_len) & (d[None, :] < index_dim),
+            other=0.0,
+        )
+        per_head = tl.dot(q, key)
+        accumulator += tl.maximum(per_head, 0.0)
+    scores = accumulator * index_scale
+    score_offsets = (
+        (batch_idx * query_len + query[:, None]) * num_blocks + block[None, :]
+    )
     tl.store(
-        score_ptr + bq_pid * num_blocks + block,
+        score_ptr + score_offsets,
         scores,
-        mask=block < num_blocks,
+        mask=(query[:, None] < query_len) & (block[None, :] < num_blocks),
     )
 
 
@@ -382,11 +399,16 @@ def qsa_select_token_indices_triton(
     query_positions = query_positions.contiguous()
     kv_lens = kv_lens.contiguous()
     num_blocks = pooled_index_key.shape[1]
+    score_block_m = 32
     score_block_n = 32
     scores = torch.empty(
         (batch, query_len, num_blocks), dtype=torch.float32, device=index_query.device
     )
-    score_grid = (triton.cdiv(num_blocks, score_block_n), batch * query_len)
+    score_grid = (
+        triton.cdiv(num_blocks, score_block_n),
+        triton.cdiv(query_len, score_block_m),
+        batch,
+    )
     _qsa_index_score_kernel[score_grid](
         index_query,
         pooled_index_key,
@@ -396,10 +418,10 @@ def qsa_select_token_indices_triton(
         num_blocks=num_blocks,
         index_heads=index_heads,
         index_dim=index_dim,
+        block_m=score_block_m,
         block_n=score_block_n,
         block_d=max(16, triton.next_power_of_2(index_dim)),
-        block_h=16,
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
     )
 
@@ -432,6 +454,233 @@ def qsa_select_token_indices_triton(
         num_stages=2,
     )
     return logical, valid
+
+
+@triton.jit
+def _qsa_expand_block_indices_kernel(
+    block_indices_ptr,
+    position_ptr,
+    kv_len_ptr,
+    logical_out_ptr,
+    valid_out_ptr,
+    token_budget: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    block_topk: tl.constexpr,
+    out_width: tl.constexpr,
+    vector_width: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, vector_width)
+    block_col = col // compress_ratio
+    offset = col % compress_ratio
+    block = tl.load(
+        block_indices_ptr + row * block_topk + block_col,
+        mask=(col < token_budget) & (block_col < block_topk),
+        other=-1,
+    ).to(tl.int64)
+    token = block * compress_ratio + offset
+    kv_len = tl.load(kv_len_ptr + row).to(tl.int64)
+    block_valid = (
+        (col < token_budget)
+        & (block >= 0)
+        & (token >= 0)
+        & (token < kv_len)
+    )
+
+    position = tl.load(position_ptr + row).to(tl.int64)
+    tail_col = col - token_budget
+    tail_start = ((position + 1) // compress_ratio) * compress_ratio
+    tail = tail_start + tail_col
+    tail_valid = (
+        (tail_col >= 0)
+        & (tail_col < compress_ratio - 1)
+        & (tail <= position)
+        & (tail < kv_len)
+    )
+    valid = block_valid | tail_valid
+    result = tl.where(block_valid, token, tl.where(tail_valid, tail, -1))
+    tl.store(logical_out_ptr + row * out_width + col, result, mask=col < out_width)
+    tl.store(valid_out_ptr + row * out_width + col, valid, mask=col < out_width)
+
+
+def can_use_qsa_selection_sm120(
+    index_query: torch.Tensor,
+    pooled_index_key: torch.Tensor,
+    *,
+    token_budget: int,
+    compress_ratio: int,
+) -> bool:
+    """Whether the bounded SM120 selector can serve this native 256K shape."""
+    if not index_query.is_cuda or not pooled_index_key.is_cuda:
+        return False
+    if index_query.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if pooled_index_key.dtype != index_query.dtype:
+        return False
+    if pooled_index_key.device != index_query.device:
+        return False
+    if index_query.ndim != 4 or pooled_index_key.ndim != 3:
+        return False
+    index_heads, index_dim = index_query.shape[-2:]
+    num_blocks = pooled_index_key.shape[1]
+    return (
+        compress_ratio == 4
+        and token_budget // compress_ratio == QSA_BLOCK_TOPK
+        and token_budget % compress_ratio == 0
+        and 0 <= num_blocks <= _MAX_SM120_SELECTOR_BLOCKS
+        and index_heads <= 16
+        and index_dim <= 256
+        and pooled_index_key.shape[0] == index_query.shape[0]
+        and pooled_index_key.shape[-1] == index_dim
+    )
+
+
+def qsa_select_token_indices_sm120(
+    index_query: torch.Tensor,
+    pooled_index_key: torch.Tensor,
+    query_positions: torch.Tensor,
+    kv_lens: torch.Tensor,
+    *,
+    token_budget: int,
+    compress_ratio: int,
+    score_workspace: torch.Tensor | None = None,
+    require_native_topk: bool = False,
+    selector_telemetry: Callable[[str], None] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score up to 65,536 blocks and run bounded top-512 radix selection.
+
+    The largest supported score matrix is 128 MiB.  The production backend
+    passes its pool-owned arena; the optional allocation exists for focused
+    kernel tests only.
+    """
+    if not can_use_qsa_selection_sm120(
+        index_query,
+        pooled_index_key,
+        token_budget=token_budget,
+        compress_ratio=compress_ratio,
+    ):
+        raise ValueError("SM120 QSA selector does not support this tensor geometry")
+    batch, query_len, index_heads, index_dim = index_query.shape
+    if query_positions.shape != (batch, query_len) or kv_lens.shape != (batch,):
+        raise ValueError("SM120 QSA positions/length shapes do not agree")
+    if query_positions.device != index_query.device or kv_lens.device != index_query.device:
+        raise ValueError("SM120 QSA selector inputs must share one CUDA device")
+
+    index_query = index_query.contiguous()
+    pooled_index_key = pooled_index_key.contiguous()
+    query_positions = query_positions.contiguous()
+    kv_lens = kv_lens.contiguous()
+    rows = batch * query_len
+    num_blocks = pooled_index_key.shape[1]
+    workspace_bytes = rows * num_blocks * 4
+    if workspace_bytes > QSA_MAX_SCORE_WORKSPACE_BYTES:
+        raise MemoryError(
+            f"QSA score matrix needs {workspace_bytes} bytes, exceeds the "
+            f"{QSA_MAX_SCORE_WORKSPACE_BYTES}-byte bound"
+        )
+    if score_workspace is None:
+        scores_flat = torch.empty(
+            (rows, num_blocks), dtype=torch.float32, device=index_query.device
+        )
+    else:
+        if (
+            score_workspace.dtype != torch.float32
+            or score_workspace.device != index_query.device
+            or score_workspace.numel() < rows * num_blocks
+        ):
+            raise ValueError("SM120 QSA score workspace has the wrong dtype/device/size")
+        scores_flat = score_workspace.reshape(-1)[: rows * num_blocks].view(
+            rows, num_blocks
+        )
+
+    if num_blocks:
+        score_block_m = 32
+        score_block_n = 32
+        _qsa_index_score_kernel[
+            (
+                triton.cdiv(num_blocks, score_block_n),
+                triton.cdiv(query_len, score_block_m),
+                batch,
+            )
+        ](
+            index_query,
+            pooled_index_key,
+            scores_flat,
+            query_len,
+            index_dim**-0.5,
+            num_blocks=num_blocks,
+            index_heads=index_heads,
+            index_dim=index_dim,
+            block_m=score_block_m,
+            block_n=score_block_n,
+            block_d=max(16, triton.next_power_of_2(index_dim)),
+            num_warps=8,
+            num_stages=2,
+        )
+        complete = torch.minimum(
+            torch.div(
+                query_positions.to(torch.long) + 1,
+                compress_ratio,
+                rounding_mode="floor",
+            ),
+            torch.div(
+                kv_lens.to(torch.long)[:, None],
+                compress_ratio,
+                rounding_mode="floor",
+            ),
+        ).clamp_max(num_blocks)
+        selected_blocks = qsa_fast_topk(
+            scores_flat,
+            complete.reshape(-1).to(torch.int32),
+            require_native=require_native_topk,
+            telemetry=selector_telemetry,
+        )
+    else:
+        selected_blocks = torch.full(
+            (rows, QSA_BLOCK_TOPK),
+            -1,
+            dtype=torch.int32,
+            device=index_query.device,
+        )
+
+    out_width = token_budget + compress_ratio - 1
+    logical = torch.empty(
+        (rows, out_width), dtype=torch.int64, device=index_query.device
+    )
+    valid = torch.empty(
+        (rows, out_width), dtype=torch.bool, device=index_query.device
+    )
+    # Both pointers are consumed by a raw Triton row index.  In particular,
+    # ``expand`` leaves ``row_kv_lens`` with a zero stride when batch == 1;
+    # passing that view to a pointer-arithmetic kernel makes row > 0 read past
+    # the scalar storage.  That silently produced an empty selection for every
+    # query except the first one in each prefill chunk, followed by an all--inf
+    # softmax and NaN model logits.  Materialize the broadcast before launch.
+    row_positions = query_positions.reshape(-1).contiguous()
+    row_kv_lens = (
+        kv_lens[:, None]
+        .expand(batch, query_len)
+        .reshape(-1)
+        .contiguous()
+    )
+    _qsa_expand_block_indices_kernel[(rows,)](
+        selected_blocks,
+        row_positions,
+        row_kv_lens,
+        logical,
+        valid,
+        token_budget=token_budget,
+        compress_ratio=compress_ratio,
+        block_topk=QSA_BLOCK_TOPK,
+        out_width=out_width,
+        vector_width=triton.next_power_of_2(out_width),
+        num_warps=8,
+        num_stages=2,
+    )
+    return (
+        logical.view(batch, query_len, out_width),
+        valid.view(batch, query_len, out_width),
+    )
 
 
 def can_use_qsa_attention_triton(
@@ -557,6 +806,9 @@ def qsa_paged_gqa_attention_triton(
 __all__ = [
     "can_use_qsa_attention_triton",
     "can_use_qsa_selection_triton",
+    "can_use_qsa_selection_sm120",
+    "QSA_MAX_SCORE_WORKSPACE_BYTES",
     "qsa_paged_gqa_attention_triton",
     "qsa_select_token_indices_triton",
+    "qsa_select_token_indices_sm120",
 ]
