@@ -64,6 +64,17 @@ def fused_topk(
 
     from triton_kernels.topk import topk as triton_kernels_topk
 
+    # The external kernel streams experts in fixed blocks of 32.  Padding a
+    # non-power-of-two k beyond that block (for example 33 -> 64) still fails
+    # inside ``tl.topk`` even though ``tl.arange`` now has a legal extent.
+    # Keep those uncommon wide routers correct with the reference path; Qwen4's
+    # top-10 remains on the fused padded-16 path below.
+    kernel_topk = 1 << (topk - 1).bit_length()
+    if kernel_topk > 32:
+        return _torch_fused_topk(
+            gating_output, topk, renormalize, num_token_non_padded
+        )
+
     logits = gating_output.float()
     softmax_first = not renormalize
     if softmax_first:
@@ -73,7 +84,6 @@ def fused_topk(
     # kernel for the next power of two and compact the candidate set below.
     # The kernel returns candidates ordered by expert id, not by score; simply
     # slicing the first ``topk`` entries would select the wrong experts.
-    kernel_topk = 1 << (topk - 1).bit_length()
     sparse_topk = triton_kernels_topk(
         logits,
         kernel_topk,

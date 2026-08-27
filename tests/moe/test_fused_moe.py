@@ -86,6 +86,35 @@ def test_fused_topk_pads_qwen4_top10_to_power_of_two(renormalize):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_fused_topk_falls_back_when_padded_k_exceeds_kernel_block(renormalize):
+    pytest.importorskip("triton_kernels.topk")
+    from freetoken.moe.fused import fused_topk
+
+    torch.manual_seed(29)
+    logits = torch.randn(11, 64, device="cuda", dtype=torch.bfloat16)
+    hidden_states = torch.zeros((11, 8), device="cuda", dtype=torch.bfloat16)
+
+    weights, ids = fused_topk(
+        hidden_states,
+        logits,
+        topk=33,
+        renormalize=renormalize,
+    )
+
+    probabilities = torch.softmax(logits.float(), dim=-1)
+    ref_weights, ref_ids = torch.topk(probabilities, 33, dim=-1)
+    if renormalize:
+        ref_weights = ref_weights / ref_weights.sum(dim=-1, keepdim=True)
+
+    assert weights.shape == ids.shape == (11, 33)
+    assert weights.is_contiguous()
+    assert ids.is_contiguous()
+    torch.testing.assert_close(ids, ref_ids.to(torch.int32))
+    torch.testing.assert_close(weights, ref_weights, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_experts_decode_matches_reference_for_non_contiguous_slots(batch_size, dtype):
