@@ -142,7 +142,7 @@ checkpoint，运行非 slow 测试，验证 prompt/API 门槛与 100 个顺序�
 观测；“effective prefill”包含固定请求开销与 CPU staging，不是纯 kernel benchmark。
 
 本次硬件记录包括：非 slow 测试 1,530 passed / 9 skipped / 11 deselected；
-峰值显存 31,668 MiB（30.926 GiB）；WSL 峰值 RSS 72.312 GiB；100/100
+峰值显存 31,668 MiB（30.926 GiB）；WSL 峰值 RSS 72.234 GiB；100/100
 顺序请求及 121/121 次独立 soak 请求成功，连续运行 30.0 分钟且未检测到单调
 内存泄漏。8,176-token 请求的客户端 TTFT p50 为 7.283 秒，effective prefill
 p50 为 1,122.6 tok/s；另行测得 256-token 稳态 decode 为 14.014 tok/s。

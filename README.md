@@ -163,7 +163,7 @@ and CPU-staging overhead rather than measuring a kernel in isolation.
 | GPU | NVIDIA GeForce RTX 5090 |
 | Executed expert path | W4A16 compatibility |
 | Peak VRAM | 30.926 GiB |
-| Peak WSL RSS | 72.312 GiB |
+| Peak WSL RSS | 72.234 GiB |
 | WSL swap | 0 MiB |
 | 8176 rendered-token TTFT (p50 / p95) | 7283.0 / 7355.5 ms |
 | 8176 effective prefill (p50) | 1122.6 tok/s |

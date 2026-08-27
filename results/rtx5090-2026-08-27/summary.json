@@ -148,17 +148,17 @@
   },
   "resources": {
     "acceptance_window_end_elapsed_s": 2490.877,
-    "acceptance_window_start_elapsed_s": 176.572,
+    "acceptance_window_start_elapsed_s": 179.154,
     "page_faults": {
-      "major_delta": 6607.0,
-      "minor_delta": 410049.0
+      "major_delta": 6567.0,
+      "minor_delta": 410026.0
     },
     "pcie_traffic": {
       "reason": "portable nvidia-smi sampling does not expose RX/TX counters",
       "status": "unavailable"
     },
     "peak_vram_mib": 31668.0,
-    "peak_wsl_rss_kib": 75824472.0,
+    "peak_wsl_rss_kib": 75743120.0,
     "windows_pagefile_note": "A pre-existing Windows pagefile may be active; the harness does not modify it and does not claim zero host paging.",
     "wsl_rss_source": "WSL MemTotal-MemAvailable fallback",
     "wsl_swap_kib": 0.0
