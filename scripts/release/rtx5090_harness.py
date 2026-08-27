@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -281,9 +282,25 @@ def rendered_length(tokenizer: Any, content: str) -> int:
         add_generation_prompt=True,
         enable_thinking=False,
         thinking_mode="disabled",
+        return_dict=False,
     )
+    # Transformers 5 defaults to a BatchEncoding, whose length is the number of
+    # mapping fields rather than rendered tokens.  Keep the flat-list contract
+    # explicit and fail closed if a tokenizer implementation ignores it.
     if hasattr(token_ids, "tolist"):
         token_ids = token_ids.tolist()
+    if (
+        isinstance(token_ids, Sequence)
+        and not isinstance(token_ids, (str, bytes))
+        and token_ids
+        and isinstance(token_ids[0], Sequence)
+        and not isinstance(token_ids[0], (str, bytes))
+    ):
+        if len(token_ids) != 1:
+            raise EvidenceError("chat template unexpectedly returned more than one sequence")
+        token_ids = token_ids[0]
+    if not isinstance(token_ids, Sequence) or isinstance(token_ids, (str, bytes)):
+        raise EvidenceError("chat template did not return a token sequence")
     return len(token_ids)
 
 

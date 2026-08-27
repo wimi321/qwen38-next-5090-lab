@@ -22,10 +22,31 @@ class FakeTokenizer:
         del tokenize, add_generation_prompt
         assert kwargs == {
             "enable_thinking": False,
+            "return_dict": False,
             "thinking_mode": "disabled",
         }
         content = messages[0]["content"]
         return list(range(13 + content.count(" x")))
+
+
+class DefaultBatchEncodingTokenizer:
+    def apply_chat_template(
+        self, messages, tokenize, add_generation_prompt, return_dict=True, **kwargs
+    ):
+        del tokenize, add_generation_prompt
+        assert kwargs == {
+            "enable_thinking": False,
+            "thinking_mode": "disabled",
+        }
+        content = messages[0]["content"]
+        input_ids = list(range(13 + content.count(" x")))
+        if return_dict:
+            return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids)}
+        return input_ids
+
+    def encode(self, content, add_special_tokens=False):
+        assert add_special_tokens is False
+        return list(range(1 + content.count(" x")))
 
 
 class ReleaseToolTests(unittest.TestCase):
@@ -34,6 +55,23 @@ class ReleaseToolTests(unittest.TestCase):
         for target in (13, 128, 2048, 8176):
             prompt = rtx5090_harness.exact_prompt(tokenizer, target)
             self.assertEqual(rtx5090_harness.rendered_length(tokenizer, prompt), target)
+
+    def test_rendered_length_disables_batch_encoding_return(self) -> None:
+        tokenizer = DefaultBatchEncodingTokenizer()
+        prompt = rtx5090_harness.exact_prompt(tokenizer, 13)
+        self.assertEqual(prompt, "x")
+        self.assertEqual(rtx5090_harness.rendered_length(tokenizer, prompt), 13)
+        self.assertEqual(len(tokenizer.encode(prompt, add_special_tokens=False)), 1)
+
+    def test_rendered_length_rejects_non_flat_results(self) -> None:
+        tokenizer = mock.Mock()
+        tokenizer.apply_chat_template.return_value = {"attention_mask": [1]}
+        with self.assertRaisesRegex(rtx5090_harness.EvidenceError, "token sequence"):
+            rtx5090_harness.rendered_length(tokenizer, "x")
+
+        tokenizer.apply_chat_template.return_value = [[1], [2]]
+        with self.assertRaisesRegex(rtx5090_harness.EvidenceError, "more than one"):
+            rtx5090_harness.rendered_length(tokenizer, "x")
 
     def test_recorder_returns_the_exact_rounded_timestamps_it_persists(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
