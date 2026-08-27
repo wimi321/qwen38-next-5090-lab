@@ -40,6 +40,9 @@ sys.path.insert(0, str(ROOT / "python"))
 from evidence import (  # noqa: E402
     COMMIT_RE,
     SCHEMA_VERSION,
+    V02_IMAGE_ACCESS_CODE,
+    V02_IMAGE_THINKING_MAX_TOKENS,
+    V02_IMAGE_TOOL_ARGUMENTS_SHA256,
     V02_PLE_CHECKPOINT_PROBE_FILE,
     EvidenceError,
     detect_monotonic_rss_leak,
@@ -77,6 +80,8 @@ NIAH_CASES = {
     131072: (0.65, "Q38-131072-C"),
     261120: (0.90, "Q38-261120-D"),
 }
+ACCESS_CODE = V02_IMAGE_ACCESS_CODE
+IMAGE_THINKING_MAX_TOKENS = V02_IMAGE_THINKING_MAX_TOKENS
 
 
 def selected_profile(args: argparse.Namespace):
@@ -314,12 +319,40 @@ def valid_city_arguments(value: str) -> dict[str, Any] | None:
     return parsed
 
 
+def valid_access_code_arguments(value: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or set(parsed) != {"code"}:
+        return None
+    code = parsed.get("code")
+    if not isinstance(code, str) or _canonical_answer(code) != ACCESS_CODE:
+        return None
+    return parsed
+
+
 def thinking_response_valid(effort: str, content: str, reasoning: str) -> bool:
     if effort == "none":
         return bool(content) and not reasoning
     if effort == "high":
         return bool(content) and bool(reasoning)
     return False
+
+
+def image_thinking_response_valid(
+    content: str,
+    reasoning: str,
+    finish_reason: Any,
+    completion_tokens: int,
+) -> bool:
+    return bool(
+        finish_reason == "stop"
+        and 0 < completion_tokens < IMAGE_THINKING_MAX_TOKENS
+        and thinking_response_valid("high", content, reasoning)
+        and "red" in content.casefold()
+        and "square" in content.casefold()
+    )
 
 
 def load_tokenizer(model_dir: Path) -> Any:
@@ -446,7 +479,7 @@ def synthetic_vision_fixture(kind: str) -> tuple[str, str]:
         draw.rectangle((35, 50, 989, 462), outline="black", width=8)
         for text, y, font in (
             ("ACCESS CODE", 90, medium),
-            ("382741", 235, large),
+            (ACCESS_CODE, 235, large),
         ):
             left, _top, right, _bottom = draw.textbbox((0, 0), text, font=font)
             draw.text(((image.width - (right - left)) // 2, y), text, fill="black", font=font)
@@ -1423,7 +1456,7 @@ def run_256k_image_gates(
         (
             "ocr",
             "Read the access code in the image. Reply with the code only.",
-            lambda value: "382741" in _canonical_answer(value),
+            lambda value: ACCESS_CODE in _canonical_answer(value),
         ),
         (
             "object",
@@ -1477,20 +1510,26 @@ def run_256k_image_gates(
                 fixture_urls["object"],
                 "Think carefully, then describe the color and shape in one sentence.",
             ),
-            128,
+            IMAGE_THINKING_MAX_TOKENS,
             reasoning_effort="high",
         ),
         args.request_timeout,
     )
     usage = response.get("usage") or {}
-    message = ((response.get("choices") or [{}])[0].get("message") or {})
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    choice = (response.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
     reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
     visible = str(message.get("content") or "")
+    finish_reason = choice.get("finish_reason")
     image_thinking_ok = (
         status == 200
-        and thinking_response_valid("high", visible, reasoning)
-        and "red" in visible.casefold()
-        and "square" in visible.casefold()
+        and image_thinking_response_valid(
+            visible,
+            reasoning,
+            finish_reason,
+            completion_tokens,
+        )
     )
     recorder.record(
         case="image-thinking",
@@ -1499,7 +1538,7 @@ def run_256k_image_gates(
         stream=False,
         success=image_thinking_ok,
         prompt_tokens=int(usage.get("prompt_tokens") or 0),
-        completion_tokens=int(usage.get("completion_tokens") or 0),
+        completion_tokens=completion_tokens,
         ttft_ms=None,
         total_ms=total_ms,
         http_status=status,
@@ -1507,6 +1546,8 @@ def run_256k_image_gates(
             "reasoning_present": bool(reasoning),
             "visible_text_present": bool(visible),
             "answer_match": "red" in visible.casefold() and "square" in visible.casefold(),
+            "requested_tokens": IMAGE_THINKING_MAX_TOKENS,
+            "finish_reason": finish_reason,
             "fixture_sha256": fixture_hashes["object"],
         },
     )
@@ -1521,6 +1562,7 @@ def run_256k_image_gates(
                 "type": "object",
                 "properties": {"code": {"type": "string"}},
                 "required": ["code"],
+                "additionalProperties": False,
             },
         },
     }
@@ -1540,19 +1582,14 @@ def run_256k_image_gates(
     )
     usage = response.get("usage") or {}
     tool_name, tool_arguments = completion_tool(response)
-    try:
-        parsed_arguments = json.loads(tool_arguments)
-    except json.JSONDecodeError:
-        parsed_arguments = None
-    reported_code = (
-        str(parsed_arguments.get("code") or "")
-        if isinstance(parsed_arguments, dict)
-        else ""
-    )
+    parsed_arguments = valid_access_code_arguments(tool_arguments)
+    access_code_match = parsed_arguments is not None
+    arguments_sha256 = _text_hash(normalize_json_arguments(tool_arguments))
     image_tool_ok = (
         status == 200
         and tool_name == "report_access_code"
-        and "Q382741" in _canonical_answer(reported_code)
+        and access_code_match
+        and arguments_sha256 == V02_IMAGE_TOOL_ARGUMENTS_SHA256
     )
     recorder.record(
         case="image-tool-call",
@@ -1567,8 +1604,8 @@ def run_256k_image_gates(
         http_status=status,
         proof={
             "tool_name": tool_name,
-            "answer_match": "382741" in _canonical_answer(reported_code),
-            "arguments_sha256": _text_hash(normalize_json_arguments(tool_arguments)),
+            "answer_match": access_code_match,
+            "arguments_sha256": arguments_sha256,
             "fixture_sha256": fixture_hashes["ocr"],
         },
     )
@@ -2262,14 +2299,6 @@ def main(argv: list[str] | None = None) -> int:
             raise EvidenceError("an initial release gate failed; soak was not started")
         soak = run_soak(args, recorder)
         acceptance_window_end = float(soak["finished_elapsed_s"])
-        final_runtime_tree = verify_clean_runtime(
-            root,
-            args.expected_commit,
-            allowed_untracked_root=args.out,
-        )
-        if final_runtime_tree != runtime_tree:
-            raise EvidenceError("runtime tree digest changed during the acceptance run")
-        runtime_clean_verified = True
     except Exception as exc:  # produce an inspectable incomplete bundle on every failure
         errors.append(sanitize_test_log(f"{type(exc).__name__}: {exc}", args.model_dir))
         if not (args.out / "pytest.txt").exists():
@@ -2279,6 +2308,32 @@ def main(argv: list[str] | None = None) -> int:
         sampler.stop()
     if sampler.error:
         errors.append(sanitize_test_log(f"resource telemetry failed: {sampler.error}", args.model_dir))
+    try:
+        final_runtime_tree = verify_clean_runtime(
+            root,
+            args.expected_commit,
+            allowed_untracked_root=args.out,
+        )
+        if final_runtime_tree != runtime_tree:
+            raise EvidenceError("runtime tree digest changed during the acceptance run")
+        runtime_clean_verified = True
+    except Exception as exc:
+        errors.append(
+            sanitize_test_log(
+                f"runtime tree verification failed: {type(exc).__name__}: {exc}",
+                args.model_dir,
+            )
+        )
+    if recorder.first_started_elapsed_s is not None:
+        acceptance_window_start = recorder.first_started_elapsed_s
+    if acceptance_window_end <= acceptance_window_start and sampler.samples:
+        # An incomplete run still publishes its observed resource window.  The
+        # missing soak remains fail-closed through the soak and leak gates, but
+        # zero peaks must not be mistaken for measurements.
+        acceptance_window_end = max(
+            acceptance_window_start,
+            float(sampler.samples[-1]["elapsed_s"]),
+        )
 
     elapsed = float(soak["duration_seconds"])
     write_json(args.out / "environment.json", env_doc)

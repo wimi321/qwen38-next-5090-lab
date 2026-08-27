@@ -605,12 +605,14 @@ class EvidenceTests(unittest.TestCase):
             "reasoning_present": True,
             "visible_text_present": True,
             "answer_match": True,
+            "requested_tokens": 512,
+            "finish_reason": "stop",
             "fixture_sha256": "c" * 64,
         })
         add("image-tool-call", proof={
             "tool_name": "report_access_code",
             "answer_match": True,
-            "arguments_sha256": "e" * 64,
+            "arguments_sha256": evidence.V02_IMAGE_TOOL_ARGUMENTS_SHA256,
             "fixture_sha256": "c" * 64,
         })
         add("ple-cold", proof={"phase": "cold"}, started=0.5)
@@ -634,14 +636,27 @@ class EvidenceTests(unittest.TestCase):
                 "image_tokens": 64, "text_tokens": 261056,
                 "runtime_image_tokens_delta": 64,
             })
-        (self.directory / "requests.jsonl").write_text(
-            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
-        )
-        with (self.directory / "latency.csv").open("w", newline="", encoding="utf-8") as handle:
-            fields = ["case", "iteration", "prompt_tokens", "completion_tokens", "ttft_ms", "total_ms"]
-            writer = csv.DictWriter(handle, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows({key: row[key] for key in fields} for row in rows if not row["warmup"])
+        def persist_request_rows() -> None:
+            (self.directory / "requests.jsonl").write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            with (self.directory / "latency.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                fields = [
+                    "case", "iteration", "prompt_tokens", "completion_tokens",
+                    "ttft_ms", "total_ms",
+                ]
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(
+                    {key: row[key] for key in fields}
+                    for row in rows
+                    if not row["warmup"]
+                )
+
+        persist_request_rows()
 
         samples = []
         for index, phase in enumerate(
@@ -726,6 +741,62 @@ class EvidenceTests(unittest.TestCase):
         evidence.write_json(self.directory / "summary.json", summary)
         evidence.write_checksums(self.directory)
         evidence.validate_directory(self.directory, release=True)
+
+        image_thinking = next(
+            row for row in rows if row["case"] == "image-thinking"
+        )
+        for field, invalid in (
+            ("finish_reason", "length"),
+            ("requested_tokens", 128),
+        ):
+            original = image_thinking["proof"][field]
+            image_thinking["proof"][field] = invalid
+            (self.directory / "requests.jsonl").write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            evidence.write_checksums(self.directory)
+            with self.subTest(image_thinking_field=field):
+                with self.assertRaisesRegex(evidence.EvidenceError, "API gates"):
+                    evidence.validate_directory(self.directory, release=True)
+            image_thinking["proof"][field] = original
+        original_completion = image_thinking["completion_tokens"]
+        image_thinking["completion_tokens"] = 511
+        persist_request_rows()
+        evidence.write_checksums(self.directory)
+        evidence.validate_directory(self.directory, release=True)
+        for invalid_completion in (0, 512):
+            image_thinking["completion_tokens"] = invalid_completion
+            persist_request_rows()
+            evidence.write_checksums(self.directory)
+            with self.subTest(image_thinking_completion=invalid_completion):
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError, "API gates|completion_tokens"
+                ):
+                    evidence.validate_directory(self.directory, release=True)
+        image_thinking["completion_tokens"] = original_completion
+        persist_request_rows()
+
+        image_tool = next(row for row in rows if row["case"] == "image-tool-call")
+        image_tool["proof"]["answer_match"] = False
+        (self.directory / "requests.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        evidence.write_checksums(self.directory)
+        with self.assertRaisesRegex(evidence.EvidenceError, "API gates"):
+            evidence.validate_directory(self.directory, release=True)
+        image_tool["proof"]["answer_match"] = True
+        original_arguments_hash = image_tool["proof"]["arguments_sha256"]
+        image_tool["proof"]["arguments_sha256"] = "0" * 64
+        (self.directory / "requests.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        evidence.write_checksums(self.directory)
+        with self.assertRaisesRegex(evidence.EvidenceError, "API gates"):
+            evidence.validate_directory(self.directory, release=True)
+        image_tool["proof"]["arguments_sha256"] = original_arguments_hash
 
         boundary_image = next(
             row for row in rows if row["case"] == "boundary-image"

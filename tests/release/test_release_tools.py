@@ -490,6 +490,50 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertTrue(rtx5090_harness.thinking_response_valid("high", "answer", "reason"))
         self.assertFalse(rtx5090_harness.thinking_response_valid("high", "answer", ""))
 
+    def test_image_thinking_requires_visible_answer_and_untruncated_finish(self) -> None:
+        self.assertEqual(rtx5090_harness.IMAGE_THINKING_MAX_TOKENS, 512)
+        self.assertTrue(
+            rtx5090_harness.image_thinking_response_valid(
+                "The image is a red square.", "visual reasoning", "stop", 511
+            )
+        )
+        for content, finish_reason, completion_tokens in (
+            ("", "length", 511),
+            ("The image is a red square.", "length", 511),
+            ("The image is a red square.", "stop", 0),
+            ("The image is a red square.", "stop", 512),
+        ):
+            with self.subTest(
+                content=content,
+                finish_reason=finish_reason,
+                completion_tokens=completion_tokens,
+            ):
+                self.assertFalse(
+                    rtx5090_harness.image_thinking_response_valid(
+                        content,
+                        "visual reasoning",
+                        finish_reason,
+                        completion_tokens,
+                    )
+                )
+
+    def test_access_code_tool_arguments_are_exact(self) -> None:
+        self.assertIsNotNone(
+            rtx5090_harness.valid_access_code_arguments('{"code":"382741"}')
+        )
+        for arguments in (
+            '{"code":"Q382741"}',
+            '{"code":"382742"}',
+            '{"code":382741}',
+            '{"code":"382741","extra":true}',
+            '{}',
+            'not-json',
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertIsNone(
+                    rtx5090_harness.valid_access_code_arguments(arguments)
+                )
+
     def test_tokenizer_never_enables_remote_code(self) -> None:
         tokenizer = mock.Mock()
         auto = mock.Mock()

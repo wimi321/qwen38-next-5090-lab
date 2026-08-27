@@ -42,6 +42,15 @@ RELEASE_RUN_ID_RE = re.compile(r"^rtx5090-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RELEASE_ONLY_ALLOWED_FILES = set(REQUIRED_FILES) | {"SHA256SUMS"}
 V02_RUNTIME_TELEMETRY_FILE = "runtime-telemetry.json"
 V02_PLE_CHECKPOINT_PROBE_FILE = "ple-checkpoint-probe.json"
+V02_IMAGE_ACCESS_CODE = "382741"
+V02_IMAGE_THINKING_MAX_TOKENS = 512
+V02_IMAGE_TOOL_ARGUMENTS_SHA256 = hashlib.sha256(
+    json.dumps(
+        {"code": V02_IMAGE_ACCESS_CODE},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 RUNTIME_PATHS = (
     "python",
     "profiles",
@@ -1166,16 +1175,23 @@ def _crosscheck_release_raw(
             ),
             "image_thinking": bool(
                 image_thinking
+                and image_thinking[0]["http_status"] == 200
                 and image_thinking[0]["proof"].get("reasoning_present") is True
                 and image_thinking[0]["proof"].get("visible_text_present") is True
                 and image_thinking[0]["proof"].get("answer_match") is True
+                and image_thinking[0]["proof"].get("requested_tokens")
+                == V02_IMAGE_THINKING_MAX_TOKENS
+                and image_thinking[0]["proof"].get("finish_reason") == "stop"
+                and 0 < image_thinking[0]["completion_tokens"]
+                < V02_IMAGE_THINKING_MAX_TOKENS
             ),
             "image_tool_call": bool(
                 image_tool
+                and image_tool[0]["http_status"] == 200
                 and image_tool[0]["proof"].get("tool_name") == "report_access_code"
                 and image_tool[0]["proof"].get("answer_match") is True
-                and isinstance(image_tool[0]["proof"].get("arguments_sha256"), str)
-                and SHA256_RE.fullmatch(image_tool[0]["proof"]["arguments_sha256"])
+                and image_tool[0]["proof"].get("arguments_sha256")
+                == V02_IMAGE_TOOL_ARGUMENTS_SHA256
             ),
         })
     if recomputed_api != summary["gates"]["api"] or not all(recomputed_api.values()):
