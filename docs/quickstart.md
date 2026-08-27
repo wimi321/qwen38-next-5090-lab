@@ -1,5 +1,9 @@
 # Quick start
 
+> This inherited FreeToken CLI guide is retained for compatibility. The only
+> model/profile validated by this downstream alpha is documented in
+> [qwen4-exp.md](qwen4-exp.md); other examples below are not release claims.
+
 Assumes FreeToken is installed — see [install.md](install.md).
 
 ## Launch a server

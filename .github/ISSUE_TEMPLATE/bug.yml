@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a reproducible defect inside the documented alpha contract.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets, private prompts/outputs, access tokens, usernames, or unredacted paths. Security issues belong in a private advisory.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and read the model-status page.
+          required: true
+        - label: This occurs within the text-only, TP=1, max-running=1, 8K, naive-cache, graph-disabled contract.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or release
+      placeholder: git rev-parse HEAD
+    validations:
+      required: true
+  - type: input
+    id: checkpoint
+    attributes:
+      label: Checkpoint
+      placeholder: Repository id, exact revision, and local verification result
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: GPU/VRAM, CPU/RAM, Windows/WSL/Ubuntu, driver, CUDA toolkit, Torch, and Triton.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal exact commands/request and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      render: shell
+    validations:
+      required: true

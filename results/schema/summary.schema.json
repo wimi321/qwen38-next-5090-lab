@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wimi321/qwen38-next-5090-lab/results/schema/summary.schema.json",
+  "title": "RTX 5090 release-gate summary",
+  "type": "object",
+  "required": ["schema_version", "status", "run_id", "measured_at", "source", "model", "execution", "gates", "resources", "benchmarks", "caveats"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "status": {"enum": ["incomplete", "synthetic", "verified"]},
+    "run_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$"},
+    "measured_at": {"type": "string", "format": "date-time"},
+    "source": {"type": "object"},
+    "model": {"type": "object"},
+    "execution": {"type": "object"},
+    "gates": {"type": "object"},
+    "resources": {"type": "object"},
+    "benchmarks": {"type": "object"},
+    "caveats": {"type": "array", "items": {"type": "string"}}
+  }
+}
+

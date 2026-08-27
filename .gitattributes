@@ -1,0 +1,31 @@
+* text=auto
+
+# The runtime is built and validated inside Linux/WSL. Keep executable and
+# configuration sources byte-stable across Windows and Linux checkouts.
+*.py text eol=lf
+*.pyi text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.cu text eol=lf
+*.cuh text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.gif binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.pdf binary
+*.safetensors binary
+*.whl binary

@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 from .index import indexing
 from .fast_index_copy import fast_index_copy_jit, update_copy_flag_jit
 from .moe_impl import (

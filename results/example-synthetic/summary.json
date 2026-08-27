@@ -1,0 +1,64 @@
+{
+  "benchmarks": {
+    "note": "Synthetic shape example; all values are placeholders"
+  },
+  "caveats": [
+    "Synthetic data is never release evidence"
+  ],
+  "execution": {
+    "attention_backend": "qsa_triton",
+    "cache_type": "naive",
+    "context_tokens": 8192,
+    "cuda_graph": false,
+    "quantization": "W4A16 compatibility",
+    "text_only": true,
+    "tp_size": 1
+  },
+  "gates": {
+    "api": {
+      "stream_nonstream_match": false,
+      "thinking_high": false,
+      "thinking_none": false,
+      "tool_call": false
+    },
+    "continuous_run_seconds": 0,
+    "prompt_cases": [],
+    "pytest": {
+      "deselected": 0,
+      "failed": 0,
+      "passed": 0,
+      "skipped": 0
+    },
+    "stability": {
+      "attempted": 0,
+      "succeeded": 0
+    },
+    "steady_decode": {
+      "observed_tokens": 0,
+      "requested_tokens": 256
+    }
+  },
+  "measured_at": "1970-01-01T00:00:00Z",
+  "model": {
+    "file_count": 0,
+    "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "repository": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "0000000000000000000000000000000000000000",
+    "total_bytes": 0
+  },
+  "resources": {
+    "peak_vram_mib": 0,
+    "peak_wsl_rss_kib": 0,
+    "windows_pagefile_note": "Synthetic; not measured",
+    "wsl_rss_source": "synthetic",
+    "wsl_swap_kib": 0
+  },
+  "run_id": "example-synthetic",
+  "schema_version": "1.0",
+  "source": {
+    "release_compatible": false,
+    "upstream_base": "synthetic",
+    "validated_runtime_commit": "synthetic"
+  },
+  "status": "synthetic"
+}

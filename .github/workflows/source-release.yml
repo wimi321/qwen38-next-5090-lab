@@ -1,0 +1,112 @@
+name: Source-only prerelease
+
+on:
+  push:
+    tags: ["v*"]
+
+# This lane never builds or publishes wheels, containers, PyPI packages, or model
+# weights.  It packages the tagged source plus already-reviewed, tracked evidence.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: source-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require successful hosted CI for the evidence commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          conclusion="$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$RELEASE_COMMIT" -f event=push -f status=completed \
+            -f per_page=10 --jq '.workflow_runs[0].conclusion // ""')"
+          test "$conclusion" = success || {
+            echo "Hosted CI has not succeeded for $RELEASE_COMMIT" >&2
+            exit 1
+          }
+      - name: Validate prerelease tag and repository
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]] || {
+            echo "only vX.Y.Z-alpha.N tags are accepted" >&2
+            exit 1
+          }
+          test "$(git cat-file -t "$RELEASE_TAG")" = tag || {
+            echo "release tag must be annotated" >&2
+            exit 1
+          }
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$RELEASE_COMMIT" || {
+            echo "tag does not resolve to GITHUB_SHA" >&2
+            exit 1
+          }
+          python -c 'import os,re,pathlib; tag=os.environ["RELEASE_TAG"]; m=re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)-alpha\.(\d+)", tag); expected=f"{m[1]}.{m[2]}.{m[3]}a{m[4]}"; text=pathlib.Path("python/freetoken/version.py").read_text(); actual=text.split("=", 1)[1].strip().strip(chr(34)+chr(39)); assert actual == expected, f"tag {tag} maps to {expected}, package is {actual}"'
+          python scripts/release/repository_audit.py
+          python scripts/release/evidence.py release-input \
+            --root results --tag-commit "$RELEASE_COMMIT" --repo-root .
+          result_dir="$(python scripts/release/evidence.py release-input \
+            --root results --tag-commit "$RELEASE_COMMIT" --repo-root . --print-path)"
+          python scripts/release/evidence.py table "$result_dir" --readme README.md --check
+      - name: Build tagged source archive and source SBOM
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          prefix="qwen38-next-5090-lab-${RELEASE_TAG#v}/"
+          git archive --format=tar --prefix="$prefix" "$GITHUB_SHA" > dist/source.tar
+          gzip -n dist/source.tar
+          mv dist/source.tar.gz "dist/qwen38-next-5090-lab-${RELEASE_TAG#v}.tar.gz"
+          python scripts/release/source_sbom.py \
+            --name qwen38-next-5090-lab \
+            --version "${RELEASE_TAG#v}" \
+            --output "dist/qwen38-next-5090-lab-${RELEASE_TAG#v}.spdx.json"
+      - name: Package verified RTX 5090 evidence
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          result_dir="$(python scripts/release/evidence.py release-input \
+            --root results --tag-commit "$GITHUB_SHA" --repo-root . --print-path)"
+          evidence_name="qwen38-next-5090-lab-${RELEASE_TAG#v}-evidence"
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "dist/${evidence_name}.tar.gz" -C "$(dirname "$result_dir")" "$(basename "$result_dir")"
+          (cd dist && sha256sum *.tar.gz *.spdx.json > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: source-release-${{ github.ref_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: source-release-${{ github.ref_name }}
+          path: dist
+      - name: Create or refresh the GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          notes='Developer preview: text-only, TP=1, 8K, naive cache, graph disabled, W4A16 compatibility on RTX 5090/WSL2. No model weights are included.'
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --prerelease --title "$RELEASE_TAG" --notes "$notes" dist/* \
+          || gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*

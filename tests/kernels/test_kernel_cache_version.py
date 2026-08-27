@@ -1,8 +1,8 @@
-"""Version pairing between the runtime and the freetoken-kernel-cache wheel.
+"""Compatibility with an externally installed legacy kernel-cache package.
 
-The comparator lives in freetoken.kernel.utils; this pins the matrix for the stamped
-version scheme (runtime `0.1.1+g<sha>`, cache `0.1.1+cu130.g<sha>`) introduced by
-scripts/build-release-wheels.sh."""
+This downstream does not build or publish that wheel. The comparator remains so
+an existing optional cache cannot be silently paired with an incompatible
+runtime."""
 
 import pytest
 

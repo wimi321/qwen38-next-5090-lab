@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 from __future__ import annotations
 
 import importlib
@@ -82,7 +83,7 @@ def _version_parts(version: str) -> Tuple[str, List[str]]:
 
 def _build_stamps(segments: List[str]) -> set[str]:
     """The `g<sha>` commit-stamp tokens of a local version segment list
-    (stamped by scripts/build-release-wheels.sh)."""
+    used by legacy external kernel-cache packages."""
     return {s for s in segments if re.fullmatch(r"g[0-9a-f]{7,40}", s)}
 
 

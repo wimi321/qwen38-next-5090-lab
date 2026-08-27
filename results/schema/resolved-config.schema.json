@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wimi321/qwen38-next-5090-lab/results/schema/resolved-config.schema.json",
+  "title": "Sanitized resolved RTX 5090 profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile", "served_model_name", "model_basename", "settings"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "profile": {"const": "rtx5090-wsl2"},
+    "served_model_name": {"type": "string"},
+    "model_basename": {"type": "string"},
+    "settings": {
+      "type": "object",
+      "required": ["host", "port", "tp_size", "max_running_requests", "max_seq_len", "max_prefill_length", "num_tokens", "memory_ratio", "cache_type", "attention_backend", "cuda_graph", "moe_backend", "moe_cache_auto", "moe_cpu_layers", "nvfp4_backend"],
+      "properties": {
+        "host": {"const": "127.0.0.1"},
+        "port": {"const": 1919},
+        "tp_size": {"const": 1},
+        "max_running_requests": {"const": 1},
+        "max_seq_len": {"const": 8192},
+        "max_prefill_length": {"const": 8192},
+        "num_tokens": {"const": 8192},
+        "memory_ratio": {"const": 0.89},
+        "cache_type": {"const": "naive"},
+        "attention_backend": {"const": "qsa_triton"},
+        "cuda_graph": {"const": false},
+        "moe_backend": {"const": "offload"},
+        "moe_cache_auto": {"const": true},
+        "moe_cpu_layers": {"type": "null"},
+        "nvfp4_backend": {"const": "auto"}
+      }
+    }
+  }
+}

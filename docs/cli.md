@@ -1,5 +1,13 @@
 # CLI reference
 
+> `ft` is the retained FreeToken-compatible low-level CLI. The downstream
+> reproducibility entry point is `q38lab`; run `q38lab --help` and see
+> [qwen4-exp.md](qwen4-exp.md) for its fixed RTX 5090 profile.
+
+`q38lab bench --out results/rtx5090-YYYY-MM-DD` invokes the same authoritative
+full-hash, test, API, stability, 30-minute soak, and resource-evidence harness
+used by source releases. It is intentionally not a short benchmark mode.
+
 ```
 ft <command> [args]
 ```
@@ -13,8 +21,8 @@ ft <command> [args]
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
 
-`ft --version` prints the installed version (torch-free; nightly wheels carry a
-`+g<sha>` build stamp, tagged releases a bare version). Every command supports
+`ft --version` prints the installed downstream version without importing
+PyTorch. This project publishes source archives only; every command supports
 `--help`.
 
 ## ft serve

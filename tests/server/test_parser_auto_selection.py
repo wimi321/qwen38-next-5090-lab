@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 """`--tool-call-parser auto` / `--reasoning-parser auto`: architecture -> parser name.
 
 Three tables are maintained independently -- the model registry, the substring cascade in

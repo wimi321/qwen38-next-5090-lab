@@ -1,0 +1,2 @@
+elapsed_s,gpu_memory_mib,wsl_rss_kib,wsl_rss_source,wsl_swap_kib,minor_faults,major_faults,fault_processes,pcie_rx_mib_s,pcie_tx_mib_s
+0,0,0,synthetic,0,0,0,0,,

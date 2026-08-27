@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, cite this downstream release and acknowledge the
+  upstream FreeToken work that provides its serving-engine foundation.
+title: "Qwen3.8 Next 5090 Lab"
+type: software
+version: "0.1.0-alpha.1"
+authors:
+  - name: "wimi321"
+    website: "https://github.com/wimi321"
+repository-code: "https://github.com/wimi321/qwen38-next-5090-lab"
+url: "https://github.com/wimi321/qwen38-next-5090-lab"
+license: Apache-2.0
+abstract: >-
+  An unofficial, reproducible FreeToken downstream for running the text tower
+  from the pinned Qwen3.8-Flash-Next NVFP4 checkpoint on one 32 GB RTX 5090,
+  using sparse PLE mmap row staging, Query-Selective Attention, four-stream
+  gated residuals, and heterogeneous MoE offload.
+keywords:
+  - Qwen3.8-Flash-Next
+  - FreeToken
+  - mixture of experts
+  - Query-Selective Attention
+  - consumer GPU inference

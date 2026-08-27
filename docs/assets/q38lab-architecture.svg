@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3.8 Next 5090 Lab text-only execution architecture</title>
+  <desc id="desc">A local OpenAI-compatible request enters the FreeToken downstream text tower. Four residual streams pass through 36 gated delta network layers and 12 query-selective attention layers. The PLE table is memory mapped, selected FP8 rows are decoded on the CPU, converted into pinned BF16 staging, and transferred to the GPU. Routed NVFP4 experts use a heterogeneous CPU, host memory, PCIe, and GPU cache path.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#151d38"/>
+    </linearGradient>
+    <linearGradient id="gpu" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#1f6feb"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="host" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#059669"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a5b4fc"/>
+    </marker>
+    <style>
+      .title { font: 700 28px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #f8fafc; }
+      .subtitle { font: 500 15px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #a5b4fc; }
+      .label { font: 700 17px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #f8fafc; }
+      .body { font: 500 14px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #dbeafe; }
+      .small { font: 500 12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #cbd5e1; }
+      .chip { font: 700 12px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #e0e7ff; }
+      .box { stroke: #64748b; stroke-width: 1.4; rx: 14; }
+      .arrow { fill: none; stroke: #a5b4fc; stroke-width: 2.2; marker-end: url(#arrow); }
+      .dashed { fill: none; stroke: #5eead4; stroke-width: 2; stroke-dasharray: 7 6; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1200" height="760" rx="24" fill="url(#bg)"/>
+  <text class="title" x="48" y="52">Qwen3.8 Next 5090 Lab</text>
+  <text class="subtitle" x="48" y="78">Verified alpha path · text only · TP=1 · max-running=1 · 8K · naive cache · graph=0 · W4A16 compatibility</text>
+
+  <rect class="box" x="48" y="118" width="220" height="105" fill="#172554"/>
+  <text class="label" x="70" y="151">Local client</text>
+  <text class="body" x="70" y="178">OpenAI-compatible API</text>
+  <text class="small" x="70" y="202">127.0.0.1 by default</text>
+
+  <rect class="box" x="322" y="118" width="250" height="105" fill="#1e293b"/>
+  <text class="label" x="344" y="151">Tokenizer + scheduler</text>
+  <text class="body" x="344" y="178">Text payloads only</text>
+  <text class="small" x="344" y="202">One running request</text>
+
+  <rect class="box" x="626" y="102" width="526" height="137" fill="url(#gpu)"/>
+  <text class="label" x="650" y="135">Qwen4-Exp text tower on RTX 5090</text>
+  <rect x="650" y="154" width="155" height="50" rx="10" fill="#312e81" stroke="#c4b5fd"/>
+  <text class="body" x="669" y="177">Embedding</text>
+  <text class="small" x="669" y="195">replicate ×4 streams</text>
+  <rect x="829" y="154" width="146" height="50" rx="10" fill="#312e81" stroke="#c4b5fd"/>
+  <text class="body" x="848" y="177">48 layers</text>
+  <text class="small" x="848" y="195">gated residual</text>
+  <rect x="999" y="154" width="129" height="50" rx="10" fill="#312e81" stroke="#c4b5fd"/>
+  <text class="body" x="1018" y="177">Mixer</text>
+  <text class="small" x="1018" y="195">LM head</text>
+
+  <path class="arrow" d="M268 170 H322"/>
+  <path class="arrow" d="M572 170 H626"/>
+  <path class="arrow" d="M805 179 H829"/>
+  <path class="arrow" d="M975 179 H999"/>
+
+  <rect class="box" x="48" y="284" width="526" height="202" fill="#111827"/>
+  <text class="label" x="72" y="317">Layer attention paths</text>
+  <rect x="72" y="339" width="218" height="112" rx="12" fill="#1e3a8a" stroke="#60a5fa"/>
+  <text class="body" x="92" y="368">36 × GDN</text>
+  <text class="small" x="92" y="393">linear recurrent state</text>
+  <text class="small" x="92" y="414">sigmoid output gate</text>
+  <text class="small" x="92" y="435">request-local state pool</text>
+  <rect x="314" y="339" width="236" height="112" rx="12" fill="#4c1d95" stroke="#c084fc"/>
+  <text class="body" x="334" y="368">12 × QSA</text>
+  <text class="small" x="334" y="393">4-token index blocks</text>
+  <text class="small" x="334" y="414">top-512 blocks (pinned config)</text>
+  <text class="small" x="334" y="435">main K/V + index-key cache</text>
+
+  <rect class="box" x="626" y="284" width="526" height="202" fill="url(#gpu)"/>
+  <text class="label" x="650" y="317">Mixture of Experts</text>
+  <rect x="650" y="339" width="194" height="112" rx="12" fill="#312e81" stroke="#c4b5fd"/>
+  <text class="body" x="670" y="368">Router</text>
+  <text class="small" x="670" y="393">512 routed experts</text>
+  <text class="small" x="670" y="414">softmax top-10</text>
+  <text class="small" x="670" y="435">+ shared expert</text>
+  <rect x="868" y="339" width="260" height="112" rx="12" fill="#312e81" stroke="#c4b5fd"/>
+  <text class="body" x="888" y="368">Heterogeneous offload</text>
+  <text class="small" x="888" y="393">NVFP4 expert banks in host RAM</text>
+  <text class="small" x="888" y="414">pageable CPU layers + pinned banks</text>
+  <text class="small" x="888" y="435">PCIe → GPU expert LRU cache</text>
+
+  <rect class="box" x="48" y="535" width="1104" height="163" fill="url(#host)"/>
+  <text class="label" x="72" y="568">PLE auxiliary path · layer 2 (one-indexed)</text>
+  <rect x="72" y="592" width="204" height="72" rx="11" fill="#064e3b" stroke="#6ee7b7"/>
+  <text class="body" x="91" y="618">Read-only safetensors mmap</text>
+  <text class="small" x="91" y="641">sparse matched FP8 rows only</text>
+  <rect x="310" y="592" width="204" height="72" rx="11" fill="#064e3b" stroke="#6ee7b7"/>
+  <text class="body" x="329" y="618">CPU row decode</text>
+  <text class="small" x="329" y="641">FP8 → FP32 + scale</text>
+  <rect x="548" y="592" width="204" height="72" rx="11" fill="#064e3b" stroke="#6ee7b7"/>
+  <text class="body" x="567" y="618">Pinned staging</text>
+  <text class="small" x="567" y="641">convert to BF16 on CPU</text>
+  <rect x="786" y="592" width="342" height="72" rx="11" fill="#312e81" stroke="#c4b5fd"/>
+  <text class="body" x="805" y="618">GPU PLE projection + convolution</text>
+  <text class="small" x="805" y="641">non-blocking H2D; request-local history/state</text>
+  <path class="dashed" d="M276 628 H310"/>
+  <path class="dashed" d="M514 628 H548"/>
+  <path class="dashed" d="M752 628 H786"/>
+  <path class="dashed" d="M957 592 C957 528 891 518 891 486"/>
+
+  <text class="small" x="48" y="731">The full ~51 GB PLE table remains file-backed; only requested rows are staged. Vision tower and MTP weights are not loaded.</text>
+</svg>

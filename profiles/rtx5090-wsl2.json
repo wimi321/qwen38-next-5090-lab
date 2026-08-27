@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "profile": "rtx5090-wsl2",
+  "served_model_name": "qwen3.8-flash-next-nvfp4",
+  "gpu": "0",
+  "tp_size": 1,
+  "max_running_requests": 1,
+  "max_seq_len": 8192,
+  "max_prefill_length": 8192,
+  "num_tokens": 8192,
+  "memory_ratio": 0.89,
+  "cache_type": "naive",
+  "attention_backend": "qsa_triton",
+  "graph": 0,
+  "moe_backend": "offload",
+  "moe_cache_auto": true,
+  "nvfp4_backend": "auto",
+  "host": "127.0.0.1",
+  "port": 1919,
+  "unsupported": ["vision", "video", "mtp", "radix-cache", "tp>1", "context>8192"]
+}
+

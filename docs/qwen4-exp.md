@@ -1,4 +1,8 @@
-# Qwen3.8-Flash-Next (Qwen4-Exp) text-only bring-up
+# Qwen3.8-Flash-Next (Qwen4-Exp) text-only reproducibility record
+
+This document was substantially modified by Qwen3.8 Next 5090 Lab contributors
+in 2026; see [`../MODIFICATIONS.md`](../MODIFICATIONS.md). It describes an
+unofficial FreeToken downstream, not an upstream FreeToken support claim.
 
 This page is the reproducibility record for the first Qwen4-Exp milestone. It
 targets exactly
@@ -106,55 +110,52 @@ Keep both paths below in the WSL ext4 filesystem:
 ```bash
 mkdir -p "$HOME/src" "$HOME/models"
 cd "$HOME/src"
-git clone https://github.com/FlashML-org/FreeToken.git
-cd FreeToken
-git switch --create codex/qwen4-exp-text \
-  9ef3651309fe4058672f2cc92069238dea06be1b
-# Apply the reviewed Qwen4-Exp text implementation commits to this branch.
+git clone https://github.com/wimi321/qwen38-next-5090-lab.git
+cd qwen38-next-5090-lab
 
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e '.[accel]'
 ```
 
-The implementation commit is part of the result and must also be recorded;
-the SHA above is its audited upstream merge base, not a substitute for the
-Qwen4-Exp changes.
+Every evidence directory records the checked-out downstream commit. The audited
+FreeToken merge base is
+`9ef3651309fe4058672f2cc92069238dea06be1b`; it establishes provenance but is
+not a substitute for the downstream release commit.
 
 Download only the pinned revision. If that commit is unavailable, stop and
 audit the replacement rather than silently selecting another revision:
 
 ```bash
-MODEL_DIR="$HOME/models/qwen38-flash-next-nvfp4-7b71922"
-hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  --revision 7b719225242aacd3dbd3f9407468c2ee9a9d2594 \
-  --local-dir "$MODEL_DIR"
+q38lab download --accept-qwen-license --full-verify
 ```
 
-Create a local checksum manifest once, preserve it with the test record, and
-verify it before subsequent runs:
-
-```bash
-cd "$MODEL_DIR"
-find . -type f ! -path './.cache/*' -print0 \
-  | LC_ALL=C sort -z \
-  | xargs -0 sha256sum > ../qwen38-flash-next-nvfp4-7b71922.sha256
-sha256sum -c ../qwen38-flash-next-nvfp4-7b71922.sha256
-```
+The downloader writes its verification receipt next to, not inside, the model
+directory. It refuses a destination inside any Git worktree, checks remaining
+disk capacity before network I/O, and never falls back to another revision.
+The full mode reads every checkpoint byte; the release harness repeats that
+same shared verifier and does not depend on an undocumented external manifest.
 
 The 2026-08-27 validation copy contained 419 non-cache files
 (135,253,622,894 bytes), including 206 safetensors files.  Every Hugging Face
-entry verified against the pinned revision.  The local manifest itself has
-SHA256 `6cc22b628ca575785e5dfdcab3c7056e79a7eac798969a145341ed1530c2a3a8`.
+entry verified against the pinned revision. The canonical GNU-format manifest
+digest is `6cc22b628ca575785e5dfdcab3c7056e79a7eac798969a145341ed1530c2a3a8`.
 
 ## RTX 5090 launch
 
-Run from the source environment. These are parser-backed FreeToken flags; the
+The release profile is the preferred entry point:
+
+```bash
+q38lab serve --profile rtx5090-wsl2
+```
+
+The equivalent low-level command below is retained so the resolved configuration
+can be audited. These are parser-backed FreeToken flags; the
 explicit sequence limit keeps the first milestone honest, while `--num-tokens`
 sets the total KV capacity rather than the checkpoint's advertised context:
 
 ```bash
-source "$HOME/src/FreeToken/.venv/bin/activate"
+source "$HOME/src/qwen38-next-5090-lab/.venv/bin/activate"
 MODEL_DIR="$HOME/models/qwen38-flash-next-nvfp4-7b71922"
 
 ft serve \
@@ -191,8 +192,10 @@ startup on auto and record the resolved layer list from the log. Passing the
 count `--moe-cpu-layers 15` is not equivalent because count syntax distributes
 layers evenly through the model.
 
-The checkpoint's PLE bank is separate from the MoE expert cache. Do not enable
-a Windows pagefile or WSL swap to make a failing configuration appear to pass.
+The checkpoint's PLE bank is separate from the MoE expert cache. The validated
+host already had a Windows pagefile, which was not created or resized for this
+run. Do not add WSL swap, alter the host pagefile, or rely on paging to make a
+failing configuration appear to pass.
 `--graph 0` is intentional for this bring-up; do not change it until the PLE
 staging test and the QSA kernels both pass real capture/replay parity on the
 target CUDA/Triton stack.
@@ -303,7 +306,7 @@ eight-token output cap.
 
 | Field | Record |
 |---|---|
-| Implementation HEAD / upstream base / checkpoint revision | `a0c0778` / `9ef3651` / `7b71922` |
+| Upstream base / checkpoint revision | `9ef3651` / `7b71922` (the evidence manifest records the downstream release commit) |
 | Driver / CUDA toolkit / torch / Triton | 591.86 / 13.3 / 2.11.0+cu130 / 3.6.0 |
 | Checkpoint quant recipe / executed expert path | W4A4 / W4A16 compatibility |
 | Cold-start time (3 runs) | approximately 66.0 s (log resolution), 107.272 s, 162.509 s |

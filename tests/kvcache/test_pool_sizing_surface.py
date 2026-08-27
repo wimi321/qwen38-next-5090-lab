@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 """Pool-family sizing classmethods: dispatch and parity with the pure cost functions.
 
 The engine sizes KV before the pool exists through resolve_pool_class(...).kv_cost /

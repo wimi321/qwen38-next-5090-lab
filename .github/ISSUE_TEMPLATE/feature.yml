@@ -1,0 +1,45 @@
+name: Feature proposal
+description: Propose one scoped downstream capability or engineering change.
+title: "[Feature]: "
+labels: ["enhancement", "needs-design"]
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and the documented milestones.
+          required: true
+        - label: This proposal contains one independently reviewable change.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user-visible limitation, not only a preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Proposed contract
+      description: Inputs, outputs, failure behavior, compatibility, and what remains out of scope.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: Oracles/parity, tiny tests, target hardware, resource gates, and evidence.
+    validations:
+      required: true
+  - type: dropdown
+    id: destination
+    attributes:
+      label: Likely destination
+      options:
+        - Downstream-only product/reproducibility feature
+        - Candidate engine change to coordinate with FreeToken upstream
+        - Unsure
+    validations:
+      required: true

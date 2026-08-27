@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 import functools
 import json
 import os
@@ -170,11 +171,50 @@ def _raw_config_json(model_path: str) -> dict:
     else:
         path = hf_hub_download(repo_id=model_path, filename="config.json")
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError("config.json must contain a JSON object")
+    return value
+
+
+def _is_native_qwen4_exp_config(raw: dict[str, Any]) -> bool:
+    """Recognize the whole native Qwen4-Exp config family without remote code.
+
+    Conditional-generation checkpoints may declare the language identity at
+    the root or under ``text_config`` and architecture names are not stable
+    across Transformers versions.  Any Qwen4-Exp-looking identity is handled
+    by the audited raw shim; unsupported variants then fail in FreeToken's
+    registry instead of executing a checkpoint ``auto_map`` module.
+    """
+
+    candidates = [raw]
+    for key in ("text_config", "language_config"):
+        nested = raw.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for candidate in candidates:
+        model_type = str(candidate.get("model_type") or "").lower()
+        if model_type.startswith("qwen4_exp"):
+            return True
+        architectures = candidate.get("architectures") or []
+        if isinstance(architectures, str):
+            architectures = [architectures]
+        if isinstance(architectures, list) and any(
+            isinstance(name, str) and name.startswith("Qwen4Exp")
+            for name in architectures
+        ):
+            return True
+    return False
 
 
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
+    # Qwen4-Exp is implemented natively by this downstream.  Parse its audited
+    # JSON directly so an ``auto_map`` entry can never execute checkpoint code
+    # during configuration loading.
+    raw = _raw_config_json(model_path)
+    if _is_native_qwen4_exp_config(raw):
+        return RawConfigShim(raw, _name_or_path=model_path)
     # trust_remote_code: checkpoints that ship a custom config class via ``auto_map``
     # (e.g. MiniMax-M2) refuse to load without it. FreeToken only reads config fields
     # (parse_config) and never instantiates the checkpoint's modeling code.

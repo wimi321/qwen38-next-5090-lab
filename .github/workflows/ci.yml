@@ -1,0 +1,73 @@
+name: Hosted CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# PR code runs only on GitHub-hosted workers.  This repository deliberately has
+# no self-hosted job: untrusted contributions must never execute on the RTX 5090.
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-safety:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Audit package identity, local links, secrets, and large files
+        run: python scripts/release/repository_audit.py
+      - name: Test release and evidence tooling
+        run: |
+          python -m pip install --disable-pip-version-check \
+            'pytest>=8,<9' 'jsonschema>=4,<5'
+          python -m unittest discover -s tests/release -p 'test_*.py' -v
+          PYTHONPATH=python python -m pytest -q tests/q38lab
+      - name: Validate source package metadata
+        run: |
+          python -c 'import ast,pathlib,tomllib; p=tomllib.loads(pathlib.Path("pyproject.toml").read_text()); tree=ast.parse(pathlib.Path("python/freetoken/version.py").read_text()); version=tree.body[0].value.value; assert p["project"]["name"] == "qwen38-next-5090-lab"; assert version == "0.1.0a1"; assert p["project"]["scripts"]["q38lab"] == "q38lab.cli:main"; assert p["project"]["urls"]["Upstream"] == "https://github.com/FlashML-org/FreeToken"'
+      - name: Check evidence schemas and source SBOM generation
+        run: |
+          python scripts/release/schema_check.py
+          python scripts/release/evidence.py validate-example
+          python scripts/release/source_sbom.py --output /tmp/source.spdx.json
+          python -m json.tool /tmp/source.spdx.json >/dev/null
+
+  qwen4-exp-cpu-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: python
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install CPU-only oracle dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            --index-url https://download.pytorch.org/whl/cpu \
+            'torch>=2.11,<2.12'
+          python -m pip install --disable-pip-version-check \
+            'pytest>=8,<9' 'einops>=0.8,<1' 'numpy>=2,<2.5' \
+            'safetensors>=0.6,<1' 'transformers>=5.5,<6' \
+            'huggingface_hub>=1.5,<2' 'tqdm>=4.66,<5' 'msgpack>=1.1,<2' \
+            'pyzmq>=27,<28' 'triton==3.6.0'
+      - name: Run QSA, PLE, gated-residual, and loader CPU tests
+        run: |
+          python -m pytest -q \
+            tests/kernels/test_qsa_reference.py \
+            tests/kernels/test_qsa_vectorized.py \
+            tests/kernels/test_qsa_torch_backend.py \
+            tests/kvcache/test_qsa_pool.py \
+            tests/models/test_qwen4_exp_ple.py \
+            tests/models/test_qwen4_exp_hyperconnection.py \
+            tests/models/test_qwen4_exp_weight.py

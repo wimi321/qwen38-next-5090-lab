@@ -1,0 +1,23 @@
+{
+  "model_basename": "synthetic-checkpoint",
+  "profile": "rtx5090-wsl2",
+  "schema_version": "1.0",
+  "served_model_name": "qwen3.8-flash-next-nvfp4",
+  "settings": {
+    "attention_backend": "qsa_triton",
+    "cache_type": "naive",
+    "cuda_graph": false,
+    "host": "127.0.0.1",
+    "port": 1919,
+    "max_prefill_length": 8192,
+    "max_running_requests": 1,
+    "max_seq_len": 8192,
+    "memory_ratio": 0.89,
+    "moe_backend": "offload",
+    "moe_cache_auto": true,
+    "moe_cpu_layers": null,
+    "num_tokens": 8192,
+    "nvfp4_backend": "auto",
+    "tp_size": 1
+  }
+}

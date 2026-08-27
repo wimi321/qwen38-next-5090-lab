@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 """Prefill hit-D2D split: resident experts must be gathered device-side, misses
 H2D'd via cudaMemcpyBatchAsync, and the buffer must end up byte-identical to the
 full-layer copy for every mix -- including experts resident in the volatile

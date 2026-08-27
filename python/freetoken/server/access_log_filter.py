@@ -1,11 +1,11 @@
-"""Hide desktop-app polling traffic from uvicorn's access log.
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
+"""Hide high-frequency status polling traffic from uvicorn's access log.
 
-The FreeToken desktop app polls a handful of read-only endpoints every 1-2s to keep its UI
+Compatible status clients poll a handful of read-only endpoints every 1-2s to keep their UI
 current: ``GET /health`` (lifecycle), ``GET /v1/stats`` (runtime metrics), ``GET /v1/requests``
 (request-log ring, carries a ``?since=&limit=`` query string), ``GET /v1/cache/status``, and a
 bare ``GET /v1`` liveness probe. Uvicorn's ``uvicorn.access`` logger logs every one of these at
-INFO, which floods both the engine's own stdout and the desktop's "Logs" screen (which tails
-that stdout) with lines nobody reads.
+INFO, which floods both the engine's stdout and client log views with repetitive lines.
 
 These lines are registered as debug-level noise (per spec): suppressed by default, and only
 shown once the engine's existing verbosity knob -- the ``LOG_LEVEL`` env var consumed by
@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import os
 
-# Path prefixes considered desktop-polling traffic. Matched against the request path with
+# Path prefixes considered status-polling traffic. Matched against the request path with
 # any query string stripped (uvicorn's access record embeds the query string in the logged
 # path, e.g. "/v1/requests?since=123&limit=50").
 _POLLING_PATH_PREFIXES: tuple[str, ...] = (

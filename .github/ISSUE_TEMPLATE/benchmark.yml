@@ -1,0 +1,44 @@
+name: Benchmark report
+description: Submit reproducible performance or stability evidence.
+title: "[Benchmark]: "
+labels: ["benchmark", "needs-validation"]
+body:
+  - type: checkboxes
+    id: evidence_rules
+    attributes:
+      label: Evidence rules
+      options:
+        - label: I removed prompts, outputs, secrets, usernames, hostnames, and private paths.
+          required: true
+        - label: I will attach the generated environment and resolved-config records with the summary.
+          required: true
+        - label: I did not infer steady decode speed from a short completion or call effective prefill a kernel benchmark.
+          required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Hardware and software
+      description: GPU/VRAM, CPU/RAM, OS/WSL, driver, CUDA, Torch, Triton, commit, and checkpoint revision.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command and resolved profile
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Method and results
+      description: Warm-ups/runs, token counts, TTFT/latency/decode, RSS/VRAM/page faults/PCIe, errors, and variance.
+    validations:
+      required: true
+  - type: textarea
+    id: archive
+    attributes:
+      label: Evidence archive
+      description: Link or attach the validated source-only archive and SHA256.
+    validations:
+      required: true

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/wimi321/qwen38-next-5090-lab/security/advisories/new
+    about: Report vulnerabilities privately; do not open a public issue.
+  - name: Alpha model status
+    url: https://github.com/wimi321/qwen38-next-5090-lab/blob/main/docs/models.md
+    about: Check the supported contract and known limitations before filing.
+  - name: FreeToken upstream
+    url: https://github.com/FlashML-org/FreeToken/issues
+    about: Report issues that reproduce on unmodified upstream FreeToken there.

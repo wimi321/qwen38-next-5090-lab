@@ -1,0 +1,26 @@
+{
+  "captured_at": "1970-01-01T00:00:00Z",
+  "hardware": {
+    "gpu_memory_mib": 32768,
+    "gpu_name": "SYNTHETIC RTX 5090",
+    "gpu_index": 0,
+    "compute_capability": "synthetic",
+    "wsl_memory_gib": 112,
+    "wsl_processors": 32
+  },
+  "schema_version": "1.0",
+  "software": {
+    "cuda_toolkit": "synthetic",
+    "cuda_runtime_probe": false,
+    "kernel": "synthetic",
+    "nvidia_driver": "synthetic",
+    "os": "synthetic",
+    "os_id": "synthetic",
+    "os_version_id": "synthetic",
+    "python": "synthetic",
+    "torch": "synthetic",
+    "torch_cuda": "synthetic",
+    "triton": "synthetic"
+  },
+  "synthetic": true
+}

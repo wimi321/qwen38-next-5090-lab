@@ -228,5 +228,13 @@ benchmarks/cross_framework
 # Local git worktrees
 .worktrees/
 
-# local e2e/bench artifacts (harnesses may run with repo cwd)
-/results/
+# Release evidence is opt-in: keep arbitrary local output ignored while allowing
+# the schema, synthetic example, and explicitly named sanitized 5090 runs.
+/results/*
+!/results/README.md
+!/results/schema/
+!/results/schema/**
+!/results/example-synthetic/
+!/results/example-synthetic/**
+!/results/rtx5090-*/
+!/results/rtx5090-*/**

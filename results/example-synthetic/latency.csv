@@ -1,0 +1,3 @@
+case,iteration,prompt_tokens,completion_tokens,ttft_ms,total_ms
+synthetic,0,0,0,0,0
+

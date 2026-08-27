@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wimi321/qwen38-next-5090-lab/results/schema/environment.schema.json",
+  "title": "Sanitized RTX 5090 environment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "captured_at", "synthetic", "hardware", "software"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "synthetic": {"type": "boolean"},
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gpu_name", "gpu_memory_mib", "gpu_index", "compute_capability", "wsl_memory_gib", "wsl_processors"],
+      "properties": {
+        "gpu_name": {"type": "string"},
+        "gpu_memory_mib": {"type": "integer", "minimum": 0},
+        "gpu_index": {"type": "integer", "minimum": 0},
+        "compute_capability": {"type": "string"},
+        "wsl_memory_gib": {"type": "number", "minimum": 0},
+        "wsl_processors": {"type": "integer", "minimum": 1}
+      }
+    },
+    "software": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "kernel", "os_id", "os_version_id", "nvidia_driver", "cuda_toolkit", "python", "torch", "torch_cuda", "triton", "cuda_runtime_probe"],
+      "properties": {
+        "os": {"type": "string"},
+        "kernel": {"type": "string"},
+        "os_id": {"type": ["string", "null"]},
+        "os_version_id": {"type": ["string", "null"]},
+        "nvidia_driver": {"type": "string"},
+        "cuda_toolkit": {"type": "string"},
+        "python": {"type": "string"},
+        "torch": {"type": ["string", "null"]},
+        "torch_cuda": {"type": ["string", "null"]},
+        "triton": {"type": ["string", "null"]},
+        "cuda_runtime_probe": {"type": "boolean"}
+      }
+    }
+  }
+}

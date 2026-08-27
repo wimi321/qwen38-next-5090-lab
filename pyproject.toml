@@ -7,18 +7,21 @@ requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "freetoken"
+name = "qwen38-next-5090-lab"
 # Single source of truth: python/freetoken/version.py (read via the attr directive below).
 dynamic = ["version"]
-description = "Local MoE-offload LLM inference runtime with OpenAI- and Anthropic-compatible APIs"
+description = "Experimental Qwen3.8-Flash-Next text-tower serving on one RTX 5090, downstream of FreeToken"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
-authors = [{ name = "FlashML Team" }]
+license-files = ["LICENSE", "MODIFICATIONS.md", "THIRD_PARTY_NOTICES.md", "licenses/*"]
+authors = [{ name = "FreeToken authors and Qwen3.8 Next 5090 Lab contributors" }]
+maintainers = [
+    { name = "wimi321", email = "34830250+wimi321@users.noreply.github.com" },
+]
 # No License:: classifier: setuptools>=77 rejects mixing one with the SPDX string above.
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
@@ -62,22 +65,25 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/FlashML-org/FreeToken"
-Repository = "https://github.com/FlashML-org/FreeToken"
-Issues = "https://github.com/FlashML-org/FreeToken/issues"
+Homepage = "https://github.com/wimi321/qwen38-next-5090-lab"
+Repository = "https://github.com/wimi321/qwen38-next-5090-lab"
+Issues = "https://github.com/wimi321/qwen38-next-5090-lab/issues"
+Upstream = "https://github.com/FlashML-org/FreeToken"
+Documentation = "https://github.com/wimi321/qwen38-next-5090-lab#readme"
 
 [project.scripts]
 ft = "freetoken.cli:main"
+q38lab = "q38lab.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=6.0"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
-# `freetoken[accel]` for the full native fast path.
+# `qwen38-next-5090-lab[accel]` for the full native fast path.
 fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
-accel = ["freetoken[fi,sgl]"]
+accel = ["qwen38-next-5090-lab[fi,sgl]"]
 # NOTE: the Marlin W4A16 NVFP4 expert-GEMM path (sm_80-99) borrows vLLM's AOT wheel
 # (vllm>=0.14,<0.15), which pins transformers>=4.56,<5 and so is INCOMPATIBLE with the
 # core transformers>=5.5 requirement. It is therefore not a lockable extra and is left

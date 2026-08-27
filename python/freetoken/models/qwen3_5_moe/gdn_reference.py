@@ -1,3 +1,4 @@
+# Modified by Qwen3.8 Next 5090 Lab contributors in 2026; see MODIFICATIONS.md.
 """Pure-torch Gated DeltaNet reference (text-only, no cache).
 
 Correctness oracle for the kernel-backed GDN op (``gdn.Qwen3_5GatedDeltaNet``).
