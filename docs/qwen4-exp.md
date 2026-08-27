@@ -142,6 +142,11 @@ find . -type f ! -path './.cache/*' -print0 \
 sha256sum -c ../qwen38-flash-next-nvfp4-7b71922.sha256
 ```
 
+The 2026-08-27 validation copy contained 419 non-cache files
+(135,253,622,894 bytes), including 206 safetensors files.  Every Hugging Face
+entry verified against the pinned revision.  The local manifest itself has
+SHA256 `6cc22b628ca575785e5dfdcab3c7056e79a7eac798969a145341ed1530c2a3a8`.
+
 ## RTX 5090 launch
 
 Run from the source environment. These are parser-backed FreeToken flags; the
@@ -161,7 +166,7 @@ ft serve \
   --max-seq-len-override 8192 \
   --max-prefill-length 8192 \
   --num-tokens 8192 \
-  --memory-ratio 0.90 \
+  --memory-ratio 0.89 \
   --cache-type naive \
   --attention-backend qsa_triton \
   --graph 0 \
@@ -169,6 +174,12 @@ ft serve \
   --moe-cache-auto \
   --nvfp4-backend auto
 ```
+
+The `0.89` ratio is the validated RTX 5090 setting for this checkpoint.  A
+ratio of `0.90` reached 31,847 MiB after an 8,176-token prompt and missed the
+strict `<31 GiB` acceptance threshold; `0.89` kept the same request at 31,542
+MiB.  Do not round this value back to the CLI default in the reproducibility
+record.
 
 Do not force the original four-layer estimate. This checkpoint's expert banks
 occupy about 63.46 GiB, while a 112 GiB WSL instance receives a FreeToken pin
@@ -284,23 +295,46 @@ ft ctl --json stats
 
 ## Measurement record
 
-Record three cold starts, then perform three warm-up requests followed by ten
-measured requests for each prompt size. Preserve the server log, the checksum
-manifest and a table containing:
+The following result was measured on 2026-08-27.  The runtime code was
+`a0c07783cdd45b9f4b31b4a938c2bff535f07137`; the later documentation-only
+commit does not change the measured tree.  Each prompt class used three
+warm-ups followed by ten measured SSE requests with greedy sampling and an
+eight-token output cap.
 
 | Field | Record |
 |---|---|
-| Implementation HEAD / upstream base / checkpoint revision | / `9ef3651...` / `7b71922...` |
-| Driver / CUDA toolkit / torch | |
+| Implementation HEAD / upstream base / checkpoint revision | `a0c0778` / `9ef3651` / `7b71922` |
+| Driver / CUDA toolkit / torch / Triton | 591.86 / 13.3 / 2.11.0+cu130 / 3.6.0 |
 | Checkpoint quant recipe / executed expert path | W4A4 / W4A16 compatibility |
-| Cold-start time (3 runs) | |
-| Prompt tokens / output tokens | |
-| TTFT and prefill/decode token/s | |
-| Peak GPU memory | |
-| Peak WSL RSS and major/minor page faults | |
-| PCIe receive/transmit traffic | |
-| Expert-cache geometry | |
-| Test duration / completed requests | |
+| Cold-start time (3 runs) | approximately 66.0 s (log resolution), 107.272 s, 162.509 s |
+| Peak GPU memory | 31,567 MiB (30.827 GiB), sampled once per second |
+| Peak WSL RSS / swap | 71,192,992 kB (67.895 GiB) / 0 kB |
+| Final scheduler page faults | 19,100,768 minor / 1,673 major |
+| PCIe receive/transmit | peak 60,710 / 9,970 MB/s; 300-s sampled sums 4,184,741 / 573,790 MB |
+| Expert/cache geometry | CPU layers 0-7 and 41-47 (15, pageable); MoE cache 6,558 slots; resolver pages 8,273; allocated KV 8,192 tokens |
+| Stability gate | 100/100 on runtime HEAD in 234.858 s; p50/p95/max 2.345/2.363/2.555 s; first/last-ten mean 2.369/2.344 s |
+| Test suite | `python -m pytest -m 'not slow'`: 1,454 passed, 9 skipped, 11 deselected in 95.99 s |
+
+The one-token case below means one user-content token; the rendered chat prompt
+contains 13 tokens.  TTFT is client-observed time to the first non-empty SSE
+content delta.  "Effective prefill" is rendered prompt tokens divided by that
+end-to-end TTFT, so it includes fixed request and CPU-staging overhead and is
+not a pure kernel benchmark.  Decode throughput uses the remaining six output
+tokens after TTFT.
+
+| Rendered prompt / completion tokens | TTFT p50 / p95 | Total p50 / p95 | Effective prefill p50 | Decode p50 |
+|---|---:|---:|---:|---:|
+| 13 / 7 | 2.238 / 2.245 s | 2.653 / 2.673 s | 5.80 tok/s | 14.31 tok/s |
+| 128 / 7 | 2.295 / 2.309 s | 2.712 / 2.725 s | 55.76 tok/s | 14.34 tok/s |
+| 2,048 / 7 | 3.411 / 3.419 s | 3.831 / 3.851 s | 600.29 tok/s | 14.26 tok/s |
+| 8,176 / 7 | 7.225 / 7.238 s | 7.643 / 7.667 s | 1,130.83 tok/s | 14.24 tok/s |
+
+The final 100-request run left `VmHWM` unchanged and moved `VmRSS` by only
+about 0.5 MiB between its pre-run and midpoint/final snapshots.  The system
+had no configured swap.  Streaming and non-streaming returned the same
+deterministic text, `reasoning_effort=high` produced `reasoning_content`, and a
+required tool request produced `get_weather({"city": "Paris"})` with
+`finish_reason=tool_calls`.
 
 Use `ft ctl --json stats` for FreeToken's TTFT, throughput, request count and
 VRAM fields. Cross-check process RSS/page faults through `/proc/<pid>/status`
@@ -326,8 +360,8 @@ Do not mark this model supported until all of the following are true on the
 pinned full checkpoint:
 
 - CPU/reference parity, tiny-model prefill/decode parity, weight-map and cache
-  reuse tests pass, followed by `pytest -m 'not slow'` and the GPU QSA/cache
-  tests.
+  reuse tests pass, followed by `python -m pytest -m 'not slow'` and the GPU
+  QSA/cache tests.
 - Before CUDA graphs are enabled, PLE row staging, request-local token/conv
   state, and QSA all pass fixed-address capture/replay parity on the target
   GPU; the initial `--graph 0` run does not satisfy that later optimization
@@ -350,3 +384,8 @@ pinned full checkpoint:
 Vision/image support belongs to a later branch. Until its processor, media
 transport, vision prefill and cache semantics exist, media requests are outside
 this integration's supported input contract and no media result is valid.
+
+The recorded run satisfies the first text-only hardware milestone, including
+the 8K and stability resource gates.  It remains experimental rather than a
+formal supported-model claim because W4A4 execution, graph-mode parity, MTP and
+multimodal serving are deliberately outside this result.
