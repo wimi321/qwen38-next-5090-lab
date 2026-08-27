@@ -113,9 +113,8 @@ cd "$HOME/src"
 git clone https://github.com/wimi321/qwen38-next-5090-lab.git
 cd qwen38-next-5090-lab
 
-uv venv --python 3.12
+uv sync --locked --extra accel --extra dev
 source .venv/bin/activate
-uv pip install -e '.[accel]'
 ```
 
 Every evidence directory records the checked-out downstream commit. The audited

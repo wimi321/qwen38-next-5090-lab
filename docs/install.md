@@ -14,13 +14,15 @@ is source-only; it is not published under FreeToken's PyPI name.
 ```bash
 git clone https://github.com/wimi321/qwen38-next-5090-lab.git
 cd qwen38-next-5090-lab
-uv venv --python 3.12 && source .venv/bin/activate
-uv pip install -e ".[accel]"
+uv sync --locked --extra accel
+source .venv/bin/activate
 ```
 
 CUDA kernels are JIT-compiled on first use and need a CUDA 13 toolkit with
 `nvcc` on `PATH`. Use a dedicated environment because this downstream retains
 the `freetoken` import namespace and cannot be co-installed with upstream.
+The tracked lock is the verified Linux x86_64/CUDA 13 dependency resolution;
+contributors can add the test extra with `uv sync --locked --extra accel --extra dev`.
 
 ## Verify
 

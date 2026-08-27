@@ -99,7 +99,7 @@ accel = ["qwen38-next-5090-lab[fi,sgl]"]
 # copies of common dependencies, which would otherwise shadow PyPI).
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
-sglang-kernel = { url = "https://github.com/sgl-project/whl/releases/download/v0.4.5/sglang_kernel-0.4.5%2Bcu130-cp310-abi3-manylinux2014_x86_64.whl#sha256=f482a5fdf287d85cfc9434eaa0faff757d6fee31272f1c3e4408bd79aef189b5", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+sglang-kernel = { url = "https://github.com/sgl-project/whl/releases/download/v0.4.5/sglang_kernel-0.4.5%2Bcu130-cp310-abi3-manylinux2014_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

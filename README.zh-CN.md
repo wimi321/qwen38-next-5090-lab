@@ -58,9 +58,8 @@ ext4 文件系统中，不要放到 `/mnt/c` 或 `/mnt/d`。WSL 内安装 CUDA 1
 git clone https://github.com/wimi321/qwen38-next-5090-lab.git
 cd qwen38-next-5090-lab
 
-uv venv --python 3.12
+uv sync --locked --extra accel
 source .venv/bin/activate
-uv pip install -e '.[accel]'
 
 q38lab doctor
 ```

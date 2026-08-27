@@ -128,12 +128,21 @@ def audit(root: Path = ROOT) -> list[str]:
         "url": (
             "https://github.com/sgl-project/whl/releases/download/v0.4.5/"
             "sglang_kernel-0.4.5%2Bcu130-cp310-abi3-manylinux2014_x86_64.whl"
-            "#sha256=f482a5fdf287d85cfc9434eaa0faff757d6fee31272f1c3e4408bd79aef189b5"
         ),
         "marker": "sys_platform == 'linux' and platform_machine == 'x86_64'",
     }
     if sglang_source != expected_sglang_source:
-        errors.append("pyproject must pin the audited SGLang cu130 wheel URL and SHA256")
+        errors.append("pyproject must pin the audited SGLang cu130 wheel URL")
+    lock_path = root / "uv.lock"
+    if not lock_path.is_file():
+        errors.append("the verified Linux x86_64 dependency lock uv.lock must be tracked")
+    else:
+        lock_text = lock_path.read_text(encoding="utf-8")
+        expected_sglang_digest = (
+            "sha256:f482a5fdf287d85cfc9434eaa0faff757d6fee31272f1c3e4408bd79aef189b5"
+        )
+        if expected_sglang_digest not in lock_text:
+            errors.append("uv.lock must retain the audited SGLang cu130 wheel SHA256")
 
     workflows = root / ".github" / "workflows"
     for path in workflows.glob("*.yml"):

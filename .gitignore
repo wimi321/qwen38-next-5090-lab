@@ -97,9 +97,8 @@ ipython_config.py
 # Pipfile.lock
 
 # UV
-#   Not tracked: a lock pinned to one CUDA/torch build goes stale faster than it helps,
-#   and the pyproject ranges are the contract.
-uv.lock
+#   This downstream deliberately tracks uv.lock for the verified Linux x86_64/CUDA 13
+#   profile.  Update it only together with dependency provenance and hardware evidence.
 
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
