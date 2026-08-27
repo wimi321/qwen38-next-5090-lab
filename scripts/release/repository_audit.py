@@ -121,6 +121,19 @@ def audit(root: Path = ROOT) -> list[str]:
         errors.append("pyproject Repository URL must point at wimi321/qwen38-next-5090-lab")
     if urls.get("Upstream") != "https://github.com/FlashML-org/FreeToken":
         errors.append("pyproject must retain the FreeToken upstream URL")
+    sglang_source = (
+        pyproject.get("tool", {}).get("uv", {}).get("sources", {}).get("sglang-kernel")
+    )
+    expected_sglang_source = {
+        "url": (
+            "https://github.com/sgl-project/whl/releases/download/v0.4.5/"
+            "sglang_kernel-0.4.5%2Bcu130-cp310-abi3-manylinux2014_x86_64.whl"
+            "#sha256=f482a5fdf287d85cfc9434eaa0faff757d6fee31272f1c3e4408bd79aef189b5"
+        ),
+        "marker": "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    }
+    if sglang_source != expected_sglang_source:
+        errors.append("pyproject must pin the audited SGLang cu130 wheel URL and SHA256")
 
     workflows = root / ".github" / "workflows"
     for path in workflows.glob("*.yml"):

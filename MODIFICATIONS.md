@@ -78,6 +78,9 @@ the corresponding high-level description. The Apache-2.0 license remains in
   downstream distribution surface.
 - Replaced upstream-facing branding, setup, contribution, security, and model
   documentation with downstream-specific material while preserving attribution.
+- Replaced the ambiguous SGLang cu130 simple-index source (which advertised two
+  hashes for one wheel URL) with the official v0.4.5 x86_64 GitHub release asset
+  pinned to its GitHub-reported SHA-256 digest.
 
 ## Validation boundary
 

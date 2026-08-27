@@ -56,6 +56,11 @@ appear in `pyproject.toml`. Release preparation generates an SBOM from the
 resolved environment; consult that release artifact for the exact dependency
 versions and license metadata used in a particular build.
 
+For the supported Linux x86_64 profile, uv resolves `sglang-kernel` from the
+official SGLang wheel repository's v0.4.5 GitHub release asset and verifies the
+SHA-256 digest published by GitHub. This pin is a supply-chain integrity record,
+not a redistribution of the wheel.
+
 ## Model artifacts are separate
 
 No Qwen or RadixArk weights are included in this repository. Their terms are

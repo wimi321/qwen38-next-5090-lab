@@ -32,6 +32,8 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The alpha profile fixes TP=1, max-running=1, 8K, naive cache, graph disabled,
   memory ratio 0.89, MoE offload, and automatic expert-cache/pageable-layer
   sizing.
+- uv installs on Linux x86_64 use the official SGLang v0.4.5 cu130 release
+  wheel pinned by SHA-256, avoiding an ambiguous duplicate-hash index entry.
 
 ### Known limitations
 
