@@ -340,7 +340,12 @@ class Scheduler(SchedulerIOMixin):
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                # Under overlap scheduling, the just-launched next forward has already
+                # advanced ``device_len`` before this prior result drains.  Reading
+                # ``req.can_decode`` here therefore terminates one token early.  The host
+                # input view advances only as results drain, so it is the authoritative
+                # count for the token being published now.
+                hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 )

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from freetoken.core import SamplingParams
+from freetoken.core import Batch, Req, SamplingParams
 from freetoken.message import (
     AbortBackendMsg,
     BatchTokenizerMsg,
@@ -85,6 +85,67 @@ def test_prompt_admitted_signal_uses_existing_frontend_usage_channel():
     assert reply.cached_tokens == 100
     assert reply.completion_tokens_delta == 0
     assert reply.finished is False
+
+
+def test_overlap_length_gate_uses_drained_host_tokens_not_ahead_device_len():
+    """The next overlapped forward must not make the prior token look terminal."""
+
+    req = Req(
+        input_ids=torch.tensor([10, 11], dtype=torch.int32),
+        table_idx=1,
+        cached_len=0,
+        output_len=3,
+        uid=7,
+        sampling_params=SamplingParams(max_tokens=3, ignore_eos=True),
+        cache_handle=SimpleNamespace(),
+    )
+    # Forward 1 sampled token 101; forward 2 launched before it drained.
+    req.complete_one()
+    req.complete_one()
+    req.append_host(torch.tensor([101], dtype=torch.int32))
+    # Forward 3 (the final budgeted forward) is now also launched.  ``can_decode``
+    # is already false even though only one of three sampled tokens reached host.
+    req.complete_one()
+    assert req.can_decode is False
+    assert req.input_ids.numel() == req.max_device_len - 2
+
+    removed = []
+    freed = []
+    sent = []
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.cache_manager = SimpleNamespace(
+        lazy_free_region=contextlib.nullcontext,
+        cache_req=lambda *_args, **_kwargs: None,
+    )
+    scheduler.decode_manager = SimpleNamespace(running_reqs={req}, remove_req=removed.append)
+    scheduler.prefill_manager = SimpleNamespace(pending_list=[])
+    scheduler.finished_reqs = set()
+    scheduler.toolcall_anchor_id = None
+    scheduler.eos_token_ids = set()
+    scheduler._free_req_resources = freed.append
+    scheduler._kv_usage_pages = lambda: (0, 1)
+    scheduler._mamba_slot_usage = lambda: None
+    scheduler._swa_token_usage = lambda: None
+    scheduler._gpu_mem_bytes = lambda: 0
+    scheduler.status_reporter = SimpleNamespace(report_batch=lambda *_args, **_kwargs: None)
+    scheduler.config = SimpleNamespace(page_size=1)
+    scheduler.send_result = sent.extend
+
+    copy_done = SimpleNamespace(synchronize=lambda: None)
+
+    def drain(token: int) -> None:
+        batch = Batch(reqs=[req], phase="decode")
+        last_data = (SimpleNamespace(batch=batch), (None, torch.tensor([token]), copy_done))
+        Scheduler._process_last_data(scheduler, last_data)
+
+    drain(102)
+    assert len(sent) == 1 and sent[0].finished is False
+    assert removed == [] and freed == [] and scheduler.finished_reqs == set()
+
+    drain(103)
+    assert len(sent) == 2 and sent[1].finished is True
+    assert sent[1].finish_reason == "length"
+    assert removed == [req] and freed == [req] and scheduler.finished_reqs == {req}
 
 
 def test_schedule_reports_admission_only_after_prepare_succeeds():
