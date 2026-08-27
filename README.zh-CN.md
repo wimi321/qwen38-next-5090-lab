@@ -141,14 +141,15 @@ checkpoint，运行非 slow 测试，验证 prompt/API 门槛与 100 个顺序�
 不能脱离相邻的 environment 和 resolved-config 记录单独比较数字。TTFT 从客户端
 观测；“effective prefill”包含固定请求开销与 CPU staging，不是纯 kernel benchmark。
 
-首个硬件记录包括：非 slow 测试 1,454 passed / 9 skipped / 11 deselected；
-8,176-token prompt 峰值显存 31,542 MiB；WSL 峰值 RSS 67.895 GiB；100/100
-顺序请求成功，延迟 p50/p95 为 2.345/2.363 秒。8,176-token 请求的客户端 TTFT
-p50 为 7.225 秒，effective prefill p50 为 1,130.83 tok/s。权威表格由英文
-[README](README.md) 的 evidence 生成器维护。
+本次硬件记录包括：非 slow 测试 1,530 passed / 9 skipped / 11 deselected；
+峰值显存 31,668 MiB（30.926 GiB）；WSL 峰值 RSS 72.312 GiB；100/100
+顺序请求及 121/121 次独立 soak 请求成功，连续运行 30.0 分钟且未检测到单调
+内存泄漏。8,176-token 请求的客户端 TTFT p50 为 7.283 秒，effective prefill
+p50 为 1,122.6 tok/s；另行测得 256-token 稳态 decode 为 14.014 tok/s。
+权威表格由英文 [README](README.md) 的 evidence 生成器维护。
 
-验证时 WSL 的 `swap=0`。Windows 宿主已有 128 GiB pagefile，且系统级汇总用量
-非零，因此本项目**不声称宿主没有发生分页**。早期 7-token completion 也不会被
+验证时 WSL 的 `swap=0`。Windows 宿主已有 pagefile，因此本项目**不声称宿主没有
+发生分页**。早期 7-token completion 也不会被
 当作稳态 decode benchmark；release gate 会另测 256–512 token decode。
 
 引用数字前请阅读[完整步骤与限制](docs/qwen4-exp.md)。

@@ -156,19 +156,26 @@ records. TTFT is client-observed, and “effective prefill” includes fixed req
 and CPU-staging overhead rather than measuring a kernel in isolation.
 
 <!-- BEGIN GENERATED BENCHMARK SUMMARY -->
-| Gate | Recorded alpha result |
+| Verified field | Result |
 |---|---:|
-| Non-slow tests | 1,454 passed, 9 skipped, 11 deselected |
-| 8,176-token prompt peak VRAM | 31,542 MiB (30.803 GiB) |
-| Peak WSL RSS | 67.895 GiB |
-| Sequential stability | 100/100 requests; p50 2.345 s; p95 2.363 s |
-| 8,176-token client TTFT p50 | 7.225 s |
-| 8,176-token effective prefill p50 | 1,130.83 tok/s |
+| Runtime commit | `643bcd6a82eb` |
+| Checkpoint revision | `7b719225242a` |
+| GPU | NVIDIA GeForce RTX 5090 |
+| Executed expert path | W4A16 compatibility |
+| Peak VRAM | 30.926 GiB |
+| Peak WSL RSS | 72.312 GiB |
+| WSL swap | 0 MiB |
+| 8176 rendered-token TTFT (p50 / p95) | 7283.0 / 7355.5 ms |
+| 8176 effective prefill (p50) | 1122.6 tok/s |
+| 256-token steady decode | 14.0 tok/s |
+| Sequential requests | 100/100 |
+| Continuous run | 30.0 min |
+| Tests | 1530 passed, 0 failed |
 <!-- END GENERATED BENCHMARK SUMMARY -->
 
-The validated WSL instance had `swap=0`. The Windows host already had a 128 GiB
-pagefile with aggregate system use, so this project does **not** claim that host
-paging was absent. Short seven-token completions are not presented as a
+The validated WSL instance had `swap=0`. The Windows host already had a
+pagefile, so this project does **not** claim that host paging was absent. Short
+seven-token completions are not presented as a
 steady-state decode benchmark; the release gate uses a separate 256–512-token
 decode measurement.
 
