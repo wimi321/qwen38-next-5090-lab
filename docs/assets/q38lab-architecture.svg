@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
-  <title id="title">Qwen3.8 Next 5090 Lab v0.2 candidate architecture</title>
-  <desc id="desc">An unreleased and not yet hardware-validated 256K image candidate. Structured text and image requests enter the tokenizer and Qwen vision tower. Visual embeddings are injected before four residual streams pass through 36 gated delta network layers and 12 query-selective attention layers. QSA keeps one index key per four tokens and uses a bounded SM120 top-512 selector. Sparse PLE rows stream from NVMe through native io_uring and O_DIRECT into a bounded host LRU, double-buffered pinned FP8 staging, and GPU BF16 decode. Routed NVFP4 experts use heterogeneous CPU, host memory, PCIe, and GPU cache paths; candidate prefill preserves raw expert IDs, moves active rows for large banks, and copies small banks whole.</desc>
+  <title id="title">Qwen3.8 Next 5090 Lab v0.2 alpha architecture</title>
+  <desc id="desc">The hardware-validated v0.2 alpha path for 262,144 total tokens and image input on one RTX 5090 under WSL2. Structured text and image requests enter the tokenizer and Qwen vision tower. Visual embeddings are injected before four residual streams pass through 36 gated delta network layers and 12 query-selective attention layers. QSA keeps one index key per four tokens and uses a bounded SM120 top-512 selector. Sparse PLE rows stream from NVMe through native io_uring and O_DIRECT into a bounded host LRU, double-buffered pinned FP8 staging, and GPU BF16 decode. Routed NVFP4 experts use heterogeneous CPU, host memory, PCIe, and GPU cache paths; v0.2 prefill preserves raw expert IDs, moves active rows for large banks, and copies small banks whole.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1020"/>
@@ -33,7 +33,7 @@
 
   <rect width="1200" height="760" rx="24" fill="url(#bg)"/>
   <text class="title" x="48" y="52">Qwen3.8 Next 5090 Lab</text>
-  <text class="subtitle" x="48" y="78">v0.2 source candidate · NOT hardware validated · 262,144 total tokens · images · TP=1 · max-running=1 · graph=0</text>
+  <text class="subtitle" x="48" y="78">v0.2 hardware-validated alpha · 262,144 total tokens · images · RTX 5090 / WSL2 · TP=1 · max-running=1 · graph=0</text>
 
   <rect class="box" x="48" y="118" width="220" height="105" fill="#172554"/>
   <text class="label" x="70" y="151">Local client</text>
@@ -46,7 +46,7 @@
   <text class="small" x="344" y="202">processor · mRoPE · 512-token chunks</text>
 
   <rect class="box" x="626" y="102" width="526" height="137" fill="url(#gpu)"/>
-  <text class="label" x="650" y="135">Qwen4-Exp candidate on RTX 5090</text>
+  <text class="label" x="650" y="135">Qwen4-Exp v0.2 alpha on RTX 5090</text>
   <rect x="650" y="154" width="155" height="50" rx="10" fill="#312e81" stroke="#c4b5fd"/>
   <text class="body" x="669" y="177">Text embedding</text>
   <text class="small" x="669" y="195">image placeholders</text>

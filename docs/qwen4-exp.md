@@ -16,17 +16,19 @@ deliberately narrow contract:
 - an 8,192-token total context budget and the naive cache;
 - MTP, vision, video, audio and radix prefix reuse disabled.
 
-The development branch also contains an unreleased `0.2.0a1` candidate. Its
-intended profile combines a 262,144-token total budget with image input, but it is **not
-supported or release-ready until every v0.2 item in [Acceptance](#acceptance)
-has a reviewed result**. Total tokens include rendered text, expanded image
-tokens, and output; the exact boundary gate is 261,120 input plus 1,024 output,
-once for text and once with a real image.
+The `0.2.0a1` / `v0.2.0-alpha.1` milestone now has reviewed RTX 5090/WSL2
+hardware evidence for a deliberately narrow image-capable alpha. Its profile
+combines a 262,144-token total budget with image input. Total tokens include
+rendered text, expanded image tokens, and output; the validated boundary is
+261,120 input plus 1,024 output, once for text and once with a real image. The
+formal record is
+[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
 
 Both profiles disable CUDA graphs and radix prefix reuse. The complete PLE
-auxiliary table must never be materialized on the GPU. The candidate adds
-native direct-I/O streaming and compressed QSA state, but neither source code
-nor unit tests substitute for the target-GPU full-checkpoint evidence.
+auxiliary table must never be materialized on the GPU. The v0.2 alpha adds
+native direct-I/O streaming and compressed QSA state; its support statement is
+bounded by the reviewed target-GPU full-checkpoint evidence rather than source
+code or unit tests alone.
 
 The pinned checkpoint declares a ModelOpt **W4A4** recipe for routed experts.
 FreeToken's existing NVFP4 expert backends preserve its packed E2M1 weights,
@@ -38,15 +40,14 @@ is not checkpoint-numerically equivalent and does not inherit the checkpoint's
 published W4A4 quality claims. Formal support requires a W4A4 execution path
 and reference/GPU parity.
 
-## v0.2 candidate architecture
+## v0.2 validated alpha architecture
 
-The unverified `rtx5090-wsl2-256k-image` candidate profile configures TP=1, one
-running request, naive cache, graph disabled, a 262,144-token total target, and
-512-token prefill chunks. It is specific to one 32 GB RTX 5090 under WSL2 and
-fails closed if the fixed cache geometry plus minimum expert residency cannot
-fit the resolved
-0.89 planning budget. The later hardware evidence independently enforces the
-strict measured peak below 31 GiB.
+The hardware-validated `rtx5090-wsl2-256k-image` alpha profile configures TP=1,
+one running request, naive cache, graph disabled, a 262,144-token total limit,
+and 512-token prefill chunks. It is specific to one 32 GB RTX 5090 under WSL2
+and fails closed if the fixed cache geometry plus minimum expert residency
+cannot fit the resolved 0.89 planning budget. The formal evidence independently
+enforces the strict measured peak below 31 GiB.
 
 ### Compressed QSA and SM120 selection
 
@@ -71,10 +72,10 @@ not alternate release configurations.
 
 ### Native PLE streaming
 
-The candidate rejects startup unless the checkpoint resides on Linux/WSL ext4
-and a read-only probe proves native `io_uring` plus `O_DIRECT`. The backend uses
-4 KiB-aligned reads, queue depth 512, at most 4,096 pages per batch, and one
-globally bounded 4 GiB C++ LRU shared across the physical shards. The next
+The validated alpha rejects startup unless the checkpoint resides on Linux/WSL
+ext4 and a read-only probe proves native `io_uring` plus `O_DIRECT`. The backend
+uses 4 KiB-aligned reads, queue depth 512, at most 4,096 pages per batch, and
+one globally bounded 4 GiB C++ LRU shared across the physical shards. The next
 prefill chunk is prefetched while later GPU layers process the current chunk.
 
 Only hashed rows are read. Double-buffered pinned FP8 staging is copied to the
@@ -86,7 +87,7 @@ wait time, page faults, staged bytes, and GPU-decoded rows.
 
 ### Route-aware native-NVFP4 MoE prefill
 
-The candidate profile sets `FREETOKEN_MOE_PREFILL_SPARSE=1`. Startup accepts
+The alpha profile sets `FREETOKEN_MOE_PREFILL_SPARSE=1`. Startup accepts
 that setting only with the double-buffered MoE prefill cache and native
 `nvfp4` banks; a missing overlap buffer or a Marlin/b12x/other bank layout is a
 hard error. The verified v0.1 profile does not enable this path.
@@ -98,7 +99,7 @@ derives sorted, coalesced runs of active raw expert IDs. Those raw IDs remain
 the row positions in the existing `[E]` GPU double buffer, and the grouped
 NVFP4 kernel still receives the original IDs and `num_experts=512`. Inactive
 rows may retain stale bytes, but the current routing cannot address them. The
-full double-buffer reservation is unchanged, so this path reduces candidate
+full double-buffer reservation is unchanged, so this path reduces expert-bank
 movement only; it does not reduce the MoE cache's GPU-memory budget.
 
 For a bank whose per-expert row is at least 256 KiB, only the coalesced active
@@ -116,8 +117,8 @@ therefore does not eagerly prefetch the next full expert layer and does not use
 the separate prefill hit-D2D optimization. It also introduces one bounded
 device-to-host synchronization per MoE layer. These are explicit scheduling
 tradeoffs: unit parity and reduced planned bytes do not establish a speedup.
-Only the pending full-checkpoint evidence may determine whether the path meets
-the v0.2 latency gate.
+The reviewed full-checkpoint evidence, rather than those implementation facts,
+is the authority for the v0.2 latency gate.
 
 The terminal runtime snapshot exports `q38lab.moe_prefill` with:
 
@@ -136,7 +137,7 @@ substitutes for profiler or driver PCIe measurements.
 ### Image-only multimodal path
 
 Transformers `5.16.1` is pinned for `AutoProcessor`/`Qwen3VLProcessor`. The
-unverified candidate implementation maps the Qwen4-Exp 27-layer vision tower,
+validated alpha implementation maps the Qwen4-Exp 27-layer vision tower,
 patch projection, position interpolation, merger, and its BF16 weights. It
 expands image placeholders,
 validates `image_grid_thw`, and builds three-axis interleaved mRoPE plus rope
@@ -329,9 +330,9 @@ inline-dequant backend (the FlashInfer b12x crossover defaults to 1024).
 not turn the run into W4A4. Preserve the startup compatibility warning in the
 test record.
 
-### Candidate 256K/image launch
+### Validated 256K/image alpha launch
 
-Run the extended doctor before attempting the candidate profile:
+Run the extended doctor before starting the alpha profile:
 
 ```bash
 q38lab doctor --profile rtx5090-wsl2-256k-image --json
@@ -340,7 +341,7 @@ q38lab serve --profile rtx5090-wsl2-256k-image
 
 The resolved profile must show all of these values without local overrides:
 
-| Field | Required candidate value |
+| Field | Required alpha value |
 |---|---:|
 | `max-seq-len` / `num-tokens` | 262,144 |
 | `max-prefill-length` | 512 |
@@ -441,7 +442,7 @@ curl -fsS http://127.0.0.1:1919/v1/chat/completions \
   }'
 ```
 
-For the unreleased image candidate, the OpenAI request keeps image and text
+For the v0.2 image alpha, the OpenAI request keeps image and text
 parts structured:
 
 ```bash
@@ -462,14 +463,14 @@ curl -fsS http://127.0.0.1:1919/v1/chat/completions \
   }"
 ```
 
-The unverified candidate API path also handles `data:image/...;base64,...` in
-unit tests; this is not yet a supported input contract. It permits no more than
-four images, 20 MiB per image and 40 MiB total, and applies one ten-second
-request deadline. It rejects local files, HTTP, credentials in URLs, loopback,
-private/link-local/reserved peers, any hostname with a non-public DNS answer,
-rebinding between validation and connect, unsafe redirect hops, invalid MIME
-types, audio, and video. TLS certificate verification and SNI use the original
-hostname while the TCP connection is pinned to an already audited public IP.
+The validated alpha API accepts HTTPS and `data:image/...;base64,...` image
+inputs. It permits no more than four images, 20 MiB per image and 40 MiB total,
+and applies one ten-second request deadline. It rejects local files, HTTP,
+credentials in URLs, loopback, private/link-local/reserved peers, any hostname
+with a non-public DNS answer, rebinding between validation and connect, unsafe
+redirect hops, invalid MIME types, audio, and video. TLS certificate
+verification and SNI use the original hostname while the TCP connection is
+pinned to an already audited public IP.
 
 The DoH fallback does not weaken those rules. It is considered only when all
 system DNS answers are non-global (the transparent fake-IP case), never for a
@@ -485,11 +486,11 @@ and rejection cases with:
 q38lab smoke --images --https-image-url "$HTTPS_IMAGE_URL"
 ```
 
-This is a candidate test surface, not v0.2 release evidence. The authoritative
-harness owns its image fixtures and must also combine a real image with the
-261,120-input-token boundary. An over-limit request returns OpenAI-style
-`context_length_exceeded` detail with separate rendered-text, expanded-image,
-requested-output, and 262,144-total counts.
+This command is a convenience smoke surface, not a substitute for the formal
+v0.2 evidence. The authoritative harness owns its image fixtures and combines
+a real image with the 261,120-input-token boundary. An over-limit request
+returns OpenAI-style `context_length_exceeded` detail with separate
+rendered-text, expanded-image, requested-output, and 262,144-total counts.
 
 For the 1, 128, 2K and 8K boundary cases, count the fully rendered chat prompt
 with the checkpoint tokenizer. Prompt tokens plus requested output tokens must
@@ -518,19 +519,20 @@ q38lab bench --profile rtx5090-wsl2 \
   --out results/rtx5090-YYYY-MM-DD
 ```
 
-After starting the candidate profile, its fail-closed harness is invoked with
+After starting the alpha profile, its fail-closed harness is invoked with
 maintainer-owned deterministic image fixtures:
 
 ```bash
 q38lab bench --profile rtx5090-wsl2-256k-image \
   --image-file "$HOME/q38lab-fixtures/chart.png" \
   --https-image-url "https://example.org/q38lab-chart.png" \
-  --decode-tokens 1024 \
+  --decode-tokens 256 \
   --out results/rtx5090-256k-image-YYYY-MM-DD
 ```
 
 For the v0.2 profile, both image arguments are mandatory, the HTTPS URL must be
 public and stable for the run, and `--decode-tokens` may be 256 through 1,024.
+The reviewed run used 256 tokens for this steady-decode contract.
 The harness reads the exact clean-checkout launch attestation, independently
 tokenizes all boundaries, and fails rather than creating release-compatible
 evidence when a gate or telemetry cross-check is missing. Its
@@ -538,26 +540,37 @@ evidence when a gate or telemetry cross-check is missing. Its
 system `getaddrinfo` hard cancellation is unavailable; these audit fields do
 not count as a passed image or release gate.
 
-Do not hand-maintain benchmark numbers in this document. The authoritative
-record is the newest reviewed `results/rtx5090-<date>/summary.json`; the English
-README table is generated from that file and CI rejects a stale table. Every
-tracked evidence directory contains exactly the environment, resolved config,
-summary, request log, latency CSV, resource CSV, pytest log, and exhaustive
-`SHA256SUMS` files.
+Do not hand-maintain benchmark numbers in this document. The authoritative v0.2
+record is
+[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/);
+the English README table is generated from its `summary.json`, and CI rejects a
+stale table. That evidence directory contains exactly 10 tracked UTF-8 files:
+`environment.json`, `resolved-config.json`, `summary.json`, `requests.jsonl`,
+`latency.csv`, `resource-samples.csv`, `pytest.txt`,
+`runtime-telemetry.json`, `ple-checkpoint-probe.json`, and exhaustive
+`SHA256SUMS`. The v0.1 record retains its original evidence format.
 
 The release harness re-hashes the complete checkpoint, runs the non-slow test
-suite, verifies the four rendered prompt boundaries and API semantics, executes
-an exact 256--512-token steady decode, completes 100 sequential requests, and
-then runs a separate 30-minute soak. Short seven-token prompt completions are
-never used to infer sustained decode throughput. TTFT is client-observed, and
-"effective prefill" includes request and CPU-staging overhead rather than being
-a pure kernel measurement.
+suite, verifies the four rendered prompt boundaries and API semantics, completes
+100 sequential requests, and then runs a separate 30-minute soak. The v0.1
+steady-decode contract is 256--512 tokens; the v0.2 contract is 256--1,024
+tokens, and the reviewed v0.2 run used 256. Short seven-token prompt
+completions are never used to infer sustained decode throughput. TTFT is
+client-observed, and "effective prefill" includes request and CPU-staging
+overhead rather than being a pure kernel measurement.
+
+README resource values are the formal API acceptance-window maxima, covering
+the first recorded API gate through the final soak request. The retained raw
+`resource-samples.csv` begins earlier and therefore also contains
+pre-acceptance preflight and pytest samples; those rows remain auditable but do
+not contribute to the README maxima.
 
 WSL must have no configured swap. A pre-existing Windows pagefile is recorded
 but never modified, and zero host paging is not claimed. Portable
 `nvidia-smi` sampling does not expose reliable PCIe RX/TX counters, so the
-evidence marks them unavailable rather than inventing a value. Evidence remains
-non-releasable while `source.release_compatible` is false.
+evidence marks them unavailable rather than inventing a value. The reviewed
+v0.2 record has `source.release_compatible=true` and passes the strict raw-data,
+checksum, runtime-commit, and release-input validation.
 
 The v0.2 record additionally requires 8K regression, 32K, 128K, and 261,120
 rendered-input cases; exact 1,024-token completion at the text and real-image
@@ -575,7 +588,7 @@ NVIDIA profiler or `nvidia-smi dmon`. Sample throughout the run rather than
 only before and after it. For example, this records framebuffer memory and
 PCIe receive/transmit throughput once per second:
 
-For the candidate profile, `ft ctl --json stats` exposes the last terminal
+For the alpha profile, `ft ctl --json stats` exposes the last terminal
 `q38lab.moe_prefill` snapshot. Check `0 <= active_rows <= possible_rows`,
 `0 <= bytes_copied <= full_bytes`, and independently recompute both fractions.
 The snapshot describes route-aware prefill movement, not decode-cache hit/miss
@@ -601,55 +614,41 @@ pagefile existed or was touched is not: the pre-existing Windows pagefile had
 non-zero aggregate system usage. Keep that caveat with every quoted v0.1
 result.
 
-### Required before v0.2 release
+### Recorded v0.2 alpha boundary
 
-Do not update the support matrix, tag `v0.2.0-alpha.1`, or publish a v0.2
-prerelease until all of the following are true on the pinned full checkpoint:
+The reviewed run in
+[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/)
+passes the formal acceptance gates for the pinned full checkpoint and this
+narrow profile:
 
-- CPU oracles cover compressed QSA cache, four-token tails, top-512 at 65,536
-  compressed blocks, chunk continuity, PLE hash/direct-read/LRU/prefetch/GPU
-  decode, vision tower and merger, placeholder expansion, mRoPE, chunk scatter,
-  request cleanup, and media security. Triton/CUDA and vision results match
-  their PyTorch/Transformers references within dtype-appropriate tolerances.
-- `python -m pytest -m 'not slow'`, the native direct-I/O tests, and target-GPU
-  QSA/cache tests have zero failures and do not regress below the reviewed v0.1
-  non-slow count. The native PLE probe samples the first and last row of all
-  128 pinned shards plus eight deterministic bigram/trigram hash hits, and each
-  GPU-decoded result exactly matches an independent safetensors slice. Loader
-  mappings include the visual tensors while still excluding MTP.
-- The 8K regression plus 32K, 128K and 261,120 rendered-input prompts pass. A
-  text request and a request containing a real image each produce exactly
-  1,024 output tokens, proving the total `261,120 + 1,024 = 262,144` boundary.
-  A one-token excess returns `context_length_exceeded` with correct component
-  counts rather than truncating silently.
-- Needle-in-a-Haystack passes at documented depths, and deterministic OCR,
-  object, and chart fixtures return their expected answers. Streaming and
-  non-streaming agree; thinking modes, tools, images, and tools plus images all
-  complete normally.
-- HTTPS/data URL, four-image and streaming-image smoke cases pass. Local/HTTP,
-  loopback/private/link-local/reserved endpoints, DNS rebinding, unsafe
-  redirects, over-size payloads, timeouts, bad MIME, audio, and video all fail
-  with the expected client-classifiable errors.
-- Client-observed TTFT for 261K is at most 15 minutes. An exact 256--1,024-token
-  steady completion reaches at least 5 tok/s and ends for `length`, not EOS or
-  an error.
-- Peak VRAM is below 31 GiB, WSL RSS below 105 GiB, and WSL swap remains zero.
-  The Windows pagefile is recorded and no claim of completely absent host
-  paging is made.
-- All 100 mixed short text/image sequential requests succeed, followed by at
-  least 30 minutes of continuing alternating text/image requests with no crash,
-  OOM, stale media state, or monotonic resource growth.
-- At least one cold and three warm PLE measurements record real storage I/O,
-  LRU hits/misses, wait time and page faults. Evidence also records selector
-  workspace peak, image tokens, vision latency, prefill chunk count/timing,
-  route-aware MoE active/possible rows and copied/full bytes, RSS, VRAM, and
-  PCIe availability, with JSON-to-raw-log cross-checks. Whole-layer small-bank
-  copies must remain represented in the byte counters.
-- The English README benchmark table is regenerated from the reviewed
-  `summary.json`; the evidence archive, SBOM and checksums are regenerated from
-  the same clean commit. No wheel, container, or model weight is released.
+- the non-slow suite, CPU oracles, native direct-I/O checks, target-GPU QSA/cache
+  checks, visual loader mapping, and independent PLE shard/hash-row probes pass;
+- 8K regression, 32K, 128K, and 261,120 rendered-input cases pass, including
+  Needle-in-a-Haystack at every required depth;
+- both text and real-image requests complete the exact
+  `261,120 + 1,024 = 262,144` boundary, while a one-token excess is rejected as
+  `context_length_exceeded` rather than silently truncated;
+- deterministic OCR, object, and chart fixtures pass, as do streaming parity,
+  thinking, tool calling, data URL, public HTTPS, four-image, and streaming-image
+  cases;
+- the formal hardware rejection cases for HTTP image URLs, loopback, local
+  files, and audio pass, while the broader media-security behavior remains
+  covered by the zero-failure test gate;
+- client-observed 261K TTFT satisfies the 15-minute ceiling, and the exact
+  256-token steady decode used by this run satisfies the 256--1,024-token
+  contract, the 5 tok/s floor, and `finish_reason=length`;
+- all 100 mixed short text/image sequential requests pass, followed by the
+  required alternating 30-minute soak without OOM, crash, stale media state, or
+  detected monotonic WSL RSS growth;
+- peak VRAM, WSL RSS, and zero-WSL-swap gates pass, with the pre-existing Windows
+  pagefile caveat retained; and
+- cold/warm PLE, selector, vision, chunk, route-aware MoE movement, page-fault,
+  and resource telemetry cross-check against the raw files, whose exhaustive
+  checksums also validate.
 
-CUDA Graph, radix cache, video, audio, MTP, TP>1, concurrent requests, native
-W4A4 parity, and contexts beyond 262,144 remain outside this candidate. Graph
-mode may only be considered after separate fixed-address QSA/PLE capture and
-replay parity on the target stack.
+This alpha supports only one RTX 5090 under Ubuntu 24.04 WSL2, TP=1, one running
+request, naive cache, CUDA graphs disabled, W4A16 compatibility, and at most
+262,144 total tokens. Audio, video, MTP, radix prefix cache, TP>1, concurrent
+requests, contexts beyond 262,144, and native W4A4/reference parity remain
+unsupported. Graph mode may only be considered after separate fixed-address
+QSA/PLE capture and replay parity on the target stack.

@@ -1,8 +1,8 @@
 # Security policy
 
 Qwen3.8 Next 5090 Lab is an experimental local inference runtime, not a
-hardened multi-tenant service. The `v0.1.0-alpha.1` release supports the alpha
-branch only; older pre-release snapshots may not receive security fixes.
+hardened multi-tenant service. Security fixes target the current alpha release;
+older pre-release snapshots may not receive them.
 
 ## Reporting a vulnerability
 
@@ -58,11 +58,13 @@ an audit log and may be incomplete or inaccurate.
 
 ## Resource exhaustion
 
-The alpha profile is intentionally restricted to one running request and 8,192
-total tokens. Raising concurrency, sequence length, output limits, cache size,
-or memory ratio can exhaust GPU memory, host RAM, pinned-memory limits, disk
-space, or PCIe bandwidth. The profile is a tested operating envelope, not a
-sandbox against malicious clients.
+Both hardware-validated profiles are restricted to TP=1 and one running
+request. `rtx5090-wsl2` is limited to 8,192 total tokens;
+`rtx5090-wsl2-256k-image` is limited to 262,144 total tokens and requires its
+native direct-I/O checks. Raising concurrency, sequence length, output limits,
+cache size, or memory ratio can exhaust GPU memory, host RAM, pinned-memory
+limits, disk space, or PCIe bandwidth. These profiles are tested operating
+envelopes, not sandboxes against malicious clients.
 
 The downloader may consume approximately 135 GB plus Hugging Face cache and
 temporary space. Verify the destination before downloading. It must never write
@@ -70,10 +72,19 @@ weights into the source tree or accept an unpinned fallback.
 
 ## Media and remote fetches
 
-This release is text-only and rejects image, video, and audio payloads. It does
-not fetch user-supplied media URLs. Any future multimodal implementation must
-add scheme/size/time limits and SSRF defenses for loopback, private, link-local,
-redirected, and local-file targets before remote media is accepted.
+The v0.1 profile remains text-only. The v0.2 profile accepts images only through
+base64 `data:` URLs or HTTPS. It permits at most four images, 20 MiB per image,
+40 MiB total, and a ten-second fetch deadline. It rejects local files, plain
+HTTP, URL credentials, loopback, private, link-local or reserved addresses,
+mixed public/non-public DNS answers, DNS rebinding, unsafe redirects, invalid
+MIME types, audio, and video. Each redirect target is resolved and audited
+again, and HTTPS retains certificate verification and SNI for the original
+hostname while connecting to an already validated public address.
+
+These controls reduce SSRF exposure but do not make the unauthenticated local
+server suitable for hostile multi-tenant traffic. Operators should prefer data
+URLs for sensitive images, review outbound network policy, and avoid exposing
+the service beyond loopback.
 
 ## Dependency and release integrity
 

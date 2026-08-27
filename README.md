@@ -7,11 +7,11 @@
 > [FreeToken](https://github.com/FlashML-org/FreeToken)**. It is not affiliated
 > with or endorsed by Qwen, RadixArk, NVIDIA, FlashML, or their contributors.
 
-Run the **text tower** from the complete 135 GB
+Run the complete 135 GB
 [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
-checkpoint on one 32 GB RTX 5090. The runtime combines sparse PLE row streaming,
-QSA Triton kernels, four-stream gated residuals, and heterogeneous MoE offload
-behind an OpenAI-compatible API.
+checkpoint with text or image input on one 32 GB RTX 5090. The runtime combines
+sparse PLE row streaming, QSA Triton kernels, four-stream gated residuals, a
+vision tower, and heterogeneous MoE offload behind an OpenAI-compatible API.
 
 This repository is a source-only developer preview. It does not redistribute
 model weights, publish the `freetoken` package name, or claim to be the first or
@@ -19,8 +19,8 @@ fastest implementation.
 
 ![Qwen3.8 Next 5090 Lab architecture](docs/assets/q38lab-architecture.svg)
 
-The diagram shows the unreleased v0.2 candidate. The verified v0.1 path omits
-the vision branch and uses mmap/CPU PLE decoding as described below.
+The diagram shows the hardware-validated v0.2 alpha path. The historical v0.1
+path omits the vision branch and uses mmap/CPU PLE decoding as described below.
 
 ## Verified v0.1 contract
 
@@ -39,14 +39,14 @@ packed NVFP4 weights but does not consume the checkpoint's activation-scale
 contract; measurements here therefore describe W4A16 compatibility, not W4A4
 quality or numerical parity.
 
-## v0.2 candidate: 256K plus images
+## Hardware-validated v0.2 alpha: 256K plus images
 
-The current development branch contains the `0.2.0a1` source candidate for
-`v0.2.0-alpha.1`. It is **not a released or hardware-validated support claim**.
-The verified support matrix remains the v0.1 table above until one evidence run
-passes every v0.2 gate on the pinned full checkpoint.
+`v0.2.0-alpha.1` (code version `0.2.0a1`) is release-ready under one reviewed
+full-checkpoint run on the exact envelope below. This is a narrow hardware
+validation, not general model support or native W4A4 parity. The reviewed record
+is [`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
 
-| Candidate area | Unverified `v0.2.0-alpha.1` target (hardware harness pending) |
+| Validated area | `v0.2.0-alpha.1` hardware-validated contract |
 |---|---|
 | Context accounting | 262,144 total tokens, including rendered text, expanded image tokens, and output |
 | Boundary proof | Exactly 261,120 input tokens plus 1,024 generated tokens, once for text and once with a real image |
@@ -55,7 +55,7 @@ passes every v0.2 gate on the pinned full checkpoint.
 | Images | Structured OpenAI `image_url`; HTTPS or base64 data URL; up to four images |
 | Still excluded | Video, audio, MTP, radix cache, TP>1, multi-request scheduling, and context beyond 262,144 |
 
-The candidate profile is:
+The validated profile is:
 
 ```bash
 q38lab doctor --profile rtx5090-wsl2-256k-image
@@ -63,24 +63,23 @@ q38lab serve --profile rtx5090-wsl2-256k-image
 q38lab smoke --images
 ```
 
-Do not use this section as evidence that the commands have passed the full
-model gates. Release requires the exact text and image boundary requests,
+The reviewed run passed the exact text and image boundary requests,
 Needle-in-a-Haystack and deterministic image cases, 100/100 mixed sequential
 requests, a 30-minute soak, TTFT at or below 15 minutes, steady decode at or
 above 5 tok/s, peak VRAM below 31 GiB, WSL RSS below 105 GiB, and WSL swap at
-zero. No v0.2 performance number is published before those raw records exist.
+zero. Quote performance only with the generated table and adjacent raw records.
 
 ## Execution paths
 
 - **PLE stays sparse.** The verified v0.1 path keeps the approximately 51 GB
   FP8 table in a read-only safetensors mmap and decodes only matched rows on the
-  CPU. The v0.2 candidate instead requires native Linux `io_uring` plus
+  CPU. The v0.2 profile instead requires native Linux `io_uring` plus
   `O_DIRECT`, a globally bounded 4 GiB native LRU, 4 KiB-aligned reads, queue
   depth 512, and batches of at most 4,096 pages. Double-buffered pinned FP8 rows
   are transferred and decoded/scaled to BF16 on the GPU; the mmap path remains
   only a test/debug fallback for this profile.
 - **QSA has its own cache path.** Twelve sparse-attention layers select from
-  four-token blocks; the v0.2 candidate stores one persistent index key per
+  four-token blocks; the v0.2 profile stores one persistent index key per
   four tokens plus a request-local tail ring and mRoPE coordinates. Its full
   256K main K/V and compressed-index budget is 6.1875 GiB. The SM120 selector
   uses a bounded 128 MiB FP32 workspace and top-512 kernel, with the Torch
@@ -88,7 +87,7 @@ zero. No v0.2 performance number is published before those raw records exist.
 - **Experts span the memory hierarchy.** The 512 routed experts per layer use
   top-10 routing, pageable CPU layers, pinned host banks, PCIe transfers, and a
   GPU expert cache. The shared expert remains part of every layer. The v0.2
-  candidate additionally enables route-aware native-NVFP4 prefill movement:
+  profile additionally enables route-aware native-NVFP4 prefill movement:
   after the current layer's router runs, a bounded 512-entry mask identifies
   the selected raw expert IDs. Coalesced selected rows are copied for banks
   whose per-expert row is at least 256 KiB; smaller banks are copied as one
@@ -97,7 +96,7 @@ zero. No v0.2 performance number is published before those raw records exist.
   compaction and no reduction in the reserved GPU buffer size. Registered
   banks use direct DMA when available, while LOCKED/PAGEABLE layers use the
   fixed pair of 32 MiB pinned bounce slabs.
-- **Images enter before residual replication.** The candidate loads the 27-layer
+- **Images enter before residual replication.** The v0.2 profile loads the 27-layer
   vision tower, expands image placeholders with the pinned Transformers
   processor, constructs three-axis interleaved mRoPE, and injects merged visual
   embeddings before copying the four gated-residual streams. Each image is
@@ -168,8 +167,9 @@ unauthenticated non-loopback bind unless the caller supplies
 `--unsafe-allow-non-loopback`. That flag adds no authentication or TLS; do not
 expose this development server directly to a network.
 
-The unreleased 256K/image candidate uses a separate profile and refuses to
-start if native `io_uring`/`O_DIRECT` or the memory budget is unavailable:
+The hardware-validated v0.2 256K/image alpha uses a separate profile and
+refuses to start if native `io_uring`/`O_DIRECT` or the memory budget is
+unavailable:
 
 ```bash
 q38lab serve --profile rtx5090-wsl2-256k-image
@@ -182,15 +182,15 @@ native-NVFP4 MoE prefill. The sparse MoE path requires the existing
 double-buffered prefill cache and refuses any non-native NVFP4 bank layout. It
 deliberately waits for the current layer's routing decision instead of eagerly
 prefetching the next full expert layer, and it disables the separate prefill
-hit-D2D path. Those tradeoffs are why its net performance remains an evidence
-question, not a source-level claim. The profile reserves QSA cache, selector
+hit-D2D path. Those tradeoffs mean its performance must be quoted from reviewed
+evidence, not inferred from source. The profile reserves QSA cache, selector
 workspace, vision weights, and runtime headroom before automatically sizing the
 GPU expert cache; it fails closed if the fixed geometry cannot fit the resolved
-0.89 planning budget. The separate evidence gate, not this arithmetic alone,
-enforces the strict peak-VRAM result below 31 GiB.
+0.89 planning budget. The reviewed evidence, not this arithmetic alone,
+confirms the strict peak-VRAM acceptance gate below 31 GiB.
 
-Exercise the unverified candidate test surface with a maintainer-selected
-public HTTPS fixture; this smoke command is not release evidence:
+Exercise the v0.2 image surface with a maintainer-selected public HTTPS fixture;
+this smoke command is not release evidence:
 
 ```bash
 HTTPS_IMAGE_URL='https://replace-with-your-public-fixture.example/chart.png'
@@ -212,9 +212,9 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-The v0.2 source candidate contains an unverified image-input path through the
-same API. This example shows only the request shape, not a published validation
-result or a supported input contract:
+The v0.2 alpha accepts image input through the same API. This example is within
+the validated request shape; support remains limited to the recorded hardware
+and scheduling envelope:
 
 ```python
 response = client.chat.completions.create(
@@ -231,8 +231,7 @@ response = client.chat.completions.create(
 )
 ```
 
-The candidate implementation is limited to HTTPS and base64 image data URLs;
-these limits are not hardware-validation results. It caps a
+The v0.2 implementation is limited to HTTPS and base64 image data URLs. It caps a
 request at four images, 20 MiB per image and 40 MiB total, with a ten-second
 fetch deadline. It rejects HTTP/local URLs, loopback, private, link-local or
 reserved addresses, unsafe redirects, DNS rebinding, unsupported MIME types,
@@ -249,8 +248,8 @@ answer. Mixed public/non-public system answers and numeric IP literals never
 use the fallback. `doctor --json` and release evidence record whether the
 opt-in was enabled and that libc `getaddrinfo` has only deadline-bounded,
 four-slot soft cancellation—there is no portable hard cancel for a lookup
-already running in libc. This compatibility path does not make the v0.2
-candidate verified or relax any evidence gate.
+already running in libc. This compatibility path does not expand the validated
+v0.2 contract or relax any evidence gate.
 
 For a streaming request, add `stream=True` and iterate over the returned chunks.
 The smoke suite also covers both thinking modes and one schema-constrained tool
@@ -275,29 +274,49 @@ Do not compare numbers without the adjacent environment and resolved-config
 records. TTFT is client-observed, and “effective prefill” includes fixed request
 and CPU-staging overhead rather than measuring a kernel in isolation.
 
+The reviewed v0.2 release record is
+[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
+The block below is generated from that directory's `summary.json`.
+
 <!-- BEGIN GENERATED BENCHMARK SUMMARY -->
 | Verified field | Result |
 |---|---:|
-| Runtime commit | `643bcd6a82eb` |
+| Runtime commit | `757872a75695` |
 | Checkpoint revision | `7b719225242a` |
 | GPU | NVIDIA GeForce RTX 5090 |
 | Executed expert path | W4A16 compatibility |
-| Peak VRAM | 30.926 GiB |
-| Peak WSL RSS | 72.234 GiB |
+| Peak VRAM | 30.388 GiB |
+| Peak WSL RSS | 75.265 GiB |
 | WSL swap | 0 MiB |
-| 8176 rendered-token TTFT (p50 / p95) | 7283.0 / 7355.5 ms |
-| 8176 effective prefill (p50) | 1122.6 tok/s |
-| 256-token steady decode | 14.0 tok/s |
+| 8176 rendered-token TTFT (p50 / p95) | 20081.2 / 20081.2 ms |
+| 8176 effective prefill (p50) | 407.1 tok/s |
+| 256-token steady decode | 12.9 tok/s |
 | Sequential requests | 100/100 |
 | Continuous run | 30.0 min |
-| Tests | 1530 passed, 0 failed |
+| Tests | 1667 passed, 0 failed |
+| 261K boundary TTFT | 566371.3 ms |
+| 261120 input + 1024 output (text / image) | passed / passed |
+| Selector workspace peak | 127.5 MiB |
+| PLE storage read / cache hits | 89796608 B / 156748 |
+| Vision tokens / latency | 6076 / 689.3 ms |
+| Prefill chunks / total time | 2179 / 4821865.4 ms |
+| Sparse MoE active rows | 17312660 / 53551104 |
+| Sparse MoE PCIe bytes | 59409764843520 / 148469364817920 |
 <!-- END GENERATED BENCHMARK SUMMARY -->
+
+The generated **Peak VRAM** and **Peak WSL RSS** values are the formal API
+acceptance-window maxima, measured from the first API request through the final
+soak. They are not whole-harness peaks. The raw
+[`resource-samples.csv`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/resource-samples.csv)
+also contains pre-acceptance preflight and pytest samples, including a higher
+transient VRAM observation; inspect those raw samples before quoting resource
+behavior.
 
 The validated WSL instance had `swap=0`. The Windows host already had a
 pagefile, so this project does **not** claim that host paging was absent. Short
 seven-token completions are not presented as a
-steady-state decode benchmark; the release gate uses a separate 256–512-token
-decode measurement.
+steady-state decode benchmark; the v0.1 gate used a separate 256–512-token
+measurement, while the v0.2 contract permits 256–1,024 tokens.
 
 See [the full procedure and caveats](docs/qwen4-exp.md) before quoting any
 result.
@@ -313,14 +332,14 @@ fraction; these are movement-accounting counters, not invented hardware PCIe
 measurements. The launch attestation also carries a native PLE checkpoint
 probe: every one of the 128 shard boundaries plus eight deterministic
 bigram/trigram hash rows must match independent safetensors slices after GPU
-FP8 decode. A v0.2 evidence directory is not
-release-compatible unless it contains both 261,120 + 1,024 boundary proofs and
-passes every resource, throughput, mixed-request, and soak gate. Until such a
-reviewed directory exists, the generated benchmark block above intentionally
-remains the v0.1 result.
+FP8 decode. A v0.2 evidence directory is release-compatible only when it
+contains both 261,120 + 1,024 boundary proofs and passes every resource,
+throughput, mixed-request, and soak gate. The reviewed run7 directory above
+satisfies these requirements, and the generated benchmark block reports that
+v0.2 record.
 
-The candidate evidence entry point requires both a deterministic local image
-and a stable public HTTPS fixture:
+The v0.2 evidence entry point requires both a deterministic local image and a
+stable public HTTPS fixture:
 
 ```bash
 q38lab bench --profile rtx5090-wsl2-256k-image \
@@ -342,20 +361,20 @@ the system-resolver soft-cancellation limitation are preserved in the evidence.
 
 ## Project status
 
-The verified v0.1 alpha is intentionally narrow. The unreleased v0.2 source
-contains the 256K/image candidate paths described above, but they remain
-unverified and outside the support matrix until the full hardware gate passes.
-Later milestones are:
+The verified v0.1 alpha remains available as the narrow 8K text-only profile.
+The v0.2 alpha is release-ready only for the recorded RTX 5090/WSL2 envelope:
+TP=1, one running request, naive cache, graph disabled, W4A16 compatibility,
+262,144 total tokens, and image input. Later milestones are:
 
 1. End-to-end reference parity and a native SM120 W4A4 activation path.
 2. PLE hot-row optimization and verified QSA/PLE CUDA graph capture/replay.
 3. Video/audio evaluation, MTP, radix-cache semantics, and contexts beyond the
-   single-request 262,144-token candidate.
+   single-request 262,144-token envelope.
 
-The v0.1 profile continues to reject media. Source code alone also does not make
-the v0.2 profile supported: the online image path, vision tower, placeholder
-expansion, mRoPE, chunk scatter, cleanup, and security controls must pass the
-recorded full-checkpoint gates before the support matrix changes.
+The v0.1 profile continues to reject media. The v0.2 validation does not extend
+beyond its recorded envelope: video, audio, MTP, radix cache, TP>1,
+multi-request scheduling, native W4A4 parity, and context beyond 262,144 remain
+unsupported.
 
 ## Provenance, contributing, and citation
 

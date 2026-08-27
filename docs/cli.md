@@ -11,20 +11,30 @@
 | `q38lab doctor [--json] [--profile NAME]` | Check WSL/ext4, RTX 5090/SM120, CUDA/Torch/Triton, RAM/disk/swap, checkpoint, port, and profile-specific budgets |
 | `q38lab download --accept-qwen-license [--full-verify]` | Download only the pinned checkpoint revision and optionally hash all 135 GB |
 | `q38lab serve --profile rtx5090-wsl2` | Start the hardware-validated v0.1 text-only 8K profile |
-| `q38lab serve --profile rtx5090-wsl2-256k-image` | Start the unreleased 262,144-total-token/image candidate; native direct I/O is mandatory |
+| `q38lab serve --profile rtx5090-wsl2-256k-image` | Start the hardware-validated v0.2 262,144-total-token/image profile; native `io_uring` + `O_DIRECT` is mandatory |
 | `q38lab smoke [--images] [--https-image-url URL]` | Exercise health/models, streaming, thinking, tools and optional bounded image/security cases |
 | `q38lab bench --profile NAME --out DIR` | Run the profile-bound full-hash, API, stability, soak, telemetry, and evidence harness |
 
-The 256K/image profile is present for validation; it is not in the supported
-matrix until its full RTX 5090 release gates pass. Its bench invocation also
-requires `--image-file PATH` and `--https-image-url URL`, and permits
-`--decode-tokens` from 256 through 1,024. The v0.1 profile retains a 512-token
-decode-measurement ceiling. The candidate profile also enables the internal
-`FREETOKEN_MOE_PREFILL_SPARSE=1` contract: native-NVFP4 large-bank rows are
-selected by raw expert ID, small banks remain whole-layer copies, and the full
-`[E]` GPU double buffers remain allocated. `ft ctl --json stats` exposes the
-resulting active/possible-row and copied/full-byte counters under
-`q38lab.moe_prefill`; their presence is not a performance or support claim.
+The 256K/image profile is hardware-validated for `v0.2.0-alpha.1` only on an
+RTX 5090 under WSL2, with TP=1, one running request, naive cache, CUDA graph
+disabled, and the W4A16 compatibility path. Its 262,144-token limit is the
+total of text tokens, expanded image tokens, and output tokens. Images are
+accepted through HTTPS and data URLs. Native `io_uring` + `O_DIRECT` is a hard
+requirement; the profile refuses to start when that path is unavailable.
+Audio, video, MTP, radix cache, TP>1, concurrent requests, and totals above
+262,144 tokens are unsupported by this validated contract. The exact release
+evidence is in
+[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
+
+The 256K/image bench invocation requires `--image-file PATH` and
+`--https-image-url URL`, and permits `--decode-tokens` from 256 through 1,024.
+The v0.1 profile retains a 512-token decode-measurement ceiling. The v0.2
+profile also enables the internal `FREETOKEN_MOE_PREFILL_SPARSE=1` contract:
+native-NVFP4 large-bank rows are selected by raw expert ID, small banks remain
+whole-layer copies, and the full `[E]` GPU double buffers remain allocated.
+`ft ctl --json stats` exposes the resulting active/possible-row and
+copied/full-byte counters under `q38lab.moe_prefill`; their presence is not a
+performance claim outside the validated contract.
 
 Configuration precedence is CLI flag, then `Q38LAB_*` environment variable,
 then profile default. Unauthenticated serving binds to `127.0.0.1`; a

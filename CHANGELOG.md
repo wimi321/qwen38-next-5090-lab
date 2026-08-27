@@ -7,15 +7,16 @@ before the audited base remains available in Git; see
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0-alpha.1] - Unreleased candidate
+## [0.2.0-alpha.1] - 2026-08-28
 
-This entry describes source currently under validation. It is not a support
-claim and no `v0.2.0-alpha.1` tag or release should be created until the full
-RTX 5090 evidence gates below pass.
+This developer preview is hardware-validated only for the narrow
+`rtx5090-wsl2-256k-image` contract described below. The reviewed full-checkpoint
+record is tracked at
+`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`.
 
 ### Added
 
-- Candidate `rtx5090-wsl2-256k-image` profile with a 262,144-token total
+- `rtx5090-wsl2-256k-image` profile with a 262,144-token total
   context budget, 512-token prefill chunks, TP=1, one running request, naive
   cache, graph disabled, and fail-closed memory planning.
 - Compressed QSA index-key persistence at one row per four tokens, request-local
@@ -30,14 +31,14 @@ RTX 5090 evidence gates below pass.
   depth 512, batches up to 4,096 pages, one globally bounded 4 GiB native LRU,
   next-chunk prefetch, and double-buffered pinned FP8 staging for GPU
   decode/scale to BF16.
-- Route-aware native-NVFP4 MoE prefill movement for the candidate profile. A
+- Route-aware native-NVFP4 MoE prefill movement for the v0.2 profile. A
   bounded expert mask discovers selected raw IDs after each layer's router;
   coalesced active rows move for banks with per-expert rows of at least 256 KiB,
   while smaller banks still move as one whole-layer entry. The implementation
   preserves raw IDs and full `[E]` GPU double buffers, uses direct registered
   copies or the fixed 64 MiB bounce allocation according to host residency, and
-  exports active/possible-row plus copied/full-byte telemetry. This is a data-
-  movement candidate, not a validated performance claim.
+  exports active/possible-row plus copied/full-byte telemetry. The reviewed run
+  validates this execution path, not a general performance advantage.
 - Opt-in Qwen4-Exp image tower and weight mapping, pinned Transformers processor,
   placeholder expansion, `image_grid_thw`, three-axis interleaved mRoPE, and
   visual embedding injection before four-stream residual replication.
@@ -56,7 +57,7 @@ RTX 5090 evidence gates below pass.
 
 ### Changed
 
-- `q38lab doctor` now reports candidate QSA, PLE, vision, MoE, disk, ext4,
+- `q38lab doctor` now reports QSA, PLE, vision, MoE, disk, ext4,
   `O_DIRECT`, `io_uring`, and locked-memory budget details for the new profile.
 - Context overflow errors account separately for rendered text tokens, expanded
   image tokens, requested output, and the 262,144 total limit.
@@ -64,18 +65,23 @@ RTX 5090 evidence gates below pass.
   SM120 QSA design references without importing their 96 GB, MTP, CUDA Graph,
   or performance claims.
 
-### Pending release gates
+### Hardware validation
 
-- Full-checkpoint text and real-image requests must each complete exactly
-  261,120 input plus 1,024 output tokens; 8K regression, 32K, and 128K must pass.
-- 261K TTFT must be at most 15 minutes and 256--1,024-token steady decode at
-  least 5 tok/s, with peak VRAM below 31 GiB, WSL RSS below 105 GiB, and WSL
-  swap at zero.
-- Needle-in-a-Haystack, deterministic OCR/object/chart cases, streaming versus
-  non-streaming, thinking, tools plus images, 100/100 mixed sequential requests,
-  and a 30-minute leak-free soak must pass.
-- All README performance fields must be generated from reviewed v0.2 evidence.
-  Until then the public support matrix and benchmark summary remain v0.1 only.
+- The pinned 135,253,622,894-byte checkpoint completed both exact
+  `261,120 input + 1,024 output` boundaries, including one with a real image;
+  a one-token excess returned `context_length_exceeded`.
+- 8K, 32K, 128K, and 261,120-token Needle-in-a-Haystack cases all passed. The
+  261K client-observed TTFT remained below 15 minutes and a 256-token steady
+  decode exceeded 5 tok/s.
+- Peak resources during the formal API acceptance window remained below 31 GiB
+  VRAM and 105 GiB WSL RSS, with WSL swap at zero. Raw resource samples also
+  include pre-acceptance pytest/preflight activity and are retained for audit.
+- Deterministic OCR/object/chart, image thinking and tool calling, streaming
+  parity, 100/100 mixed sequential requests, and a 30-minute alternating
+  text/image soak passed without a monotonic memory leak.
+- The full non-slow suite recorded 1,667 passed and zero failed tests; the PLE
+  probe covered real rows across all 128 shards with native direct I/O and GPU
+  FP8 decode attestation.
 
 ## [0.1.0-alpha.1] - 2026-08-27
 
@@ -123,4 +129,5 @@ RTX 5090 evidence gates below pass.
 - WSL swap was zero in the recorded run, but a pre-existing Windows pagefile
   prevents a claim that host paging was absent.
 
+[0.2.0-alpha.1]: https://github.com/wimi321/qwen38-next-5090-lab/releases/tag/v0.2.0-alpha.1
 [0.1.0-alpha.1]: https://github.com/wimi321/qwen38-next-5090-lab/releases/tag/v0.1.0-alpha.1

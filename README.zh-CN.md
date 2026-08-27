@@ -9,17 +9,17 @@
 
 本项目让完整 135 GB
 [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
-checkpoint 的**文本塔**在一张 32 GB RTX 5090 上运行。它在 FreeToken 的
+checkpoint 在一张 32 GB RTX 5090 上接受文本或图片输入。它在 FreeToken 的
 OpenAI 兼容 API 之上组合了稀疏 PLE 行流式读取、QSA Triton kernel、四路
-gated residual 和异构 MoE offload。
+gated residual、vision tower 和异构 MoE offload。
 
 这是一个仅发布源码的开发者预览版。仓库不再分发模型权重，不占用
 `freetoken` 官方包的发布名，也不声称“首个”“唯一”或“最快”。
 
 ![Qwen3.8 Next 5090 Lab 架构](docs/assets/q38lab-architecture.svg)
 
-架构图展示的是未发布的 v0.2 候选路径；已验证的 v0.1 不含 vision 分支，并使用
-下文说明的 mmap/CPU PLE 解码。
+架构图展示的是已经硬件验证的 v0.2 alpha 路径；历史 v0.1 不含 vision 分支，
+并使用下文说明的 mmap/CPU PLE 解码。
 
 ## 已验证的 v0.1 边界
 
@@ -37,13 +37,14 @@ checkpoint 声明 routed expert 使用 W4A4 方案。本 alpha 保留 packed NVF
 权重，但没有消费 checkpoint 的 activation-scale 契约，所以当前结果只能称为
 W4A16 compatibility，不能继承 W4A4 的质量结论，也不能声称与其数值等价。
 
-## v0.2 候选版：256K 与图片
+## 已完成硬件验证的 v0.2 alpha：256K 与图片
 
-当前开发分支包含 `v0.2.0-alpha.1`（代码版本 `0.2.0a1`）的源码候选版，
-但这**不是已经发布或完成硬件验证的支持声明**。在固定完整 checkpoint 的一次
-证据运行通过全部 v0.2 门槛之前，已验证支持矩阵仍以上面的 v0.1 表格为准。
+`v0.2.0-alpha.1`（代码版本 `0.2.0a1`）已经在固定完整 checkpoint 上完成一次
+经过审阅的整机验证，并已达到预发布条件。它只证明下面这组窄范围硬件契约，
+不代表通用模型支持或原生 W4A4 parity。审阅记录位于
+[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/)。
 
-| 候选项目 | `v0.2.0-alpha.1` 未验证目标（硬件 harness 待完成） |
+| 验证项目 | `v0.2.0-alpha.1` 已验证契约 |
 |---|---|
 | 上下文计数 | 总计 262,144 token，包括渲染后的文本、展开后的图片 token 与输出 |
 | 边界证明 | 文本和含真实图片的请求各完成一次准确的 261,120 输入 + 1,024 输出 |
@@ -52,7 +53,7 @@ W4A16 compatibility，不能继承 W4A4 的质量结论，也不能声称与其�
 | 图片 | OpenAI 结构化 `image_url`；HTTPS 或 base64 data URL；最多 4 张 |
 | 仍不支持 | 视频、音频、MTP、radix cache、TP>1、多请求调度及超过 262,144 token |
 
-候选 profile 的入口为：
+已验证 profile 的入口为：
 
 ```bash
 q38lab doctor --profile rtx5090-wsl2-256k-image
@@ -60,26 +61,25 @@ q38lab serve --profile rtx5090-wsl2-256k-image
 q38lab smoke --images
 ```
 
-这些命令存在不等于已通过整模门槛。发布前必须完成准确的文本/图片边界请求、
-Needle-in-a-Haystack 和确定答案图片用例、100/100 次文本/图片混合顺序请求、
-至少 30 分钟 soak，并满足 TTFT 不超过 15 分钟、稳态 decode 不低于 5 tok/s、
-峰值显存低于 31 GiB、WSL RSS 低于 105 GiB、WSL swap 为 0。没有这些原始
-记录前，不发布任何 v0.2 性能数字。
+审阅运行已经完成准确的文本/图片边界请求、Needle-in-a-Haystack、确定答案图片
+用例、100/100 次文本/图片混合顺序请求和 30 分钟 soak，并满足 TTFT 不超过
+15 分钟、稳态 decode 不低于 5 tok/s、峰值显存低于 31 GiB、WSL RSS 低于
+105 GiB、WSL swap 为 0。引用性能时必须同时附带英文生成表和相邻原始记录。
 
 ## 执行路径
 
 - **PLE 只读取命中的行。** 已验证 v0.1 使用只读 safetensors mmap，在 CPU
-  解码命中行。v0.2 候选 profile 则强制要求 Linux 原生 `io_uring` +
+  解码命中行。v0.2 profile 则强制要求 Linux 原生 `io_uring` +
   `O_DIRECT`、全局有界的 4 GiB 原生 LRU、4 KiB 对齐读取、queue depth 512，
   每批最多 4,096 页；双缓冲 pinned FP8 行传到 GPU 后解码、缩放为 BF16。
   mmap 在该 profile 中仅为单测/debug fallback。
-- **QSA 使用独立缓存。** v0.2 候选版为每 4 token 持久保存一个 index key，
+- **QSA 使用独立缓存。** v0.2 profile 为每 4 token 持久保存一个 index key，
   并保留请求级尾部 ring 和真实 mRoPE 坐标。完整 256K 的 12 层主 K/V 与压缩
   索引预算为 6.1875 GiB；SM120 selector 使用最大 128 MiB 的 FP32 workspace
   和 top-512 kernel，同时保留 Torch oracle 与原 Triton 路径作为正确性 fallback。
 - **专家权重跨越多级内存。** 每层 512 个 routed experts 采用 top-10，结合
   pageable CPU layers、pinned host banks、PCIe 传输和 GPU expert cache；
-  shared expert 仍在每层参与计算。v0.2 候选 profile 还启用 route-aware 的
+  shared expert 仍在每层参与计算。v0.2 profile 还启用 route-aware 的
   native-NVFP4 prefill 搬运：当前层 router 完成后，用固定 512 项的 mask 找出
   命中的 raw expert ID。单个 expert 行不小于 256 KiB 的大 bank 只搬运按 ID
   合并后的命中连续段；更小的 bank 仍作为一个整层条目搬运，以保证 CUDA
@@ -87,7 +87,7 @@ Needle-in-a-Haystack 和确定答案图片用例、100/100 次文本/图片混�
   expert-ID 压紧，也不会减少为 GPU buffer 预留的空间。已注册的 pinned bank
   在可用时直接 DMA；LOCKED/PAGEABLE 层经过两个固定的 32 MiB pinned bounce
   slab。
-- **图片在四路 residual 复制前注入。** 候选版加载 27 层 vision tower，用固定
+- **图片在四路 residual 复制前注入。** v0.2 profile 加载 27 层 vision tower，用固定
   Transformers `5.16.1` processor 展开 placeholder，构建三轴 interleaved
   mRoPE；合并后的视觉 embedding 在四路 gated-residual stream 复制前写入。
   每张图片只编码一次，完整 BF16 embedding 暂存在 pageable CPU；每个
@@ -150,8 +150,8 @@ CLI 参数 > `Q38LAB_*` 环境变量 > profile 默认值。
 拒绝把无鉴权服务绑定到非 loopback 地址。`--unsafe-allow-non-loopback` 只表示
 风险确认，不会增加鉴权或 TLS；不要把此开发服务直接暴露到网络。
 
-未发布的 256K/图片候选版使用独立 profile；原生 `io_uring`/`O_DIRECT` 或内存
-预算不满足时会拒绝启动：
+完成硬件验证的 v0.2 256K/图片 alpha 使用独立 profile；原生
+`io_uring`/`O_DIRECT` 或内存预算不满足时会拒绝启动：
 
 ```bash
 q38lab serve --profile rtx5090-wsl2-256k-image
@@ -163,13 +163,13 @@ naive cache、graph 关闭、原生 PLE streaming、vision 加载，以及 route
 native-NVFP4 MoE prefill。稀疏 MoE 路径要求已有的双缓冲 prefill cache，并会
 拒绝任何非 native NVFP4 的 bank 布局。它有意等待当前层的 routing 结果，不再
 提前搬运下一层完整 expert bank，同时关闭独立的 prefill hit-D2D 路径；因此
-净性能必须由 evidence 回答，不能从源码直接宣称。预算器先为 QSA cache、
+净性能必须从已审阅 evidence 引用，不能从源码直接推断。预算器先为 QSA cache、
 selector workspace、vision 权重与运行余量预留显存，再自动定容 GPU expert
 cache；固定几何无法装进解析后的 0.89 预算时会直接失败。严格低于 31 GiB 的
-峰值由后续 evidence gate 实测，不由这项预算算术单独证明。
+验收峰值由已审阅 evidence 实测，不由这项预算算术单独证明。
 
-使用维护者选定的公开 HTTPS fixture 检查未验证的候选接口；这条 smoke 命令
-不构成发布证据：
+使用维护者选定的公开 HTTPS fixture 检查 v0.2 图片接口；这条 smoke 命令
+本身不构成发布证据：
 
 ```bash
 HTTPS_IMAGE_URL='https://replace-with-your-public-fixture.example/chart.png'
@@ -191,8 +191,8 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-v0.2 源码候选版包含通过同一 API 传入图片的未验证路径。下面只展示请求格式，
-不代表已经发布的验收结果或已支持的输入契约：
+v0.2 alpha 通过同一 API 接受图片。下面的请求格式属于已验证输入契约，但支持
+范围仍严格限定在记录的硬件与调度边界内：
 
 ```python
 response = client.chat.completions.create(
@@ -209,7 +209,7 @@ response = client.chat.completions.create(
 )
 ```
 
-候选实现只处理 HTTPS 和 base64 图片 data URL；这些限制本身不是硬件验收结果。
+v0.2 实现只处理 HTTPS 和 base64 图片 data URL。
 每个请求最多 4 张、单张不超过 20 MiB、
 总计不超过 40 MiB，抓取总超时 10 秒。HTTP/本地文件、loopback、private、
 link-local 或 reserved 地址、不安全重定向、DNS rebinding、不支持的 MIME、
@@ -223,8 +223,8 @@ Cloudflare DoH 公网 IP `1.1.1.1` 和 `1.0.0.1`，同时用
 global。公网/non-global 混合答案和数字 IP 字面量永远不会走 fallback。
 `doctor --json` 与发布证据会记录是否开启该选项，
 也会记录 libc `getaddrinfo` 只有受 deadline 和四个槽位约束的软取消：已经进入
-libc 的查询没有可移植的硬取消机制。这个兼容路径不会把 v0.2 候选版变成已验证
-支持，也不会降低任何证据门槛。
+libc 的查询没有可移植的硬取消机制。这个兼容路径不会扩大已验证的 v0.2 契约，
+也不会降低任何证据门槛。
 
 流式调用只需加入 `stream=True` 并迭代 chunks。`q38lab smoke` 还覆盖两种
 thinking 模式和一次带 schema 的工具调用。模型输出不是安全边界；应用仍必须
@@ -254,12 +254,11 @@ fraction 与 row fraction 本来就可能不同；这些是搬运记账计数，
 PCIe 实测值。启动证明还会携带真实 PLE checkpoint 探针：128 个 shard 的全部
 边界行以及 8 个确定性 bigram/trigram hash 行，必须在 GPU FP8 解码后与独立
 safetensors slice 精确一致。
-只有同时包含
-两次 261,120 + 1,024 边界证明，并通过资源、吞吐、混合顺序请求和 soak 门槛的
-证据目录才可发布。正式审阅记录出现以前，英文 README 的 generated benchmark
-区块会有意保留 v0.1 结果。
+只有同时包含两次 261,120 + 1,024 边界证明，并通过资源、吞吐、混合顺序请求和
+soak 门槛的证据目录才可发布。上面的 run7 目录已经满足这些要求，英文 README
+的 generated benchmark 区块现由该 v0.2 记录生成。
 
-候选 profile 必须使用维护者持有的确定性本地图片和稳定的公开 HTTPS fixture：
+v0.2 profile 必须使用维护者持有的确定性本地图片和稳定的公开 HTTPS fixture：
 
 ```bash
 q38lab bench --profile rtx5090-wsl2-256k-image \
@@ -281,25 +280,32 @@ fallback，应给 `doctor`、`serve` 和 `bench` 使用相同的
 [README](README.md) 的 generated benchmark 区块维护；中文文档不手工复制
 性能数字，以免证据更新后出现不一致。
 
+英文表中的 **Peak VRAM** 和 **Peak WSL RSS** 是正式 API 验收窗口内的最大值，
+该窗口从第一个 API 请求开始，到最后一次 soak 结束；它们不是整个 harness 的
+峰值。原始
+[`resource-samples.csv`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/resource-samples.csv)
+还包含验收窗口之前的 preflight 和 pytest 采样，其中包括一次更高的瞬时显存值。
+引用资源行为时必须同时说明这一区别并检查原始采样。
+
 验证时 WSL 的 `swap=0`。Windows 宿主已有 pagefile，因此本项目**不声称宿主没有
-发生分页**。早期 7-token completion 也不会被
-当作稳态 decode benchmark；release gate 会另测 256–512 token decode。
+发生分页**。早期 7-token completion 也不会被当作稳态 decode benchmark；
+v0.1 gate 使用独立的 256–512 token 测量，v0.2 契约允许 256–1,024 token。
 
 引用数字前请阅读[完整步骤与限制](docs/qwen4-exp.md)。
 
 ## 项目状态
 
-已验证的 v0.1 alpha 有意保持小范围。未发布的 v0.2 源码包含上述 256K/图片
-候选路径，但在完整硬件门槛通过之前仍未验证，也不进入支持矩阵。更后续的
-里程碑包括：
+已验证的 v0.1 alpha 继续作为窄范围 8K 纯文本 profile。v0.2 alpha 只在记录的
+RTX 5090/WSL2 边界内达到预发布条件：TP=1、同时一个请求、naive cache、graph
+关闭、W4A16 compatibility、总计 262,144 token 和图片输入。更后续的里程碑包括：
 
 1. 完整 reference parity 与原生 SM120 W4A4 activation path。
 2. PLE hot-row 优化，以及经过验证的 QSA/PLE CUDA graph capture/replay。
 3. 视频/音频评估、MTP、radix-cache 语义和超过单请求 262,144 token 的上下文。
 
-v0.1 profile 仍拒绝媒体。源码中存在候选实现也不等于 v0.2 已获得支持：在线
-图片管线、vision tower、placeholder expansion、mRoPE、chunk scatter、资源
-清理与安全控制必须通过固定整模证据门槛，支持矩阵才会更新。
+v0.1 profile 仍拒绝媒体。v0.2 验证不会扩展到记录边界之外：视频、音频、MTP、
+radix cache、TP>1、多请求调度、原生 W4A4 parity 和超过 262,144 token 的上下文
+仍不支持。
 
 ## 来源、贡献与引用
 

@@ -1,0 +1,197 @@
+{
+  "samples": [
+    {
+      "moe_prefill": {
+        "active_rows": 0,
+        "byte_fraction": 0.0,
+        "bytes_copied": 0,
+        "full_bytes": 0,
+        "possible_rows": 0,
+        "row_fraction": 0.0
+      },
+      "phase": "baseline",
+      "ple": {
+        "bytes_read": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "page_faults": 0,
+        "wait_ms": 0.0
+      },
+      "prefill_chunks": {
+        "count": 0,
+        "total_ms": 0.0
+      },
+      "selector": {
+        "errors": 0,
+        "fallback_calls": 0,
+        "native_calls": 0,
+        "workspace_peak_bytes": 0
+      },
+      "vision": {
+        "image_tokens": 0,
+        "latency_ms": 0.0
+      }
+    },
+    {
+      "moe_prefill": {
+        "active_rows": 14971,
+        "byte_fraction": 0.6535592682363804,
+        "bytes_copied": 44531220480,
+        "full_bytes": 68136468480,
+        "possible_rows": 24576,
+        "row_fraction": 0.6091715494791666
+      },
+      "phase": "cold",
+      "ple": {
+        "bytes_read": 1568768,
+        "cache_hits": 8,
+        "cache_misses": 383,
+        "page_faults": 18730888,
+        "wait_ms": 33.036033
+      },
+      "prefill_chunks": {
+        "count": 1,
+        "total_ms": 66303.126158
+      },
+      "selector": {
+        "errors": 0,
+        "fallback_calls": 0,
+        "native_calls": 48,
+        "workspace_peak_bytes": 100488
+      },
+      "vision": {
+        "image_tokens": 300,
+        "latency_ms": 381.721279
+      }
+    },
+    {
+      "moe_prefill": {
+        "active_rows": 29942,
+        "byte_fraction": 0.6535592682363804,
+        "bytes_copied": 89062440960,
+        "full_bytes": 136272936960,
+        "possible_rows": 49152,
+        "row_fraction": 0.6091715494791666
+      },
+      "phase": "warm-1",
+      "ple": {
+        "bytes_read": 1568768,
+        "cache_hits": 399,
+        "cache_misses": 383,
+        "page_faults": 18738101,
+        "wait_ms": 33.036033
+      },
+      "prefill_chunks": {
+        "count": 2,
+        "total_ms": 74573.651905
+      },
+      "selector": {
+        "errors": 0,
+        "fallback_calls": 0,
+        "native_calls": 96,
+        "workspace_peak_bytes": 100488
+      },
+      "vision": {
+        "image_tokens": 600,
+        "latency_ms": 404.362163
+      }
+    },
+    {
+      "moe_prefill": {
+        "active_rows": 44913,
+        "byte_fraction": 0.6535592682363804,
+        "bytes_copied": 133593661440,
+        "full_bytes": 204409405440,
+        "possible_rows": 73728,
+        "row_fraction": 0.6091715494791666
+      },
+      "phase": "warm-2",
+      "ple": {
+        "bytes_read": 1568768,
+        "cache_hits": 790,
+        "cache_misses": 383,
+        "page_faults": 18738128,
+        "wait_ms": 33.036033
+      },
+      "prefill_chunks": {
+        "count": 3,
+        "total_ms": 76443.87186700001
+      },
+      "selector": {
+        "errors": 0,
+        "fallback_calls": 0,
+        "native_calls": 144,
+        "workspace_peak_bytes": 100488
+      },
+      "vision": {
+        "image_tokens": 900,
+        "latency_ms": 423.235274
+      }
+    },
+    {
+      "moe_prefill": {
+        "active_rows": 59884,
+        "byte_fraction": 0.6535592682363804,
+        "bytes_copied": 178124881920,
+        "full_bytes": 272545873920,
+        "possible_rows": 98304,
+        "row_fraction": 0.6091715494791666
+      },
+      "phase": "warm-3",
+      "ple": {
+        "bytes_read": 1568768,
+        "cache_hits": 1181,
+        "cache_misses": 383,
+        "page_faults": 18738148,
+        "wait_ms": 33.036033
+      },
+      "prefill_chunks": {
+        "count": 4,
+        "total_ms": 78298.206969
+      },
+      "selector": {
+        "errors": 0,
+        "fallback_calls": 0,
+        "native_calls": 192,
+        "workspace_peak_bytes": 100488
+      },
+      "vision": {
+        "image_tokens": 1200,
+        "latency_ms": 441.51324900000003
+      }
+    },
+    {
+      "moe_prefill": {
+        "active_rows": 17312660,
+        "byte_fraction": 0.4001483061261763,
+        "bytes_copied": 59409764843520,
+        "full_bytes": 148469364817920,
+        "possible_rows": 53551104,
+        "row_fraction": 0.32329230784859264
+      },
+      "phase": "final",
+      "ple": {
+        "bytes_read": 89796608,
+        "cache_hits": 156748,
+        "cache_misses": 21923,
+        "page_faults": 18822216,
+        "wait_ms": 3333.642609
+      },
+      "prefill_chunks": {
+        "count": 2179,
+        "total_ms": 4821865.394457995
+      },
+      "selector": {
+        "errors": 0,
+        "fallback_calls": 0,
+        "native_calls": 67116,
+        "workspace_peak_bytes": 133693440
+      },
+      "vision": {
+        "image_tokens": 6076,
+        "latency_ms": 689.3268549999999
+      }
+    }
+  ],
+  "schema_version": "1.0"
+}

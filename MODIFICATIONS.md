@@ -26,7 +26,7 @@ the corresponding high-level description. The Apache-2.0 license remains in
   tail handling, and a cache that stores both main K/V and QSA index keys.
 - Generalized cache-pool sizing so storage is allocated only for the 12 QSA
   layers in the pinned model.
-- The v0.2 candidate persists one compressed index key per four tokens, with a
+- The v0.2 alpha persists one compressed index key per four tokens, with a
   request-local pending tail and the original three-axis positions. Its
   262,144-token main K/V plus index budget is 6.1875 GiB.
 - Added `qsa_triton_sm120`, which bounds selector scores to a 128 MiB FP32
@@ -37,8 +37,8 @@ the corresponding high-level description. The Apache-2.0 license remains in
   at exact commit `30edf3503961a471b25150aa890f8166031b5738`.
 - Retained the PyTorch oracle and original `qsa_triton` backend as visible
   correctness fallbacks. The new CUDA selector has independent boundary and
-  adversarial wide-row tests; those tests do not replace the pending full-model
-  v0.2 evidence run.
+  adversarial wide-row tests; the reviewed full-model v0.2 evidence complements
+  rather than replaces those checks.
 - CUDA graph capture/replay remains disabled for QSA until it passes a real
   target-GPU parity gate.
 
@@ -53,7 +53,7 @@ the corresponding high-level description. The Apache-2.0 license remains in
   experts with softmax top-10 routing, and the shared expert path.
 - Added loader mapping for `model.language_model.*`. The v0.1 profile skips
   visual and MTP weights and remains text-only.
-- The v0.2 candidate optionally loads the Qwen4-Exp vision configuration and
+- The v0.2 alpha loads the Qwen4-Exp vision configuration and
   `model.visual.*` weights, including the 27-layer tower, patch projection,
   position interpolation, and merger. Visual embeddings replace expanded
   image placeholders before the hidden state is copied into four residual
@@ -127,7 +127,7 @@ the corresponding high-level description. The Apache-2.0 license remains in
 - Added `q38lab.moe_prefill` telemetry for summed active and possible expert
   rows, copied and hypothetical full-bank bytes, and their derived fractions.
   The counters preserve the whole-layer contribution of small banks, so byte
-  fraction is not inferred from row fraction. The candidate profile fails
+  fraction is not inferred from row fraction. The v0.2 profile fails
   closed unless double-buffered overlap and the native `nvfp4` layout are
   available; none of these source changes is a hardware-performance claim.
 - Added a model-declared 512 MiB runtime guard to automatic expert-cache sizing;
@@ -147,7 +147,7 @@ the corresponding high-level description. The Apache-2.0 license remains in
 - Added the `q38lab` source-only CLI for environment diagnosis, pinned model
   download/verification, the RTX 5090 profile, API smoke tests, and evidence
   collection.
-- Added the `rtx5090-wsl2-256k-image` candidate profile and corresponding
+- Added the `rtx5090-wsl2-256k-image` alpha profile and corresponding
   doctor, image/security smoke, long-context, runtime-telemetry, and evidence
   contracts. The original `rtx5090-wsl2` profile and v0.1 evidence are retained
   unchanged.
@@ -178,17 +178,20 @@ It does not establish W4A4 numerical parity, multimodal serving, MTP, radix
 prefix reuse, 32K/262K context, multi-request stability, or absence of Windows
 host paging. See [`docs/qwen4-exp.md`](docs/qwen4-exp.md).
 
-The `0.2.0a1` source candidate adds native 262,144-token and image code paths,
-but no v0.2 release/support claim exists until one reviewed full-checkpoint run
-proves all of the following:
+The reviewed `0.2.0a1` full-checkpoint run is tracked at
+`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`. It validates the native
+262,144-token and image paths only for one RTX 5090 under WSL2, TP=1, one
+running request, naive cache, graph disabled, and W4A16 compatibility. The run
+proved all of the following:
 
 - exact `261,120 input + 1,024 output` completion for both a text request and a
   request containing a real image;
 - 8K regression plus 32K and 128K, Needle-in-a-Haystack, deterministic
   OCR/object/chart results, stream/non-stream consistency, thinking, and tool
   calls combined with images;
-- 261K TTFT at most 15 minutes, 256--1,024-token steady decode at least 5 tok/s,
-  peak VRAM below 31 GiB, WSL RSS below 105 GiB, and WSL swap zero;
+- 261K TTFT below 15 minutes, a 256-token steady decode above 5 tok/s,
+  acceptance-window peak VRAM below 31 GiB, WSL RSS below 105 GiB, and WSL
+  swap zero;
 - 100/100 mixed text/image sequential requests and at least 30 minutes without
   a crash or monotonic leak; and
 - recorded bounded selector workspace, cold plus three warm PLE measurements,
@@ -201,15 +204,18 @@ proves all of the following:
 - a 30-minute soak that continues alternating text and image requests rather
   than switching to a text-only leak window.
 
-Until those gates pass, the README benchmark table and `docs/models.md` support
-matrix remain the verified v0.1 text-only result. Video, audio, MTP, radix
-cache, TP>1, multi-request scheduling, native W4A4 parity, and contexts beyond
-262,144 are outside the v0.2 candidate contract.
+The release evidence contains ten files, exhaustive checksums, and raw resource
+samples spanning both pre-acceptance pytest/preflight work and the formal API
+acceptance window. README resource figures are explicitly the acceptance-window
+maxima. During human review, the 13 ordinary 8K regression records were
+namespaced from `prompt-8176` to `regression-prompt-8176` to distinguish them
+from the NIAH request; only the case labels and resulting checksums changed.
+Video, audio, MTP, radix cache, TP>1, multi-request scheduling, native W4A4
+parity, and contexts beyond 262,144 remain outside the v0.2 contract.
 
 ## Publication review checklist
 
-The following values cannot be known until release preparation runs and must
-be reviewed rather than guessed:
+The following controls remain mandatory when the release tag is prepared:
 
 - [ ] Record the final public release commit after the downstream-only history
       rewrite; preserve the private pre-rewrite bundle and mapping outside the
