@@ -9,7 +9,7 @@ class FakeClient:
         self, stream_text: str = "q38lab-ready", *,
         disabled_reasoning: str | None = None,
         thinking_reasoning: str | None = "2+2 is 4",
-        tool_arguments: str = '{"city":"Hangzhou"}',
+        tool_arguments: str = '{"city":"Shanghai"}',
     ) -> None:
         self.stream_text = stream_text
         self.disabled_reasoning = disabled_reasoning
@@ -25,6 +25,8 @@ class FakeClient:
     def post_json(self, path, payload):
         assert path == "/v1/chat/completions"
         if payload.get("tools"):
+            assert payload.get("reasoning_effort") == "none"
+            assert payload.get("tool_choice") == "required"
             message = {
                 "content": None,
                 "tool_calls": [{
@@ -72,6 +74,6 @@ def test_smoke_requires_real_thinking_toggle_and_schema_valid_tool_arguments():
     assert not report.passed
     assert next(check for check in report.checks if check.name == "thinking").passed is False
 
-    report = run_smoke(FakeClient(tool_arguments='{"city":"Shanghai"}'))
+    report = run_smoke(FakeClient(tool_arguments='{"city":"Hangzhou"}'))
     assert not report.passed
     assert next(check for check in report.checks if check.name == "tool_call").passed is False

@@ -38,6 +38,9 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   requiring at least 30,000 MiB free before the fixed RTX 5090 profile starts.
 - OpenAI model metadata, FastAPI documentation, and server help identify this
   downstream instead of presenting it as the official FreeToken service.
+- The smoke tool-call gate disables thinking and uses the same required-tool
+  contract as the release harness, so its 128-token budget measures parsing
+  instead of being consumed by hidden reasoning.
 
 ### Known limitations
 

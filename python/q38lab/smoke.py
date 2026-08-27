@@ -166,7 +166,7 @@ def run_smoke(client: SmokeClient, *, requested_model: str | None = None) -> Smo
                 "messages": [
                     {
                         "role": "user",
-                        "content": "Call get_weather for Hangzhou; do not answer directly.",
+                        "content": "What is the weather in Shanghai?",
                     }
                 ],
                 "max_tokens": 128,
@@ -186,11 +186,8 @@ def run_smoke(client: SmokeClient, *, requested_model: str | None = None) -> Smo
                         },
                     }
                 ],
-                "tool_choice": {
-                    "type": "function",
-                    "function": {"name": "get_weather"},
-                },
-                "chat_template_kwargs": {"enable_thinking": True},
+                "tool_choice": "required",
+                "reasoning_effort": "none",
             },
         )
         tool_calls = _first_message(response).get("tool_calls")
@@ -206,9 +203,9 @@ def run_smoke(client: SmokeClient, *, requested_model: str | None = None) -> Smo
                 arguments = json.loads(arguments)
             except json.JSONDecodeError as exc:
                 raise ValueError("tool arguments are not valid JSON") from exc
-        if not isinstance(arguments, dict) or arguments.get("city") != "Hangzhou":
-            raise ValueError("tool arguments do not satisfy the required Hangzhou city schema")
-        checks.append(SmokeCheck("tool_call", True, "get_weather(Hangzhou) parsed"))
+        if not isinstance(arguments, dict) or arguments.get("city") != "Shanghai":
+            raise ValueError("tool arguments do not satisfy the required Shanghai city schema")
+        checks.append(SmokeCheck("tool_call", True, "get_weather(Shanghai) parsed"))
     except Exception as exc:
         checks.append(SmokeCheck("tool_call", False, str(exc)))
 
