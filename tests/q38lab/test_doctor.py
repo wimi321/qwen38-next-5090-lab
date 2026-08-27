@@ -64,3 +64,13 @@ def test_doctor_reports_swap_checkpoint_and_busy_port_failures():
     assert statuses["swap"] == "fail"
     assert statuses["checkpoint"] == "fail"
     assert statuses["port"] == "fail"
+
+
+def test_doctor_gpu_free_floor_allows_normal_wddm_reservation():
+    report = evaluate_doctor(replace(_ready_snapshot(), gpu_memory_free_mib=30_000))
+    statuses = {check.name: check.status for check in report.checks}
+    assert statuses["gpu_memory_available"] == "pass"
+
+    report = evaluate_doctor(replace(_ready_snapshot(), gpu_memory_free_mib=29_999))
+    statuses = {check.name: check.status for check in report.checks}
+    assert statuses["gpu_memory_available"] == "fail"

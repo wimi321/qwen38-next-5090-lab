@@ -17,6 +17,7 @@ from typing import Callable, Literal
 from .checkpoint import CheckpointVerificationError, verify_checkpoint_receipt
 
 GiB = 1024**3
+GPU_FREE_FLOOR_MIB = 30_000
 Status = Literal["pass", "warn", "fail"]
 
 
@@ -338,8 +339,9 @@ def evaluate_doctor(snapshot: DoctorSnapshot) -> DoctorReport:
     gpu_free = snapshot.gpu_memory_free_mib
     add(
         "gpu_memory_available",
-        "pass" if gpu_free is not None and gpu_free >= 30 * 1024 else "fail",
-        f"{gpu_free or 0} MiB free (expected at least 30720 MiB before launch)",
+        "pass" if gpu_free is not None and gpu_free >= GPU_FREE_FLOOR_MIB else "fail",
+        f"{gpu_free or 0} MiB free (expected at least {GPU_FREE_FLOOR_MIB} MiB "
+        "before launch; WDDM display reservation is allowed)",
     )
     capability = snapshot.compute_capability
     add(

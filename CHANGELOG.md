@@ -34,6 +34,8 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sizing.
 - uv installs on Linux x86_64 use the official SGLang v0.4.5 cu130 release
   wheel pinned by SHA-256, avoiding an ambiguous duplicate-hash index entry.
+- `q38lab doctor` accepts the measured WDDM display reservation while still
+  requiring at least 30,000 MiB free before the fixed RTX 5090 profile starts.
 
 ### Known limitations
 
