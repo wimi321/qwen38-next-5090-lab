@@ -64,6 +64,11 @@ jobs:
             'huggingface_hub>=1.5,<2' 'tqdm>=4.66,<5' 'msgpack>=1.1,<2' \
             'pyzmq>=27,<28' 'triton==3.6.0' 'pillow==12.3.0' \
             'fastapi>=0.115,<1' 'apache-tvm-ffi==0.1.13.post3'
+          # The selected CPU tests import flashlib's slot-cache constants. Its
+          # direct torch/triton/numpy dependencies are installed explicitly
+          # above; avoid resolving unrelated CUDA extras on a hosted CPU worker.
+          python -m pip install --disable-pip-version-check --no-deps \
+            'flashlib==0.3.0'
       - name: Run QSA, PLE, gated-residual, and loader CPU tests
         run: |
           python -m pytest -q \

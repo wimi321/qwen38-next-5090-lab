@@ -576,6 +576,18 @@ class ReleaseToolTests(unittest.TestCase):
             sorted(candidates[1:]),
         )
 
+    def test_cpu_oracle_workflow_installs_pinned_flashlib_without_cuda_extras(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        install = (
+            "python -m pip install --disable-pip-version-check --no-deps \\\n"
+            "            'flashlib==0.3.0'"
+        )
+        test_step = "Run QSA, PLE, gated-residual, and loader CPU tests"
+        self.assertIn(install, workflow)
+        self.assertLess(workflow.index(install), workflow.index(test_step))
+
     def test_release_workflow_binds_tag_version_runtime_and_source_only_assets(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "source-release.yml").read_text(encoding="utf-8")
         self.assertIn("ref: ${{ github.ref }}", workflow)
