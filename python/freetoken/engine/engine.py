@@ -526,12 +526,19 @@ class Engine:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
-        without a GPU. Reused by the Phase-2 runtime rebuild.
+        without a GPU. Manual cache geometry and idle-time resize validation are separate.
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        runtime_reserve = int(
+            getattr(config.model_config, "moe_auto_runtime_reserve_bytes", 0)
+        )
+        if runtime_reserve < 0:
+            raise ValueError("moe_auto_runtime_reserve_bytes must be non-negative")
+        # The model-declared guard is budget-only, not an allocation. Folding it into the
+        # fixed term applies it to startup auto-planning without changing manual geometry.
+        fixed_cache_size += state_pool_bytes(config) + runtime_reserve
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -649,9 +656,14 @@ class Engine:
                     # slack) and goes negative whenever the expert fill is exact --
                     # a greedy fill leaves no headroom for the measurement delta.
                     object.__setattr__(config, "num_page_override", pages)
+                runtime_reserve_mib = (
+                    getattr(config.model_config, "moe_auto_runtime_reserve_bytes", 0)
+                    / 2**20
+                )
                 logger.info_rank0(
                     f"--moe-cache-auto resolved moe_cache_size={size} "
-                    f"num_pages={pages} (prefill_overlap={overlap})"
+                    f"num_pages={pages} (prefill_overlap={overlap}, "
+                    f"runtime_reserve={runtime_reserve_mib:.0f} MiB)"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
             cache = OffloadMoeCache(

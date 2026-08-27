@@ -275,6 +275,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         has_swa_attention = False
         num_experts = 4
         num_moe_layers = 2  # total_experts = 8
+        moe_auto_runtime_reserve_bytes = 123_456
 
         def kv_cache_group_specs(self):
             return [KVCacheGroupSpec(
@@ -323,12 +324,39 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     cache_per_page, fixed, _, _ = MHAKVCache.kv_cost(StubConfig())
     expected = resolve_moe_cache_auto(
         baseline_free=10_000_000, weights_bytes=1_000_000, memory_ratio=0.9,
-        cache_per_page=cache_per_page, fixed_cache_size=fixed,
+        cache_per_page=cache_per_page, fixed_cache_size=fixed + 123_456,
         per_expert_bytes=expert_bytes_per_slot(StubBanks.sources),
         num_experts=4, total_experts=8, prefill_overlap=True,
         kv_reserve_tokens=0, page_size=16, quant_format="bf16",
     )
     assert (size, pages, overlap) == expected
+
+    # Generic models preserve the exact legacy result whether the new field is
+    # explicitly zero or absent (for lightweight third-party config objects).
+    StubModelConfig.moe_auto_runtime_reserve_bytes = 0
+    with_zero = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+    del StubModelConfig.moe_auto_runtime_reserve_bytes
+    with_missing = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
+    expected_without_reserve = resolve_moe_cache_auto(
+        baseline_free=10_000_000, weights_bytes=1_000_000, memory_ratio=0.9,
+        cache_per_page=cache_per_page, fixed_cache_size=fixed,
+        per_expert_bytes=expert_bytes_per_slot(StubBanks.sources),
+        num_experts=4, total_experts=8, prefill_overlap=True,
+        kv_reserve_tokens=0, page_size=16, quant_format="bf16",
+    )
+    assert with_zero == with_missing == expected_without_reserve
+
+
+def test_engine_rejects_a_negative_model_runtime_reserve():
+    from freetoken.engine.engine import Engine
+
+    engine = Engine.__new__(Engine)
+    engine._pool_cls = SimpleNamespace(kv_cost=lambda _config: (1, 0, 1, 0))
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(moe_auto_runtime_reserve_bytes=-1),
+    )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        engine._resolve_auto_moe_cache_size(config, SimpleNamespace())
 
 
 # ---------------------------------------------------------------------------

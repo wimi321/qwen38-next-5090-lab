@@ -351,6 +351,10 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # Optional safety guard deducted only from ``--moe-cache-auto``.  It leaves room for
+    # model-specific dynamic workspaces or a downstream peak-VRAM contract without changing
+    # the user's public memory-ratio setting.  Manual cache geometries remain untouched.
+    moe_auto_runtime_reserve_bytes: int = 0
 
     @property
     def is_moe(self) -> bool:

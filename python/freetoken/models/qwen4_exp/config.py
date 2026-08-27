@@ -15,6 +15,13 @@ from freetoken.models.config import (
 from .args import load_args
 
 
+# Formal 30-minute RTX 5090/WSL2 evidence showed the lazy MoE LRU approaching
+# full residency late in the soak and peaking at 31,940 MiB with the generic
+# auto budget.  Keep the public 0.89 profile contract while reserving enough
+# physical-commit headroom to remain below the strict 31 GiB release ceiling.
+_QWEN4_EXP_MOE_AUTO_RUNTIME_RESERVE_BYTES = 512 * 2**20
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
     args = load_args(text)
@@ -103,6 +110,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         qwen4_args=args,
+        moe_auto_runtime_reserve_bytes=_QWEN4_EXP_MOE_AUTO_RUNTIME_RESERVE_BYTES,
     )
 
 

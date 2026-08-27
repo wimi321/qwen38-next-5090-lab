@@ -181,6 +181,7 @@ def test_parse_target_revision_geometry_and_text_only_policy():
     assert config.rotary_config.rotary_dim == 64
     assert config.rotary_config.base == 10_000_000.0
     assert config.expert_quant == "nvfp4"
+    assert config.moe_auto_runtime_reserve_bytes == 512 * 2**20
     assert (config.attn_quant, config.dense_quant, config.lm_head_quant) == (
         "none",
         "none",

@@ -60,6 +60,9 @@ the corresponding high-level description. The Apache-2.0 license remains in
   router.
 - Added WSL-aware host pin-budget resolution and an automatic pageable-layer
   selection for the pinned 135 GB checkpoint.
+- Added a model-declared 512 MiB runtime guard to automatic expert-cache sizing;
+  the public profile remains at `memory-ratio=0.89`, while late LRU fill retains
+  headroom for the preview's strict peak-VRAM gate.
 - Registered the text-only model and added the `qsa_triton` launch surface.
 - Preserves packed NVFP4 routed weights while executing BF16 activations. This
   is W4A16 compatibility, not native checkpoint W4A4 parity.
