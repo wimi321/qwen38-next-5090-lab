@@ -61,6 +61,46 @@ def _config():
     )
 
 
+def _production_kv_config():
+    """Qwen4-Exp QSA head geometry with a single layer for integration tests."""
+    rotary = RotaryConfig(
+        head_dim=256, rotary_dim=64, max_position=262144, base=1e7, scaling=None
+    )
+    return ModelConfig(
+        num_layers=1,
+        num_qo_heads=24,
+        num_kv_heads=2,
+        head_dim=256,
+        hidden_size=2560,
+        vocab_size=16,
+        intermediate_size=16,
+        rms_norm_eps=1e-6,
+        rotary_config=rotary,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        norm_topk_prob=False,
+        model_type="test_qsa_production_kv",
+        architectures=["TestQSAProductionKV"],
+        attention_groups=(
+            QSAAttentionGroupConfig(
+                name="qsa",
+                layer_ids=(0,),
+                num_kv_heads=2,
+                head_dim=256,
+                rotary_config=rotary,
+                indexer_n_heads=4,
+                indexer_kv_heads=1,
+                indexer_head_dim=128,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
+            ),
+        ),
+    )
+
+
 def test_backend_uses_qsa_selection_over_paged_rows(monkeypatch):
     config = _config()
     pool = QSAKVCache(
@@ -201,3 +241,106 @@ def test_vectorized_backend_prefill_decode_and_fixed_graph_metadata(monkeypatch)
     backend.prepare_metadata(replay)
     backend.prepare_for_replay(replay)
     assert replay.attn_metadata.rows.data_ptr() == backend._rows_buf.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qsa_triton_backend_stores_production_headed_kv_prefill_and_decode(monkeypatch):
+    config = _production_kv_config()
+    device = torch.device("cuda")
+    pool = QSAKVCache(
+        num_kv_heads=2,
+        num_layers=1,
+        head_dim=256,
+        num_pages=16,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device=device,
+        index_head_dim=128,
+        layer_ids=(0,),
+    )
+    physical = torch.arange(2, 13, dtype=torch.int32, device=device)
+    page_table = torch.zeros(1, 16, dtype=torch.int32, device=device)
+    page_table[0, : physical.numel()] = physical
+    ctx = SimpleNamespace(kv_cache=pool, page_table=page_table)
+    monkeypatch.setattr("freetoken.attention.qsa_triton.get_global_ctx", lambda: ctx)
+    backend = QSATritonBackend(config)
+
+    tokens = torch.arange(11, dtype=torch.bfloat16, device=device)
+    key = (
+        tokens[:, None, None]
+        .expand(-1, 2, 256)
+        .contiguous()
+    )
+    value = (
+        tokens[:, None, None]
+        .add(torch.tensor([0, 10], dtype=torch.bfloat16, device=device)[None, :, None])
+        .expand(-1, -1, 256)
+        .contiguous()
+    )
+    query = torch.zeros(11, 24, 256, dtype=torch.bfloat16, device=device)
+    index_q = torch.zeros(11, 4, 128, dtype=torch.bfloat16, device=device)
+    index_k = torch.zeros(11, 128, dtype=torch.bfloat16, device=device)
+    transform = lambda pooled, _starts: pooled
+
+    prefill_req = SimpleNamespace(extend_len=10, device_len=10, table_idx=0)
+    prefill = SimpleNamespace(
+        reqs=[prefill_req],
+        padded_reqs=[prefill_req],
+        phase="prefill",
+        positions=torch.arange(10, dtype=torch.int32, device=device),
+        out_loc=physical[:10],
+    )
+    backend.prepare_metadata(prefill)
+    prefill_output = backend.qsa_forward(
+        query[:10],
+        key[:10],
+        value[:10],
+        index_q[:10],
+        index_k[:10],
+        0,
+        prefill,
+        index_key_transform=transform,
+    )
+
+    expected_prefill = torch.cat(
+        (
+            torch.full((12, 256), 4.5, dtype=torch.bfloat16, device=device),
+            torch.full((12, 256), 14.5, dtype=torch.bfloat16, device=device),
+        )
+    )
+    assert torch.allclose(prefill_output[-1], expected_prefill, atol=5e-2, rtol=0)
+    cached_key = pool.k_cache(0).view(-1, 2, 256)
+    cached_value = pool.v_cache(0).view(-1, 2, 256)
+    assert torch.equal(cached_key.index_select(0, physical[:10].long()), key[:10])
+    assert torch.equal(cached_value.index_select(0, physical[:10].long()), value[:10])
+
+    decode_req = SimpleNamespace(extend_len=1, device_len=11, table_idx=0)
+    decode = SimpleNamespace(
+        reqs=[decode_req],
+        padded_reqs=[decode_req],
+        phase="decode",
+        positions=torch.tensor([10], dtype=torch.int32, device=device),
+        out_loc=physical[10:],
+        active_table_idx=None,
+    )
+    backend.prepare_metadata(decode)
+    decode_output = backend.qsa_forward(
+        query[10:],
+        key[10:],
+        value[10:],
+        index_q[10:],
+        index_k[10:],
+        0,
+        decode,
+        index_key_transform=transform,
+    )
+
+    expected_decode = torch.cat(
+        (
+            torch.full((12, 256), 5, dtype=torch.bfloat16, device=device),
+            torch.full((12, 256), 15, dtype=torch.bfloat16, device=device),
+        )
+    )
+    assert torch.allclose(decode_output[0], expected_decode, atol=5e-2, rtol=0)
+    assert torch.equal(cached_key[physical[10].long()], key[10])
+    assert torch.equal(cached_value[physical[10].long()], value[10])
