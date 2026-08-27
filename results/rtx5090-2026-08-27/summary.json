@@ -166,7 +166,7 @@
   "run_id": "rtx5090-2026-08-27",
   "schema_version": "1.0",
   "source": {
-    "release_compatible": false,
+    "release_compatible": true,
     "runtime_tree_sha256": "ed0c6d26dd0c4c57015b2960015f9a92162304d53a370c09e54d23950b3ceb22",
     "upstream_base": "9ef3651309fe4058672f2cc92069238dea06be1b",
     "validated_runtime_commit": "643bcd6a82ebb513e6eb8a9815332a5ba55fed07"
