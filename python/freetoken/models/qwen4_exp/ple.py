@@ -34,6 +34,15 @@ from torch import nn
 from freetoken.layers import BaseOP, LinearReplicated
 
 from .hyperconnection import Qwen4ExpGroupedRMSNorm
+from .ple_io import (
+    DEFAULT_CACHE_BYTES,
+    DEFAULT_MAX_BATCH_PAGES,
+    DEFAULT_QUEUE_DEPTH,
+    DirectIOPageReader,
+    IoUringPageReader,
+    PLEStreamingUnavailable,
+    require_production_ple_streaming,
+)
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -344,6 +353,61 @@ class _SafeTensorInfo:
         return math.prod(self.shape)
 
 
+def _read_safetensors_infos(
+    path: str | os.PathLike[str], *, max_header_bytes: int
+) -> tuple[dict[str, _SafeTensorInfo], int]:
+    """Read safetensors metadata without mapping or materialising its payload."""
+
+    path_string = str(Path(path))
+    file_size = os.path.getsize(path_string)
+    with open(path_string, "rb") as handle:
+        raw_length = handle.read(8)
+        if len(raw_length) != 8:
+            raise ValueError(f"{path_string!r} is too small to be a safetensors file")
+        header_len = struct.unpack("<Q", raw_length)[0]
+        if header_len <= 0 or header_len > max_header_bytes:
+            raise ValueError(f"invalid safetensors header length {header_len}")
+        raw_header = handle.read(header_len)
+    if len(raw_header) != header_len:
+        raise ValueError("safetensors header extends beyond the file")
+    data_start = 8 + header_len
+    try:
+        header = json.loads(raw_header.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid safetensors JSON header: {exc}") from exc
+
+    infos: dict[str, _SafeTensorInfo] = {}
+    for name, metadata in header.items():
+        if name == "__metadata__":
+            continue
+        try:
+            dtype = str(metadata["dtype"])
+            shape = tuple(int(dim) for dim in metadata["shape"])
+            relative_start, relative_end = (
+                int(offset) for offset in metadata["data_offsets"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid metadata for tensor {name!r}") from exc
+        if dtype not in _SAFE_DTYPE_INFO:
+            raise ValueError(f"unsupported safetensors dtype {dtype!r} for {name!r}")
+        if any(dim < 0 for dim in shape):
+            raise ValueError(f"negative dimension in tensor {name!r}: {shape}")
+        if relative_start < 0 or relative_end < relative_start:
+            raise ValueError(f"invalid data offsets for tensor {name!r}")
+        item_size = _SAFE_DTYPE_INFO[dtype][1]
+        expected = math.prod(shape) * item_size
+        if relative_end - relative_start != expected:
+            raise ValueError(
+                f"tensor {name!r} payload has {relative_end - relative_start} bytes, "
+                f"expected {expected}"
+            )
+        start, end = data_start + relative_start, data_start + relative_end
+        if end > file_size:
+            raise ValueError(f"tensor {name!r} extends beyond the file")
+        infos[name] = _SafeTensorInfo(dtype, shape, start, end, item_size)
+    return infos, file_size
+
+
 _SAFE_DTYPE_INFO: dict[str, tuple[torch.dtype | None, int]] = {
     "BOOL": (torch.bool, 1),
     "U8": (torch.uint8, 1),
@@ -480,6 +544,14 @@ class SafetensorsMmapRowBank:
     @property
     def row_width(self) -> int:
         return self._weight_info.shape[1]
+
+    @property
+    def weight_dtype(self) -> str:
+        return self._weight_info.dtype
+
+    @property
+    def has_embedded_scale(self) -> bool:
+        return self._scale_info is not None
 
     @property
     def mapped_bytes(self) -> int:
@@ -642,6 +714,45 @@ class SafetensorsMmapRowBank:
         scale_width = math.prod(info.shape[1:]) if len(info.shape) > 1 else 1
         return self._read_unique_rows(info, sorted_rows, scale_width)
 
+    def _read_raw_unique_rows(self, sorted_rows: list[int]) -> torch.Tensor:
+        info = self._weight_info
+        if info.dtype not in {"F8_E4M3", "F8_E4M3FN", "F8_E5M2"}:
+            raise TypeError(f"raw staging requires FP8 weights, got {info.dtype}")
+        import numpy as np
+
+        mapped = np.ndarray(
+            (info.shape[0], self.row_width),
+            dtype=np.uint8,
+            buffer=self._mapping,
+            offset=info.start,
+        )
+        selected = np.take(
+            mapped, np.asarray(sorted_rows, dtype=np.int64), axis=0
+        )
+        self._payload_bytes_read += len(sorted_rows) * self.row_width
+        return torch.from_numpy(selected)
+
+    def read_raw_rows(
+        self, indices: torch.Tensor | Sequence[int]
+    ) -> torch.Tensor:
+        """Return requested FP8 encodings as CPU uint8 without decoding."""
+
+        if self.closed:
+            raise RuntimeError("cannot read from a closed safetensors row bank")
+        indices_tensor = torch.as_tensor(indices, dtype=torch.long, device="cpu")
+        original_shape = tuple(indices_tensor.shape)
+        flat = indices_tensor.reshape(-1)
+        if flat.numel() == 0:
+            return torch.empty((*original_shape, self.row_width), dtype=torch.uint8)
+        minimum, maximum = flat.min().item(), flat.max().item()
+        if minimum < 0 or maximum >= self.row_count:
+            raise IndexError(
+                f"row index range [{minimum}, {maximum}] is outside [0, {self.row_count})"
+            )
+        unique_rows, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+        raw = self._read_raw_unique_rows(unique_rows.tolist())
+        return raw.index_select(0, inverse).reshape(*original_shape, self.row_width)
+
     def read_rows(
         self,
         indices: torch.Tensor | Sequence[int],
@@ -709,6 +820,199 @@ class SafetensorsMmapRowBank:
             mapping.close()
         if file is not None and not file.closed:
             file.close()
+
+
+class SafetensorsDirectRowBank(SafetensorsMmapRowBank):
+    """Safetensors row bank backed by the aligned O_DIRECT debug reader.
+
+    Header parsing uses an ordinary buffered descriptor because safetensors
+    headers are small and unaligned.  Tensor payload reads exclusively use the
+    aligned reader.  This class is a correctness/fallback building block; the
+    256K release profile requires the separate native io_uring extension.
+    """
+
+    _reader_type = DirectIOPageReader
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        tensor_name: str,
+        *,
+        scale_name: str | None = None,
+        default_dtype: torch.dtype = torch.float32,
+        cache_capacity_bytes: int = DEFAULT_CACHE_BYTES,
+        queue_depth: int = DEFAULT_QUEUE_DEPTH,
+        max_batch_pages: int = DEFAULT_MAX_BATCH_PAGES,
+    ) -> None:
+        self.path = str(Path(path))
+        self.tensor_name = tensor_name
+        self.scale_name = scale_name
+        self.default_dtype = default_dtype
+        self._payload_bytes_read = 0
+        self._infos, self._file_size = _read_safetensors_infos(
+            self.path, max_header_bytes=self._MAX_HEADER_BYTES
+        )
+        self._weight_info = self._require_tensor(tensor_name)
+        if len(self._weight_info.shape) != 2:
+            raise ValueError(
+                f"{tensor_name!r} must have shape [rows, width], "
+                f"got {self._weight_info.shape}"
+            )
+        self._scale_info = self._require_tensor(scale_name) if scale_name else None
+        self._validate_scale_shape()
+        self._reader = self._reader_type(
+            self.path,
+            cache_capacity_bytes=cache_capacity_bytes,
+            queue_depth=queue_depth,
+            max_batch_pages=max_batch_pages,
+        )
+
+    @property
+    def mapped_bytes(self) -> int:
+        return 0
+
+    @property
+    def closed(self) -> bool:
+        return self._reader.closed
+
+    def _read_unique_rows(
+        self,
+        info: _SafeTensorInfo,
+        sorted_rows: list[int],
+        row_width: int,
+    ) -> torch.Tensor:
+        output = torch.empty((len(sorted_rows), row_width), dtype=torch.float32)
+        row_bytes = row_width * info.item_size
+        for out_start, out_end, row_start, row_end in self._contiguous_runs(sorted_rows):
+            byte_start = info.start + row_start * row_bytes
+            byte_count = (row_end - row_start) * row_bytes
+            payload = bytearray(self._reader.read(byte_start, byte_count))
+            self._payload_bytes_read += byte_count
+            decoded = self._decode_bytes(payload, info.dtype).reshape(
+                row_end - row_start, row_width
+            )
+            output[out_start:out_end].copy_(decoded)
+        return output
+
+    def _read_scale_rows(self, sorted_rows: list[int]) -> torch.Tensor | None:
+        info = self._scale_info
+        if info is None:
+            return None
+        if info.numel == 1:
+            payload = bytearray(self._reader.read(info.start, info.end - info.start))
+            self._payload_bytes_read += len(payload)
+            return self._decode_bytes(payload, info.dtype).reshape(1, 1)
+        scale_width = math.prod(info.shape[1:]) if len(info.shape) > 1 else 1
+        return self._read_unique_rows(info, sorted_rows, scale_width)
+
+    def _read_raw_unique_rows(self, sorted_rows: list[int]) -> torch.Tensor:
+        info = self._weight_info
+        if info.dtype not in {"F8_E4M3", "F8_E4M3FN", "F8_E5M2"}:
+            raise TypeError(f"raw staging requires FP8 weights, got {info.dtype}")
+        output = torch.empty((len(sorted_rows), self.row_width), dtype=torch.uint8)
+        for out_start, out_end, row_start, row_end in self._contiguous_runs(sorted_rows):
+            byte_start = info.start + row_start * self.row_width
+            byte_count = (row_end - row_start) * self.row_width
+            payload = bytearray(self._reader.read(byte_start, byte_count))
+            self._payload_bytes_read += byte_count
+            output[out_start:out_end].copy_(
+                torch.frombuffer(payload, dtype=torch.uint8).reshape(
+                    row_end - row_start, self.row_width
+                )
+            )
+        return output
+
+    def prefetch_rows(
+        self, indices: torch.Tensor | Sequence[int]
+    ):
+        """Queue unique row spans for the next PLE chunk."""
+
+        rows = torch.unique(
+            torch.as_tensor(indices, dtype=torch.long, device="cpu").reshape(-1),
+            sorted=True,
+        )
+        if rows.numel() == 0:
+            return self._reader.prefetch(())
+        if rows[0].item() < 0 or rows[-1].item() >= self.row_count:
+            raise IndexError(f"row index outside [0, {self.row_count})")
+        spans = []
+        row_bytes = self.row_width * self._weight_info.item_size
+        for _, _, first, end in self._contiguous_runs(rows.tolist()):
+            spans.append(
+                (self._weight_info.start + first * row_bytes, (end - first) * row_bytes)
+            )
+        return self._reader.prefetch(spans)
+
+    def telemetry(self) -> dict[str, int]:
+        value = self._reader.telemetry().as_dict()
+        value["payload_bytes_read"] = self._payload_bytes_read
+        return value
+
+    def close(self) -> None:
+        self._reader.close()
+
+    def __del__(self) -> None:
+        reader = getattr(self, "_reader", None)
+        if reader is not None and not reader.closed:
+            reader.close()
+
+
+class SafetensorsIoUringRowBank(SafetensorsDirectRowBank):
+    """Production safetensors bank using the bundled native io_uring reader."""
+
+    _reader_type = IoUringPageReader
+
+    def _read_unique_rows(
+        self,
+        info: _SafeTensorInfo,
+        sorted_rows: list[int],
+        row_width: int,
+    ) -> torch.Tensor:
+        output = torch.empty((len(sorted_rows), row_width), dtype=torch.float32)
+        row_bytes = row_width * info.item_size
+        runs = list(self._contiguous_runs(sorted_rows))
+        spans = [
+            (
+                info.start + row_start * row_bytes,
+                (row_end - row_start) * row_bytes,
+            )
+            for _, _, row_start, row_end in runs
+        ]
+        payloads = self._reader.read_many(spans)
+        for (out_start, out_end, row_start, row_end), payload in zip(
+            runs, payloads, strict=True
+        ):
+            self._payload_bytes_read += len(payload)
+            decoded = self._decode_bytes(bytearray(payload), info.dtype).reshape(
+                row_end - row_start, row_width
+            )
+            output[out_start:out_end].copy_(decoded)
+        return output
+
+    def _read_raw_unique_rows(self, sorted_rows: list[int]) -> torch.Tensor:
+        info = self._weight_info
+        if info.dtype not in {"F8_E4M3", "F8_E4M3FN", "F8_E5M2"}:
+            raise TypeError(f"raw staging requires FP8 weights, got {info.dtype}")
+        output = torch.empty((len(sorted_rows), self.row_width), dtype=torch.uint8)
+        runs = list(self._contiguous_runs(sorted_rows))
+        spans = [
+            (
+                info.start + row_start * self.row_width,
+                (row_end - row_start) * self.row_width,
+            )
+            for _, _, row_start, row_end in runs
+        ]
+        payloads = self._reader.read_many(spans)
+        for (out_start, out_end, row_start, row_end), payload in zip(
+            runs, payloads, strict=True
+        ):
+            self._payload_bytes_read += len(payload)
+            output[out_start:out_end].copy_(
+                torch.frombuffer(bytearray(payload), dtype=torch.uint8).reshape(
+                    row_end - row_start, self.row_width
+                )
+            )
+        return output
 
 
 class ConcatenatedRowBank:
@@ -842,6 +1146,48 @@ def _load_small_safetensors_tensor(
         return handle.get_tensor(tensor_name).float()
 
 
+class _PinnedFP8DoubleBuffer:
+    """Two reusable host buffers whose CUDA copies never race reuse."""
+
+    def __init__(self) -> None:
+        self._buffers: list[torch.Tensor | None] = [None, None]
+        self._events: list[torch.cuda.Event | None] = [None, None]
+        self._next = 0
+        import threading
+
+        self._lock = threading.Lock()
+
+    def acquire(self, rows: int, width: int) -> tuple[torch.Tensor, int]:
+        required = rows * width
+        with self._lock:
+            slot = self._next
+            self._next = 1 - self._next
+            event = self._events[slot]
+            if event is not None:
+                event.synchronize()
+                self._events[slot] = None
+            buffer = self._buffers[slot]
+            if buffer is None or buffer.numel() < required:
+                buffer = torch.empty(required, dtype=torch.uint8, pin_memory=True)
+                self._buffers[slot] = buffer
+            return buffer[:required].view(rows, width), slot
+
+    def mark_copy_enqueued(self, slot: int) -> None:
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        with self._lock:
+            self._events[slot] = event
+
+    def close(self) -> None:
+        with self._lock:
+            events = tuple(event for event in self._events if event is not None)
+        for event in events:
+            event.synchronize()
+        with self._lock:
+            self._events = [None, None]
+            self._buffers = [None, None]
+
+
 class ShardedSafetensorsMmapRowBank:
     """One logical table backed by row-sharded safetensors FP8 tensors.
 
@@ -871,6 +1217,10 @@ class ShardedSafetensorsMmapRowBank:
         weight_scale_name: str | None = None,
         default_dtype: torch.dtype = torch.bfloat16,
         pin_memory: bool = False,
+        io_backend: str | None = None,
+        cache_capacity_bytes: int | None = None,
+        queue_depth: int | None = None,
+        max_batch_pages: int | None = None,
     ) -> None:
         if not shards:
             raise ValueError("ShardedSafetensorsMmapRowBank requires at least one shard")
@@ -889,15 +1239,86 @@ class ShardedSafetensorsMmapRowBank:
             else SafetensorsRowShard(shard[0], shard[1])
             for shard in shards
         )
+        backend = (
+            io_backend
+            or os.getenv("FREETOKEN_PLE_IO_BACKEND", "mmap")
+        ).strip().lower()
+        def env_int(name: str, value: int | None, default: int, minimum: int) -> int:
+            raw = os.getenv(name) if value is None else None
+            try:
+                resolved = int(raw) if raw not in {None, ""} else (
+                    default if value is None else int(value)
+                )
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+            if resolved < minimum:
+                raise ValueError(f"{name} must be at least {minimum}, got {resolved}")
+            return resolved
+
+        cache_capacity_bytes = env_int(
+            "FREETOKEN_PLE_CACHE_BYTES",
+            cache_capacity_bytes,
+            DEFAULT_CACHE_BYTES,
+            0,
+        )
+        queue_depth = env_int(
+            "FREETOKEN_PLE_QUEUE_DEPTH", queue_depth, DEFAULT_QUEUE_DEPTH, 1
+        )
+        max_batch_pages = env_int(
+            "FREETOKEN_PLE_MAX_BATCH_PAGES",
+            max_batch_pages,
+            DEFAULT_MAX_BATCH_PAGES,
+            1,
+        )
+        if max_batch_pages > DEFAULT_MAX_BATCH_PAGES:
+            raise ValueError(
+                "FREETOKEN_PLE_MAX_BATCH_PAGES must not exceed "
+                f"{DEFAULT_MAX_BATCH_PAGES}"
+            )
+        if backend not in {"mmap", "direct_debug", "io_uring_odirect"}:
+            raise ValueError(
+                "PLE io_backend must be mmap, direct_debug or io_uring_odirect, "
+                f"got {backend!r}"
+            )
+        if backend == "io_uring_odirect":
+            # Do not pretend that the thread-pool debug backend is io_uring.
+            require_production_ple_streaming(specs[0].path)
+            bank_type = SafetensorsIoUringRowBank
+        elif backend == "direct_debug":
+            bank_type = SafetensorsDirectRowBank
+        else:
+            bank_type = SafetensorsMmapRowBank
+
+        # ``cache_capacity_bytes`` is the budget for the *logical* PLE bank,
+        # not for each of the 128 checkpoint tensors.  Giving every native
+        # reader the full 4 GiB profile value would permit a 512 GiB aggregate
+        # LRU and defeat the no-swap WSL memory contract.  Split the exact
+        # global budget across readers (including any remainder) instead.
+        cache_base, cache_remainder = divmod(cache_capacity_bytes, len(specs))
+        per_reader_cache = tuple(
+            cache_base + (1 if index < cache_remainder else 0)
+            for index in range(len(specs))
+        )
+
         opened: list[SafetensorsMmapRowBank] = []
         try:
-            for spec in specs:
+            for spec_index, spec in enumerate(specs):
+                extra = (
+                    {
+                        "cache_capacity_bytes": per_reader_cache[spec_index],
+                        "queue_depth": queue_depth,
+                        "max_batch_pages": max_batch_pages,
+                    }
+                    if backend != "mmap"
+                    else {}
+                )
                 opened.append(
-                    SafetensorsMmapRowBank(
+                    bank_type(
                         spec.path,
                         spec.tensor_name,
                         scale_name=spec.scale_name,
                         default_dtype=torch.float32,
+                        **extra,
                     )
                 )
             widths = {bank.row_width for bank in opened}
@@ -914,6 +1335,13 @@ class ShardedSafetensorsMmapRowBank:
         self.banks = tuple(opened)
         self.default_dtype = default_dtype
         self.pin_memory = pin_memory
+        self.io_backend = backend
+        self.cache_capacity_bytes = int(cache_capacity_bytes)
+        self.queue_depth = int(queue_depth)
+        self.max_batch_pages = int(max_batch_pages)
+        self._fp8_staging = _PinnedFP8DoubleBuffer() if pin_memory else None
+        self._staged_fp8_bytes = 0
+        self._gpu_decoded_rows = 0
         self._row_offsets = tuple(
             itertools.accumulate((bank.row_count for bank in self.banks), initial=0)
         )
@@ -958,6 +1386,108 @@ class ShardedSafetensorsMmapRowBank:
     def closed(self) -> bool:
         return self._closed
 
+    def telemetry(self) -> dict[str, object]:
+        children = []
+        for bank in self.banks:
+            callback = getattr(bank, "telemetry", None)
+            children.append(callback() if callback is not None else {})
+        return {
+            "backend": self.io_backend,
+            "payload_bytes_read": self.payload_bytes_read,
+            "mapped_bytes": self.mapped_bytes,
+            "cache_capacity_bytes": self.cache_capacity_bytes,
+            "queue_depth": self.queue_depth,
+            "max_batch_pages": self.max_batch_pages,
+            "staged_fp8_bytes": self._staged_fp8_bytes,
+            "gpu_decoded_rows": self._gpu_decoded_rows,
+            "shards": children,
+        }
+
+    def prefetch_rows(self, indices: torch.Tensor | Sequence[int]):
+        """Prefetch direct-reader rows, grouped by physical shard.
+
+        mmap has no asynchronous prefetch contract and returns an empty tuple.
+        The production native bank is expected to implement the same method.
+        """
+
+        if self._closed:
+            raise RuntimeError("cannot prefetch from a closed sharded row bank")
+        flat = torch.unique(
+            torch.as_tensor(indices, dtype=torch.long, device="cpu").reshape(-1),
+            sorted=True,
+        )
+        if flat.numel() and (flat[0].item() < 0 or flat[-1].item() >= self.row_count):
+            raise IndexError(f"row index outside [0, {self.row_count})")
+        handles = []
+        for shard_idx, bank in enumerate(self.banks):
+            callback = getattr(bank, "prefetch_rows", None)
+            if callback is None:
+                continue
+            start, end = self._row_offsets[shard_idx : shard_idx + 2]
+            local = flat[(flat >= start) & (flat < end)] - start
+            if local.numel():
+                handles.append(callback(local))
+        return tuple(handles)
+
+    def _can_gpu_decode_fp8(self, target_device: torch.device) -> bool:
+        return bool(
+            target_device.type == "cuda"
+            and self.pin_memory
+            and self._fp8_staging is not None
+            and all(
+                getattr(bank, "weight_dtype", None)
+                in {"F8_E4M3", "F8_E4M3FN", "F8_E5M2"}
+                and not getattr(bank, "has_embedded_scale", True)
+                and callable(getattr(bank, "read_raw_rows", None))
+                for bank in self.banks
+            )
+            and len({getattr(bank, "weight_dtype", None) for bank in self.banks}) == 1
+        )
+
+    def _read_rows_gpu_fp8(
+        self,
+        unique_rows: torch.Tensor,
+        inverse: torch.Tensor,
+        original_shape: tuple[int, ...],
+        *,
+        target_dtype: torch.dtype,
+        target_device: torch.device,
+    ) -> torch.Tensor:
+        assert self._fp8_staging is not None
+        staging, slot = self._fp8_staging.acquire(unique_rows.numel(), self.row_width)
+        unique_scales = torch.empty(unique_rows.numel(), dtype=torch.float32)
+        for shard_idx, bank in enumerate(self.banks):
+            start, end = self._row_offsets[shard_idx : shard_idx + 2]
+            positions = torch.nonzero(
+                (unique_rows >= start) & (unique_rows < end), as_tuple=False
+            ).flatten()
+            if positions.numel() == 0:
+                continue
+            local_rows = unique_rows.index_select(0, positions) - start
+            raw = bank.read_raw_rows(local_rows).reshape(-1, self.row_width)
+            staging.index_copy_(0, positions, raw)
+            scale = self._weight_scales[
+                0 if self._weight_scales.numel() == 1 else shard_idx
+            ]
+            unique_scales.index_fill_(0, positions, float(scale))
+
+        raw_device = staging.to(target_device, non_blocking=True)
+        scale_device = unique_scales.pin_memory().to(target_device, non_blocking=True)
+        inverse_device = inverse.pin_memory().to(target_device, non_blocking=True)
+        self._fp8_staging.mark_copy_enqueued(slot)
+        dtype_name = str(getattr(self.banks[0], "weight_dtype"))
+        lut = _fp8_decode_lut(dtype_name).to(target_device)
+        decoded = lut.index_select(0, raw_device.reshape(-1).long()).reshape(
+            unique_rows.numel(), self.row_width
+        )
+        decoded.mul_(scale_device.unsqueeze(1))
+        values = decoded.index_select(0, inverse_device).reshape(
+            *original_shape, self.row_width
+        )
+        self._staged_fp8_bytes += staging.numel()
+        self._gpu_decoded_rows += unique_rows.numel()
+        return values.to(dtype=target_dtype)
+
     def read_rows(
         self,
         indices: torch.Tensor | Sequence[int],
@@ -992,6 +1522,14 @@ class ShardedSafetensorsMmapRowBank:
             )
 
         unique_rows, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+        if self._can_gpu_decode_fp8(target_device):
+            return self._read_rows_gpu_fp8(
+                unique_rows,
+                inverse,
+                original_shape,
+                target_dtype=target_dtype,
+                target_device=target_device,
+            )
         unique_values = torch.empty(
             (unique_rows.numel(), self.row_width), dtype=torch.float32
         )
@@ -1027,6 +1565,9 @@ class ShardedSafetensorsMmapRowBank:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        staging = getattr(self, "_fp8_staging", None)
+        if staging is not None:
+            staging.close()
         first_error: BaseException | None = None
         for bank in reversed(getattr(self, "banks", ())):
             try:
@@ -1280,6 +1821,49 @@ class Qwen4ExpPLELayer(BaseOP):
         output = gated_value_flat + conv_output
         return output, next_conv_state
 
+    def _prefetch_next_prompt_chunk(
+        self,
+        req,
+        next_token_history: torch.Tensor,
+    ) -> None:
+        """Hash and queue the next prompt chunk while GPU layers run.
+
+        ``ChunkedReq.input_ids`` stops at the current prefill boundary.  The
+        prefill manager therefore attaches a shared view of the complete CPU
+        prompt as ``ple_prefetch_input_ids``.  No rows are materialized here:
+        the native bank submits sparse page runs into io_uring and warms its
+        bounded LRU for the following scheduler turn.
+        """
+
+        # The synchronous read for this chunk necessarily passed through every
+        # physical bank used by the previous look-ahead, so those handles no
+        # longer need to keep request-owned references alive.
+        req.ple_prefetch_handles = ()
+        full_prompt = getattr(req, "ple_prefetch_input_ids", None)
+        if full_prompt is None:
+            return
+        start = int(req.device_len)
+        total = int(full_prompt.numel())
+        if start >= total:
+            req.ple_prefetch_input_ids = None
+            return
+        chunk_size = max(1, int(req.extend_len))
+        end = min(total, start + chunk_size)
+        future_ids = full_prompt[start:end].reshape(1, -1)
+        row_ids, _ = self.ple_embedding.hasher(
+            future_ids, next_token_history
+        )
+        prefetch = getattr(self.ple_embedding.row_bank, "prefetch_rows", None)
+        if not callable(prefetch):
+            return
+        handles = prefetch(row_ids)
+        if handles is None:
+            req.ple_prefetch_handles = ()
+        elif isinstance(handles, tuple):
+            req.ple_prefetch_handles = handles
+        else:
+            req.ple_prefetch_handles = (handles,)
+
     def stage_decode_batch(
         self,
         batch,
@@ -1484,6 +2068,7 @@ class Qwen4ExpPLELayer(BaseOP):
             )
             assert next_state.token_history is not None
             assert next_state.conv_state is not None
+            self._prefetch_next_prompt_chunk(req, next_state.token_history)
             outputs.append(output.squeeze(0))
             next_histories.append(next_state.token_history[0])
             next_conv_states.append(next_state.conv_state[0])
@@ -1510,6 +2095,8 @@ __all__ = [
     "Qwen4ExpNGramHasher",
     "Qwen4ExpPLELayer",
     "ReadonlyRowBank",
+    "SafetensorsDirectRowBank",
+    "SafetensorsIoUringRowBank",
     "SafetensorsMmapRowBank",
     "SafetensorsRowShard",
     "ShardedSafetensorsMmapRowBank",

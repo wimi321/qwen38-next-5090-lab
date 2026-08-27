@@ -281,6 +281,52 @@ def test_forward_flat_matches_explicit_per_request_calls_and_stages_pool():
     assert pool.token_history[1].tolist() == [3, 2]
 
 
+def test_forward_flat_prefetches_next_chunk_with_streaming_history():
+    from freetoken.kvcache.ple_state_pool import PLEStatePool
+
+    layer = _make_tiny_ple()
+    captured: list[torch.Tensor] = []
+    handle = object()
+
+    class TrackingBank(TensorRowBank):
+        def prefetch_rows(self, indices):
+            captured.append(torch.as_tensor(indices).clone())
+            return (handle,)
+
+    original_bank = layer.ple_embedding.row_bank
+    layer.ple_embedding.bind_row_bank(TrackingBank(original_bank.weight.clone()))
+    full_prompt = torch.tensor([5, 7, 11, 13, 17, 19])
+    req = SimpleNamespace(
+        input_ids=full_prompt[:3],
+        ple_prefetch_input_ids=full_prompt,
+        ple_prefetch_handles=(),
+        table_idx=0,
+        cached_len=0,
+        device_len=3,
+        extend_len=3,
+    )
+    batch = SimpleNamespace(reqs=[req], padded_reqs=[req], is_decode=False)
+    pool = PLEStatePool(
+        num_slots=2,
+        context_len=2,
+        channels=8,
+        conv_state_len=6,
+        eos_token_id=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    layer.forward_flat(torch.randn(3, 8), batch, pool)
+
+    _, history = layer.ple_embedding.hasher(full_prompt[:3].reshape(1, -1))
+    expected, _ = layer.ple_embedding.hasher(
+        full_prompt[3:].reshape(1, -1), history
+    )
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0], expected)
+    assert req.ple_prefetch_handles == (handle,)
+
+
 def test_prefill_downstream_failure_is_retryable_for_ragged_fresh_and_continued_slots():
     from freetoken.kvcache.ple_state_pool import PLEStatePool
 
