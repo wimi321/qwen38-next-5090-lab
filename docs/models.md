@@ -16,7 +16,7 @@ consult the [upstream documentation](https://github.com/FlashML-org/FreeToken/bl
 v0.1 full-checkpoint 8K/stability run remains the text-only baseline. The v0.2
 full-checkpoint 262,144-token and image run passed its documented release
 gates; its exact evidence is
-[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
+[`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8`](../results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/).
 The runtime does not yet consume the checkpoint's routed-expert activation
 scales and has no complete native W4A4 reference parity. See
 [`qwen4-exp.md`](qwen4-exp.md) for commands, measurements, and caveats.

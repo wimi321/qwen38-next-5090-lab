@@ -1,0 +1,28 @@
+{
+  "captured_at": "2026-08-27T23:29:50Z",
+  "hardware": {
+    "compute_capability": "12.0",
+    "gpu_index": 0,
+    "gpu_memory_mib": 32607,
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "wsl_memory_gib": 110.041,
+    "wsl_processors": 32
+  },
+  "schema_version": "1.0",
+  "software": {
+    "cuda_runtime_probe": true,
+    "cuda_toolkit": "13.3",
+    "kernel": "6.18.33.2-microsoft-standard-WSL2",
+    "media_doh_fallback_enabled": true,
+    "media_system_dns_hard_cancel_supported": false,
+    "nvidia_driver": "591.86",
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "os_id": "ubuntu",
+    "os_version_id": "24.04",
+    "python": "3.12.14",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "triton": "3.6.0"
+  },
+  "synthetic": false
+}

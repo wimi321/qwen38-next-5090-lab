@@ -12,7 +12,7 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This developer preview is hardware-validated only for the narrow
 `rtx5090-wsl2-256k-image` contract described below. The reviewed full-checkpoint
 record is tracked at
-`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`.
+`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/`.
 
 ### Added
 

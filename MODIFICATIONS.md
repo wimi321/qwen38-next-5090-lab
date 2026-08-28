@@ -179,7 +179,7 @@ prefix reuse, 32K/262K context, multi-request stability, or absence of Windows
 host paging. See [`docs/qwen4-exp.md`](docs/qwen4-exp.md).
 
 The reviewed `0.2.0a1` full-checkpoint run is tracked at
-`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`. It validates the native
+`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/`. It validates the native
 262,144-token and image paths only for one RTX 5090 under WSL2, TP=1, one
 running request, naive cache, graph disabled, and W4A16 compatibility. The run
 proved all of the following:

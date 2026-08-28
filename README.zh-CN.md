@@ -42,7 +42,7 @@ W4A16 compatibility，不能继承 W4A4 的质量结论，也不能声称与其�
 `v0.2.0-alpha.1`（代码版本 `0.2.0a1`）已经在固定完整 checkpoint 上完成一次
 经过审阅的整机验证，并已达到预发布条件。它只证明下面这组窄范围硬件契约，
 不代表通用模型支持或原生 W4A4 parity。审阅记录位于
-[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/)。
+[`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8`](results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/)。
 
 | 验证项目 | `v0.2.0-alpha.1` 已验证契约 |
 |---|---|
@@ -255,7 +255,7 @@ PCIe 实测值。启动证明还会携带真实 PLE checkpoint 探针：128 个 
 边界行以及 8 个确定性 bigram/trigram hash 行，必须在 GPU FP8 解码后与独立
 safetensors slice 精确一致。
 只有同时包含两次 261,120 + 1,024 边界证明，并通过资源、吞吐、混合顺序请求和
-soak 门槛的证据目录才可发布。上面的 run7 目录已经满足这些要求，英文 README
+soak 门槛的证据目录才可发布。上面的 run8 目录已经满足这些要求，英文 README
 的 generated benchmark 区块现由该 v0.2 记录生成。
 
 v0.2 profile 必须使用维护者持有的确定性本地图片和稳定的公开 HTTPS fixture：
@@ -283,7 +283,7 @@ fallback，应给 `doctor`、`serve` 和 `bench` 使用相同的
 英文表中的 **Peak VRAM** 和 **Peak WSL RSS** 是正式 API 验收窗口内的最大值，
 该窗口从第一个 API 请求开始，到最后一次 soak 结束；它们不是整个 harness 的
 峰值。原始
-[`resource-samples.csv`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/resource-samples.csv)
+[`resource-samples.csv`](results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/resource-samples.csv)
 还包含验收窗口之前的 preflight 和 pytest 采样，其中包括一次更高的瞬时显存值。
 引用资源行为时必须同时说明这一区别并检查原始采样。
 

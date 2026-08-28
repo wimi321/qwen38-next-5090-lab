@@ -44,7 +44,7 @@ quality or numerical parity.
 `v0.2.0-alpha.1` (code version `0.2.0a1`) is release-ready under one reviewed
 full-checkpoint run on the exact envelope below. This is a narrow hardware
 validation, not general model support or native W4A4 parity. The reviewed record
-is [`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
+is [`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8`](results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/).
 
 | Validated area | `v0.2.0-alpha.1` hardware-validated contract |
 |---|---|
@@ -275,39 +275,39 @@ records. TTFT is client-observed, and “effective prefill” includes fixed req
 and CPU-staging overhead rather than measuring a kernel in isolation.
 
 The reviewed v0.2 release record is
-[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
+[`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8`](results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/).
 The block below is generated from that directory's `summary.json`.
 
 <!-- BEGIN GENERATED BENCHMARK SUMMARY -->
 | Verified field | Result |
 |---|---:|
-| Runtime commit | `757872a75695` |
+| Runtime commit | `74650573a40c` |
 | Checkpoint revision | `7b719225242a` |
 | GPU | NVIDIA GeForce RTX 5090 |
 | Executed expert path | W4A16 compatibility |
-| Peak VRAM | 30.388 GiB |
-| Peak WSL RSS | 75.265 GiB |
+| Peak VRAM | 30.178 GiB |
+| Peak WSL RSS | 76.184 GiB |
 | WSL swap | 0 MiB |
-| 8176 rendered-token TTFT (p50 / p95) | 20081.2 / 20081.2 ms |
-| 8176 effective prefill (p50) | 407.1 tok/s |
-| 256-token steady decode | 12.9 tok/s |
+| 8176 rendered-token TTFT (p50 / p95) | 20252.2 / 20252.2 ms |
+| 8176 effective prefill (p50) | 403.7 tok/s |
+| 256-token steady decode | 12.7 tok/s |
 | Sequential requests | 100/100 |
 | Continuous run | 30.0 min |
-| Tests | 1667 passed, 0 failed |
-| 261K boundary TTFT | 566371.3 ms |
+| Tests | 1668 passed, 0 failed |
+| 261K boundary TTFT | 575370.1 ms |
 | 261120 input + 1024 output (text / image) | passed / passed |
 | Selector workspace peak | 127.5 MiB |
-| PLE storage read / cache hits | 89796608 B / 156748 |
-| Vision tokens / latency | 6076 / 689.3 ms |
-| Prefill chunks / total time | 2179 / 4821865.4 ms |
-| Sparse MoE active rows | 17312660 / 53551104 |
-| Sparse MoE PCIe bytes | 59409764843520 / 148469364817920 |
+| PLE storage read / cache hits | 98549760 B / 154470 |
+| Vision tokens / latency | 6076 / 662.7 ms |
+| Prefill chunks / total time | 2179 / 4866617.9 ms |
+| Sparse MoE active rows | 17343870 / 53551104 |
+| Sparse MoE PCIe bytes | 59486466539520 / 148469364817920 |
 <!-- END GENERATED BENCHMARK SUMMARY -->
 
 The generated **Peak VRAM** and **Peak WSL RSS** values are the formal API
 acceptance-window maxima, measured from the first API request through the final
 soak. They are not whole-harness peaks. The raw
-[`resource-samples.csv`](results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/resource-samples.csv)
+[`resource-samples.csv`](results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/resource-samples.csv)
 also contains pre-acceptance preflight and pytest samples, including a higher
 transient VRAM observation; inspect those raw samples before quoting resource
 behavior.
@@ -334,7 +334,7 @@ probe: every one of the 128 shard boundaries plus eight deterministic
 bigram/trigram hash rows must match independent safetensors slices after GPU
 FP8 decode. A v0.2 evidence directory is release-compatible only when it
 contains both 261,120 + 1,024 boundary proofs and passes every resource,
-throughput, mixed-request, and soak gate. The reviewed run7 directory above
+throughput, mixed-request, and soak gate. The reviewed run8 directory above
 satisfies these requirements, and the generated benchmark block reports that
 v0.2 record.
 

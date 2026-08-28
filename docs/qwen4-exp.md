@@ -22,7 +22,7 @@ combines a 262,144-token total budget with image input. Total tokens include
 rendered text, expanded image tokens, and output; the validated boundary is
 261,120 input plus 1,024 output, once for text and once with a real image. The
 formal record is
-[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
+[`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/`](../results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/).
 
 Both profiles disable CUDA graphs and radix prefix reuse. The complete PLE
 auxiliary table must never be materialized on the GPU. The v0.2 alpha adds
@@ -542,7 +542,7 @@ not count as a passed image or release gate.
 
 Do not hand-maintain benchmark numbers in this document. The authoritative v0.2
 record is
-[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/);
+[`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/`](../results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/);
 the English README table is generated from its `summary.json`, and CI rejects a
 stale table. That evidence directory contains exactly 10 tracked UTF-8 files:
 `environment.json`, `resolved-config.json`, `summary.json`, `requests.jsonl`,
@@ -617,7 +617,7 @@ result.
 ### Recorded v0.2 alpha boundary
 
 The reviewed run in
-[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/)
+[`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/`](../results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/)
 passes the formal acceptance gates for the pinned full checkpoint and this
 narrow profile:
 

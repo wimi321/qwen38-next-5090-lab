@@ -1,0 +1,255 @@
+{
+  "benchmarks": {
+    "prompt_classes": [
+      {
+        "completion_tokens": 10,
+        "content_prompt_tokens": 8164,
+        "rendered_prompt_tokens": 8176,
+        "total_p50_ms": 20943.923,
+        "total_p95_ms": 20943.923,
+        "ttft_p50_ms": 20252.202,
+        "ttft_p95_ms": 20252.202
+      },
+      {
+        "completion_tokens": 11,
+        "content_prompt_tokens": 32756,
+        "rendered_prompt_tokens": 32768,
+        "total_p50_ms": 77582.902,
+        "total_p95_ms": 77582.902,
+        "ttft_p50_ms": 76801.429,
+        "ttft_p95_ms": 76801.429
+      },
+      {
+        "completion_tokens": 12,
+        "content_prompt_tokens": 131060,
+        "rendered_prompt_tokens": 131072,
+        "total_p50_ms": 288200.802,
+        "total_p95_ms": 288200.802,
+        "ttft_p50_ms": 287376.597,
+        "ttft_p95_ms": 287376.597
+      },
+      {
+        "completion_tokens": 12,
+        "content_prompt_tokens": 261108,
+        "rendered_prompt_tokens": 261120,
+        "total_p50_ms": 566226.731,
+        "total_p95_ms": 566226.731,
+        "ttft_p50_ms": 565390.12,
+        "ttft_p95_ms": 565390.12
+      }
+    ],
+    "steady_decode": {
+      "decode_tokens_per_second": 12.713,
+      "finish_reason": "length",
+      "http_status": 200,
+      "observed_tokens": 256,
+      "requested_tokens": 256
+    }
+  },
+  "caveats": [
+    "The checkpoint declares W4A4, but this release executes the W4A16 compatibility path.",
+    "The Windows host pagefile exists; zero host paging is not claimed.",
+    "Full-model Transformers logits parity has not been established.",
+    "PCIe counters are unavailable in this portable harness and must not be inferred."
+  ],
+  "errors": [],
+  "execution": {
+    "attention_backend": "qsa_triton_sm120",
+    "cache_type": "naive",
+    "context_tokens": 262144,
+    "cuda_graph": false,
+    "image_input": true,
+    "profile": "rtx5090-wsl2-256k-image",
+    "quantization": "W4A16 compatibility",
+    "text_only": false,
+    "tp_size": 1
+  },
+  "gates": {
+    "api": {
+      "context_length_rejection": true,
+      "image_chart": true,
+      "image_data_url": true,
+      "image_four": true,
+      "image_https": true,
+      "image_object": true,
+      "image_ocr": true,
+      "image_security_rejections": true,
+      "image_stream_nonstream_match": true,
+      "image_thinking": true,
+      "image_tool_call": true,
+      "stream_nonstream_match": true,
+      "thinking_high": true,
+      "thinking_none": true,
+      "tool_call": true
+    },
+    "boundary": {
+      "image_completed": true,
+      "image_tokens": 300,
+      "input_tokens": 261120,
+      "output_tokens": 1024,
+      "text_completed": true,
+      "text_tokens": 260820,
+      "total_tokens": 262144
+    },
+    "continuous_run_seconds": 1800.827,
+    "long_context_ttft_ms": 575370.119,
+    "memory_leak_detected": false,
+    "niah": {
+      "attempted": 4,
+      "depths": [
+        0.1,
+        0.35,
+        0.65,
+        0.9
+      ],
+      "succeeded": 4
+    },
+    "prompt_cases": [
+      {
+        "completion_tokens": 10,
+        "content_prompt_tokens": 8164,
+        "rendered_prompt_tokens": 8176,
+        "total_p50_ms": 20943.923,
+        "total_p95_ms": 20943.923,
+        "ttft_p50_ms": 20252.202,
+        "ttft_p95_ms": 20252.202
+      },
+      {
+        "completion_tokens": 11,
+        "content_prompt_tokens": 32756,
+        "rendered_prompt_tokens": 32768,
+        "total_p50_ms": 77582.902,
+        "total_p95_ms": 77582.902,
+        "ttft_p50_ms": 76801.429,
+        "ttft_p95_ms": 76801.429
+      },
+      {
+        "completion_tokens": 12,
+        "content_prompt_tokens": 131060,
+        "rendered_prompt_tokens": 131072,
+        "total_p50_ms": 288200.802,
+        "total_p95_ms": 288200.802,
+        "ttft_p50_ms": 287376.597,
+        "ttft_p95_ms": 287376.597
+      },
+      {
+        "completion_tokens": 12,
+        "content_prompt_tokens": 261108,
+        "rendered_prompt_tokens": 261120,
+        "total_p50_ms": 566226.731,
+        "total_p95_ms": 566226.731,
+        "ttft_p50_ms": 565390.12,
+        "ttft_p95_ms": 565390.12
+      }
+    ],
+    "pytest": {
+      "deselected": 11,
+      "failed": 0,
+      "passed": 1668,
+      "skipped": 9
+    },
+    "soak": {
+      "attempted": 121,
+      "duration_seconds": 1800.827,
+      "finished_elapsed_s": 5031.841,
+      "max_start_gap_seconds": 15.002,
+      "started_elapsed_s": 3231.014,
+      "succeeded": 121
+    },
+    "stability": {
+      "attempted": 100,
+      "max_ms": 2132.436,
+      "p50_ms": 2051.608,
+      "p95_ms": 2117.594,
+      "succeeded": 100
+    },
+    "steady_decode": {
+      "decode_tokens_per_second": 12.713,
+      "finish_reason": "length",
+      "http_status": 200,
+      "observed_tokens": 256,
+      "requested_tokens": 256
+    },
+    "vision_quality": {
+      "chart": true,
+      "object": true,
+      "ocr": true
+    }
+  },
+  "measured_at": "2026-08-27T23:29:48Z",
+  "model": {
+    "file_count": 419,
+    "manifest_sha256": "6cc22b628ca575785e5dfdcab3c7056e79a7eac798969a145341ed1530c2a3a8",
+    "repository": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+    "total_bytes": 135253622894
+  },
+  "resources": {
+    "acceptance_window_end_elapsed_s": 5031.841,
+    "acceptance_window_start_elapsed_s": 269.209,
+    "page_faults": {
+      "major_delta": 47.0,
+      "minor_delta": 486720.0
+    },
+    "pcie_traffic": {
+      "reason": "portable nvidia-smi sampling does not expose RX/TX counters",
+      "status": "unavailable"
+    },
+    "peak_vram_mib": 30902.0,
+    "peak_wsl_rss_kib": 79884912.0,
+    "windows_pagefile_note": "A pre-existing Windows pagefile may be active; the harness does not modify it and does not claim zero host paging.",
+    "wsl_rss_source": "WSL MemTotal-MemAvailable fallback",
+    "wsl_swap_kib": 0.0
+  },
+  "run_id": "rtx5090-2026-08-28-v02-alpha1-7465057-run8",
+  "schema_version": "1.0",
+  "source": {
+    "release_compatible": true,
+    "runtime_tree_sha256": "36229f9f984c631f9cf8b3762a940ab7b52127a73cacb7d3257d90dc188c45a4",
+    "upstream_base": "9ef3651309fe4058672f2cc92069238dea06be1b",
+    "validated_runtime_commit": "74650573a40c5ebb313f96b1fc6482c9644261e0"
+  },
+  "status": "verified",
+  "telemetry": {
+    "moe_prefill": {
+      "active_rows": 17343870,
+      "byte_fraction": 0.400665,
+      "bytes_copied": 59486466539520,
+      "full_bytes": 148469364817920,
+      "possible_rows": 53551104,
+      "row_fraction": 0.323875
+    },
+    "ple": {
+      "bytes_read": 98549760.0,
+      "cache_hits": 154470.0,
+      "cache_misses": 24060.0,
+      "cold_runs": 1,
+      "page_faults": 18842721.0,
+      "wait_ms": 3903.968,
+      "warm_runs": 3
+    },
+    "prefill_chunks": {
+      "count": 2179,
+      "total_ms": 4866617.853
+    },
+    "selector": {
+      "errors": 0,
+      "fallback_calls": 0,
+      "native_calls": 67116,
+      "workspace_peak_bytes": 133693440
+    },
+    "vision": {
+      "image_tokens": 6076,
+      "latency_ms": 662.736
+    }
+  },
+  "verification": {
+    "checkpoint_full_sha256": true,
+    "checkpoint_shape": true,
+    "launch_attestation": true,
+    "ple_checkpoint_rows": true,
+    "runtime_clean_tree": true,
+    "server_port_owner": true,
+    "server_profile": true
+  }
+}

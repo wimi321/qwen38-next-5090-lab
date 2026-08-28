@@ -24,7 +24,7 @@ requirement; the profile refuses to start when that path is unavailable.
 Audio, video, MTP, radix cache, TP>1, concurrent requests, and totals above
 262,144 tokens are unsupported by this validated contract. The exact release
 evidence is in
-[`results/rtx5090-2026-08-28-v02-alpha1-757872a-run7`](../results/rtx5090-2026-08-28-v02-alpha1-757872a-run7/).
+[`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8`](../results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/).
 
 The 256K/image bench invocation requires `--image-file PATH` and
 `--https-image-url URL`, and permits `--decode-tokens` from 256 through 1,024.
