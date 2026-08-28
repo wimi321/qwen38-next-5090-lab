@@ -26,6 +26,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
 ROOT = Path(__file__).parent
 SOURCE_ROOT = ROOT.resolve()
+BUILD_HOME = Path.home().resolve()
 
 # Release wheels are built from throw-away ext4 clones.  Strip absolute build
 # paths and debug tables from the three native extensions so the binary does
@@ -38,6 +39,9 @@ RELEASE_CXX_FLAGS = [
     f"-ffile-prefix-map={SOURCE_ROOT}=.",
     f"-fdebug-prefix-map={SOURCE_ROOT}=.",
     f"-fmacro-prefix-map={SOURCE_ROOT}=.",
+    f"-ffile-prefix-map={BUILD_HOME}=/opt/q38lab-build",
+    f"-fdebug-prefix-map={BUILD_HOME}=/opt/q38lab-build",
+    f"-fmacro-prefix-map={BUILD_HOME}=/opt/q38lab-build",
 ]
 
 

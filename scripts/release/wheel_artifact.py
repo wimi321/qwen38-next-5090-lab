@@ -18,7 +18,7 @@ EXPECTED_NATIVE = {
     "freetoken/models/qwen4_exp/_ple_io_uring.cpython-312-x86_64-linux-gnu.so",
 }
 FORBIDDEN_SUFFIXES = {".bin", ".ckpt", ".gguf", ".pt", ".pth", ".safetensors"}
-PRIVATE_MARKERS = (b"/home/", b"/mnt/c/", b"C:\\Users\\")
+PRIVATE_MARKERS = (b"/home/", b"/root/", b"/mnt/c/", b"C:\\Users\\")
 
 
 class WheelAuditError(RuntimeError):
