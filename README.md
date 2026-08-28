@@ -13,9 +13,9 @@ checkpoint with text or image input on one 32 GB RTX 5090. The runtime combines
 sparse PLE row streaming, QSA Triton kernels, four-stream gated residuals, a
 vision tower, and heterogeneous MoE offload behind an OpenAI-compatible API.
 
-This repository is a source-only developer preview. It does not redistribute
-model weights, publish the `freetoken` package name, or claim to be the first or
-fastest implementation.
+This repository publishes source archives plus an optional experimental WSL2
+wheel. It does not redistribute model weights, publish the `freetoken` package
+name, or claim to be the first or fastest implementation.
 
 ![Qwen3.8 Next 5090 Lab architecture](docs/assets/q38lab-architecture.svg)
 
@@ -45,6 +45,10 @@ quality or numerical parity.
 full-checkpoint run on the exact envelope below. This is a narrow hardware
 validation, not general model support or native W4A4 parity. The reviewed record
 is [`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8`](results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/).
+
+The `0.2.0a1.post1` wheel companion changes packaging only: it places the PLE
+preflight inside the installed package and strips local build paths from native
+extensions. The model/runtime evidence remains the `v0.2.0-alpha.1` run above.
 
 | Validated area | `v0.2.0-alpha.1` hardware-validated contract |
 |---|---|
@@ -105,6 +109,33 @@ zero. Quote performance only with the generated table and adjacent raw records.
 - **Evidence is a release artifact.** Environment, resolved configuration,
   request timings, RSS/VRAM/page-fault/PCIe samples, tests, and checksums are
   stored together. README figures are generated from the recorded summary.
+
+## Install the wheel
+
+The easiest supported binary path is **Ubuntu 24.04 under WSL2, Linux x86-64,
+CPython 3.12, CUDA toolkit 13.3, and RTX 5090/SM120**. The wheel is deliberately
+tagged `linux_x86_64`, not generic manylinux. It contains the project code and
+three native extensions, but no model weights, CUDA runtime, or PyTorch shared
+libraries. Use a dedicated environment because it retains the `freetoken`
+import namespace and `ft` compatibility command.
+
+```bash
+python3.12 -m venv "$HOME/q38lab-venv"
+source "$HOME/q38lab-venv/bin/activate"
+python -m pip install --upgrade pip
+
+python -m pip install -r \
+  https://raw.githubusercontent.com/wimi321/qwen38-next-5090-lab/wheel-v0.2.0-alpha.1.post1/requirements-wheel-cu130.txt
+python -m pip install \
+  https://github.com/wimi321/qwen38-next-5090-lab/releases/download/wheel-v0.2.0-alpha.1.post1/qwen38_next_5090_lab-0.2.0a1.post1-cp312-cp312-linux_x86_64.whl
+
+q38lab doctor --profile rtx5090-wsl2-256k-image
+```
+
+The exact acceleration wheels in the requirements file are URL- and
+SHA256-pinned. `q38lab doctor`, `download`, `serve`, and `smoke` work from the
+wheel; the evidence-producing `q38lab bench` remains source-checkout-only.
+Verify the companion release's `WHEEL-SHA256SUMS` before installation.
 
 ## Install from source
 

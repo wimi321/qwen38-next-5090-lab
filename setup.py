@@ -25,6 +25,20 @@ from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
 
 ROOT = Path(__file__).parent
+SOURCE_ROOT = ROOT.resolve()
+
+# Release wheels are built from throw-away ext4 clones.  Strip absolute build
+# paths and debug tables from the three native extensions so the binary does
+# not disclose the builder's home directory and repeated builds have stable
+# source locations in diagnostics.
+RELEASE_CXX_FLAGS = [
+    "-O3",
+    "-std=c++17",
+    "-g0",
+    f"-ffile-prefix-map={SOURCE_ROOT}=.",
+    f"-fdebug-prefix-map={SOURCE_ROOT}=.",
+    f"-fmacro-prefix-map={SOURCE_ROOT}=.",
+]
 
 
 def _check_toolchain() -> None:
@@ -58,7 +72,7 @@ linux_ple_extensions = (
             sources=[
                 "python/freetoken/models/qwen4_exp/csrc/ple_io_uring.cpp",
             ],
-            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+            extra_compile_args=[*RELEASE_CXX_FLAGS, "-pthread"],
             extra_link_args=["-pthread"],
             language="c++",
         )
@@ -78,7 +92,7 @@ setup(
             include_dirs=cuda_include_dirs,
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17"],
+            extra_compile_args=RELEASE_CXX_FLAGS,
         ),
         # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
         # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
@@ -93,7 +107,7 @@ setup(
             include_dirs=cuda_include_dirs,
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+            extra_compile_args=[*RELEASE_CXX_FLAGS, "-pthread"],
         ),
         *linux_ple_extensions,
     ],

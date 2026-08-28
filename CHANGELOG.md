@@ -7,6 +7,25 @@ before the audited base remains available in Git; see
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-alpha.1.post1] - 2026-08-28
+
+### Added
+
+- Published an optional CPython 3.12/Linux x86-64 wheel companion for the
+  existing `v0.2.0-alpha.1` RTX 5090/WSL2 runtime.
+- Added SHA256-pinned CUDA 13 acceleration requirements and wheel install
+  instructions in English and Chinese.
+
+### Fixed
+
+- Moved the release-qualified PLE checkpoint row probe into the `q38lab`
+  package so the installed wheel can launch the 256K/image profile.
+- Stripped debug tables and local source paths from the three compiled native
+  extensions. The release evidence harness remains source-checkout-only.
+
+This post-release package does not change model kernels, profiles, checkpoint
+identity, or the hardware claims recorded for `v0.2.0-alpha.1`.
+
 ## [0.2.0-alpha.1] - 2026-08-28
 
 This developer preview is hardware-validated only for the narrow
@@ -130,4 +149,5 @@ record is tracked at
   prevents a claim that host paging was absent.
 
 [0.2.0-alpha.1]: https://github.com/wimi321/qwen38-next-5090-lab/releases/tag/v0.2.0-alpha.1
+[0.2.0-alpha.1.post1]: https://github.com/wimi321/qwen38-next-5090-lab/releases/tag/wheel-v0.2.0-alpha.1.post1
 [0.1.0-alpha.1]: https://github.com/wimi321/qwen38-next-5090-lab/releases/tag/v0.1.0-alpha.1

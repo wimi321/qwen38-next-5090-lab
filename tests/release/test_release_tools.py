@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
@@ -19,6 +20,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "release"))
 import repository_audit  # noqa: E402
 import rtx5090_harness  # noqa: E402
 import source_sbom  # noqa: E402
+import wheel_artifact  # noqa: E402
 
 
 class FakeTokenizer:
@@ -575,6 +577,55 @@ class ReleaseToolTests(unittest.TestCase):
             repository_audit.forbidden_rebrand_paths(candidates),
             sorted(candidates[1:]),
         )
+
+    def test_wheel_keeps_the_256k_ple_preflight_inside_q38lab(self) -> None:
+        packaged_probe = ROOT / "python" / "q38lab" / "ple_checkpoint_probe.py"
+        wrapper = ROOT / "scripts" / "release" / "ple_checkpoint_probe.py"
+        runtime = (ROOT / "python" / "q38lab" / "runtime.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(packaged_probe.is_file())
+        self.assertIn("from q38lab.ple_checkpoint_probe import", wrapper.read_text(encoding="utf-8"))
+        self.assertIn("from .ple_checkpoint_probe import run_probe", runtime)
+
+    def test_native_wheel_build_strips_local_source_paths(self) -> None:
+        setup = (ROOT / "setup.py").read_text(encoding="utf-8")
+        for flag in ("-g0", "-ffile-prefix-map", "-fdebug-prefix-map", "-fmacro-prefix-map"):
+            self.assertIn(flag, setup)
+
+    def test_wheel_artifact_audit_checks_native_shape_and_private_paths(self) -> None:
+        version = "0.2.0a1.post1"
+        dist_info = f"qwen38_next_5090_lab-{version}.dist-info"
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = Path(directory) / (
+                f"qwen38_next_5090_lab-{version}-cp312-cp312-linux_x86_64.whl"
+            )
+            members = {
+                "q38lab/ple_checkpoint_probe.py": b"def run_probe(): pass\n",
+                f"{dist_info}/METADATA": (
+                    f"Name: qwen38-next-5090-lab\nVersion: {version}\n"
+                ).encode(),
+                f"{dist_info}/WHEEL": (
+                    b"Root-Is-Purelib: false\nTag: cp312-cp312-linux_x86_64\n"
+                ),
+                f"{dist_info}/RECORD": b"",
+                f"{dist_info}/licenses/LICENSE": b"Apache-2.0\n",
+                f"{dist_info}/licenses/MODIFICATIONS.md": b"modified\n",
+                f"{dist_info}/licenses/THIRD_PARTY_NOTICES.md": b"notices\n",
+                **{name: b"ELF" for name in wheel_artifact.EXPECTED_NATIVE},
+            }
+            with zipfile.ZipFile(wheel, "w") as archive:
+                for name, payload in members.items():
+                    archive.writestr(name, payload)
+            result = wheel_artifact.audit_wheel(wheel, version)
+            self.assertEqual(result["version"], version)
+
+            members["q38lab/private.py"] = b"/home/example/private"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                for name, payload in members.items():
+                    archive.writestr(name, payload)
+            with self.assertRaisesRegex(wheel_artifact.WheelAuditError, "private build path"):
+                wheel_artifact.audit_wheel(wheel, version)
 
     def test_cpu_oracle_workflow_installs_pinned_flashlib_without_cuda_extras(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(

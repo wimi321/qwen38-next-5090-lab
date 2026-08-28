@@ -111,7 +111,7 @@ def _env_value(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="q38lab",
-        description="Reproduce the Qwen3.8 Next text-only RTX 5090/WSL2 run.",
+        description="Run Qwen3.8 Next text and image profiles on RTX 5090/WSL2.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

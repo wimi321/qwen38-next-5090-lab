@@ -105,20 +105,9 @@ def _probe_qsa_native_fast_topk():
 
 
 def _probe_ple_checkpoint_rows(path: Path) -> dict[str, Any]:
-    """Run the source-only release probe before worker processes are spawned."""
+    """Run the packaged sparse-row parity probe before workers are spawned."""
 
-    root = Path(__file__).resolve().parents[2]
-    release_dir = root / "scripts" / "release"
-    script = release_dir / "ple_checkpoint_probe.py"
-    if not script.is_file():
-        raise RuntimeError(
-            "the 256K release profile requires the source checkout containing "
-            "scripts/release/ple_checkpoint_probe.py"
-        )
-    release_path = str(release_dir)
-    if release_path not in sys.path:
-        sys.path.insert(0, release_path)
-    from ple_checkpoint_probe import run_probe
+    from .ple_checkpoint_probe import run_probe
 
     return run_probe(path)
 

@@ -89,9 +89,11 @@ the service beyond loopback.
 ## Dependency and release integrity
 
 Use source archives, evidence bundles, SBOMs, and `SHA256SUMS` from the same
-GitHub Release. Verify checksums before use. A release never contains model
-weights. Dependency packages, CUDA kernels, the Windows driver, WSL, and the
-checkpoint have their own security update channels; review them independently.
+GitHub Release. The optional binary companion has a separate
+`WHEEL-SHA256SUMS` and provenance record bound to its tag and commit. Verify
+checksums before use. A release never contains model weights. Dependency
+packages, CUDA kernels, the Windows driver, WSL, and the checkpoint have their
+own security update channels; review them independently.
 
 Do not treat a successful checksum as proof that a model or dependency is safe.
 It proves only that bytes match the recorded artifact.

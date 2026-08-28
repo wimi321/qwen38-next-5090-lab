@@ -73,6 +73,14 @@ covering tracked files and vendored source. Exact runtime dependency versions
 are recorded separately by `uv.lock` and the evidence environment snapshot;
 consult upstream package metadata for their licenses.
 
+The optional companion wheel contains Python/source files from this repository
+and three native extensions compiled from those tracked sources. It does not
+bundle `libcudart`, libtorch, FlashInfer, SGLang Kernel, their dependency
+wheels, or model weights. Those remain separately installed runtime
+dependencies under their own terms. The wheel retains `LICENSE`, this notice,
+`MODIFICATIONS.md`, and the archived third-party license texts in its
+`.dist-info/licenses` directory.
+
 For the supported Linux x86_64 profile, uv resolves `sglang-kernel` from the
 official SGLang wheel repository's v0.4.5 GitHub release asset and verifies the
 SHA-256 digest published by GitHub. This pin is a supply-chain integrity record,

@@ -144,6 +144,21 @@ def audit(root: Path = ROOT) -> list[str]:
         if expected_sglang_digest not in lock_text:
             errors.append("uv.lock must retain the audited SGLang cu130 wheel SHA256")
 
+    wheel_requirements = root / "requirements-wheel-cu130.txt"
+    if not wheel_requirements.is_file():
+        errors.append("missing SHA256-pinned wheel companion requirements")
+    else:
+        wheel_text = wheel_requirements.read_text(encoding="utf-8")
+        expected_wheel_digests = {
+            "torch cu130": "96911323dcfcd42028c7e8edde7bdf25bb187753234e8775f0f3f112e86a22db",
+            "torchvision cu130": "0f030a9bd8ada1a31b7111ea1589c1ecb5fa0884fee700a203e731b4cf378a98",
+            "FlashInfer": "ab7ce3aec42faf2f6079aa840c2407ac00ecd277a0524cdb708a8ff4a64dad90",
+            "SGLang kernel": "f482a5fdf287d85cfc9434eaa0faff757d6fee31272f1c3e4408bd79aef189b5",
+        }
+        for label, digest in expected_wheel_digests.items():
+            if f"#sha256={digest}" not in wheel_text:
+                errors.append(f"wheel requirements must pin the audited {label} SHA256")
+
     public_identity_checks = {
         root / "python" / "freetoken" / "server" / "api_models.py": (
             'owned_by: str = "qwen38-next-5090-lab"'

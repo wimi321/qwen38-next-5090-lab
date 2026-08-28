@@ -144,7 +144,7 @@ the corresponding high-level description. The Apache-2.0 license remains in
 
 ### Product and release surface
 
-- Added the `q38lab` source-only CLI for environment diagnosis, pinned model
+- Added the `q38lab` CLI for environment diagnosis, pinned model
   download/verification, the RTX 5090 profile, API smoke tests, and evidence
   collection.
 - Added the `rtx5090-wsl2-256k-image` alpha profile and corresponding
@@ -158,6 +158,11 @@ the corresponding high-level description. The Apache-2.0 license remains in
   kernel-cache packaging project, official logo assets, and community artwork;
   these remain available in the preserved upstream history but are not a
   downstream distribution surface.
+- Added a downstream-owned `0.2.0a1.post1` CPython 3.12/Linux x86-64 companion
+  wheel. It packages three in-tree native extensions without CUDA, libtorch,
+  dependency wheels, or model weights; the evidence harness remains
+  source-checkout-only. The packaged PLE row probe is the same implementation
+  used by the source wrapper.
 - Replaced upstream-facing branding, setup, contribution, security, and model
   documentation with downstream-specific material while preserving attribution.
 - Replaced the ambiguous SGLang cu130 simple-index source (which advertised two
@@ -212,6 +217,10 @@ namespaced from `prompt-8176` to `regression-prompt-8176` to distinguish them
 from the NIAH request; only the case labels and resulting checksums changed.
 Video, audio, MTP, radix cache, TP>1, multi-request scheduling, native W4A4
 parity, and contexts beyond 262,144 remain outside the v0.2 contract.
+
+The `0.2.0a1.post1` wheel is a packaging companion to that run. It relocates
+the PLE preflight into the installed package and removes local compiler paths;
+it does not expand or replace the recorded hardware-validation boundary.
 
 ## Publication review checklist
 

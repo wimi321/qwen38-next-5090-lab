@@ -1,0 +1,8 @@
+# Qwen3.8 Next 5090 Lab wheel companion: CPython 3.12 / Linux x86_64 / CUDA 13.
+# These are the four acceleration artifacts used by the reviewed WSL2 setup.
+# Transitive Python dependencies remain constrained by the wheel metadata.
+
+torch @ https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=96911323dcfcd42028c7e8edde7bdf25bb187753234e8775f0f3f112e86a22db
+torchvision @ https://download-r2.pytorch.org/whl/cu130/torchvision-0.26.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=0f030a9bd8ada1a31b7111ea1589c1ecb5fa0884fee700a203e731b4cf378a98
+flashinfer-python[cu13] @ https://files.pythonhosted.org/packages/da/6f/679f5fa5471705e7ae40712063222c65711b2cb864624f25192fc9de77bf/flashinfer_python-0.6.17-py3-none-any.whl#sha256=ab7ce3aec42faf2f6079aa840c2407ac00ecd277a0524cdb708a8ff4a64dad90
+sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.5/sglang_kernel-0.4.5%2Bcu130-cp310-abi3-manylinux2014_x86_64.whl#sha256=f482a5fdf287d85cfc9434eaa0faff757d6fee31272f1c3e4408bd79aef189b5

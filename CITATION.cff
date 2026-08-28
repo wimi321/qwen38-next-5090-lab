@@ -4,7 +4,7 @@ message: >-
   upstream FreeToken work that provides its serving-engine foundation.
 title: "Qwen3.8 Next 5090 Lab"
 type: software
-version: "0.2.0-alpha.1"
+version: "0.2.0-alpha.1.post1"
 authors:
   - name: "wimi321"
     website: "https://github.com/wimi321"

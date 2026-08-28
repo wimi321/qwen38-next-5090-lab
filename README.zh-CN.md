@@ -13,8 +13,8 @@ checkpoint 在一张 32 GB RTX 5090 上接受文本或图片输入。它在 Free
 OpenAI 兼容 API 之上组合了稀疏 PLE 行流式读取、QSA Triton kernel、四路
 gated residual、vision tower 和异构 MoE offload。
 
-这是一个仅发布源码的开发者预览版。仓库不再分发模型权重，不占用
-`freetoken` 官方包的发布名，也不声称“首个”“唯一”或“最快”。
+项目发布源码包，也提供一个可选的 WSL2 实验 wheel。仓库不分发模型权重，
+不占用 `freetoken` 官方包的发布名，也不声称“首个”“唯一”或“最快”。
 
 ![Qwen3.8 Next 5090 Lab 架构](docs/assets/q38lab-architecture.svg)
 
@@ -43,6 +43,10 @@ W4A16 compatibility，不能继承 W4A4 的质量结论，也不能声称与其�
 经过审阅的整机验证，并已达到预发布条件。它只证明下面这组窄范围硬件契约，
 不代表通用模型支持或原生 W4A4 parity。审阅记录位于
 [`results/rtx5090-2026-08-28-v02-alpha1-7465057-run8`](results/rtx5090-2026-08-28-v02-alpha1-7465057-run8/)。
+
+`0.2.0a1.post1` wheel 伴随版只调整打包：把 PLE 启动预检放进安装包，并从
+native extension 中移除本机构建路径。模型与运行时证据仍以上面的
+`v0.2.0-alpha.1` run8 为准。
 
 | 验证项目 | `v0.2.0-alpha.1` 已验证契约 |
 |---|---|
@@ -95,6 +99,31 @@ q38lab smoke --images
 - **性能数字有原始证据。** environment、最终解析配置、请求时间、RSS、VRAM、
   page fault、PCIe 采样、测试结果和 checksum 一起保存；README 的数字由
   `summary.json` 生成。
+
+## 使用 wheel 安装
+
+最省事的二进制安装范围是：**WSL2 Ubuntu 24.04、Linux x86-64、CPython
+3.12、CUDA toolkit 13.3、RTX 5090/SM120**。wheel 标签是保守的
+`linux_x86_64`，不是通用 manylinux。它包含项目代码和三个 native
+extension，但不包含模型权重、CUDA runtime 或 PyTorch 动态库。请使用独立
+环境，因为它仍保留 `freetoken` import namespace 和兼容命令 `ft`。
+
+```bash
+python3.12 -m venv "$HOME/q38lab-venv"
+source "$HOME/q38lab-venv/bin/activate"
+python -m pip install --upgrade pip
+
+python -m pip install -r \
+  https://raw.githubusercontent.com/wimi321/qwen38-next-5090-lab/wheel-v0.2.0-alpha.1.post1/requirements-wheel-cu130.txt
+python -m pip install \
+  https://github.com/wimi321/qwen38-next-5090-lab/releases/download/wheel-v0.2.0-alpha.1.post1/qwen38_next_5090_lab-0.2.0a1.post1-cp312-cp312-linux_x86_64.whl
+
+q38lab doctor --profile rtx5090-wsl2-256k-image
+```
+
+requirements 文件里的加速 wheel 都固定了 URL 和 SHA256。wheel 安装支持
+`doctor`、`download`、`serve`、`smoke`；生成正式证据的 `q38lab bench`
+仍需源码仓库。安装前请核对伴随 Release 的 `WHEEL-SHA256SUMS`。
 
 ## 从源码安装
 
